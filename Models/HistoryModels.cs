@@ -62,8 +62,8 @@ public sealed class TestHistoryRecord
 
     public TestHistoryRecord ClonePersistenceSnapshot() => (TestHistoryRecord)MemberwiseClone();
 
-    public string DateText => EffectiveTestStartedAt.ToString("yyyy/MM/dd");
-    public string TimeText => EffectiveTestStartedAt.ToString("HH:mm:ss");
+    public string DateText => EffectiveResultAt.ToString("yyyy/MM/dd");
+    public string TimeText => EffectiveResultAt.ToString("HH:mm:ss");
     public string PassedText => Passed ? "PASS" : "FAIL";
     public string LabelTypeText => !string.IsNullOrWhiteSpace(LabelTemplateType)
         ? LabelTemplateType

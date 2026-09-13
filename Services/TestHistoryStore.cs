@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text.Json;
@@ -2060,10 +2060,10 @@ public sealed class TestHistoryStore
         */
         int limit = Math.Clamp(criteria.MaxRows, 1, 5_000);
         int offset = Math.Max(0, criteria.Offset);
-        string order = exportAll
-            ? "ORDER BY p.PartNumber COLLATE NOCASE,t.StartedAt,t.Id"
-            : "ORDER BY t.ResultAt DESC,t.Id DESC" +
-              (applyLimit
+        // Lịch sử luôn theo thời điểm kết quả mới nhất -> cũ nhất.
+        // ResultAt cũng là khóa của bộ lọc ngày và keyset cursor, đồng thời đã có index DESC.
+        string order = "ORDER BY t.ResultAt DESC,t.Id DESC" +
+              (!exportAll && applyLimit
                   ? $" LIMIT {limit}" +
                     (criteria.BeforeResultAt is null ? $" OFFSET {offset}" : string.Empty)
                   : string.Empty);
