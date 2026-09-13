@@ -228,6 +228,12 @@
             <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
             <Setter Property="FontFamily" Value="Malgun Gothic"/>
             <Setter Property="FontSize" Value="{DynamicResource TestGridBaseFontSize}"/>
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsLiveTopologyPresentation}" Value="True">
+                    <Setter Property="Foreground" Value="#FF0000"/>
+                    <Setter Property="FontWeight" Value="Bold"/>
+                </DataTrigger>
+            </Style.Triggers>
         </Style>
 
         <Style x:Key="PiGridStrongTextStyle" TargetType="TextBlock" BasedOn="{StaticResource PiGridTextStyle}">
@@ -378,7 +384,7 @@
                             </Trigger>
                             <!-- LiveTopology (mã hàng không cấu hình IO): chỉ đổi màu hiển thị,
                                  tuyệt đối không đổi FaultKind/ProductFaultType nên không cộng lỗi. -->
-                            <DataTrigger Binding="{Binding FaultType}" Value="CHẬP MẠCH">
+                            <DataTrigger Binding="{Binding IsLiveTopologyPresentation}" Value="True">
                                 <Setter Property="Foreground" Value="#FF0000"/>
                                 <Setter Property="FontWeight" Value="Bold"/>
                             </DataTrigger>
@@ -426,7 +432,7 @@
                 </Trigger>
                 <!-- LiveTopology: DataGridCell đang đặt Foreground riêng nên phải
                      đổi màu ngay tại Cell; đổi ở DataGridRow thôi sẽ bị ghi đè. -->
-                <DataTrigger Binding="{Binding FaultType}" Value="CHẬP MẠCH">
+                <DataTrigger Binding="{Binding IsLiveTopologyPresentation}" Value="True">
                     <Setter Property="Foreground" Value="#FF0000"/>
                     <Setter Property="FontWeight" Value="Bold"/>
                 </DataTrigger>

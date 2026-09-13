@@ -78,7 +78,6 @@ public partial class TopologyLearningWindow : Window
     private void UpdateBoardStatus()
     {
         bool ready = _test.IsBoardConnected && !_test.IsDeviceFault;
-        BoardStatusText.Text = ready ? "BO ĐÃ KẾT NỐI" : "BO ĐANG KHỞI TẠO";
         DiagnoseButton.IsEnabled = ready;
         if (!ready)
         {

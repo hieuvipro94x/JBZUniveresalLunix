@@ -72,6 +72,10 @@ public sealed class FaultRow : ObservableObject
     public bool IsNetworkPassed =>
         Kind == FaultKind.Info &&
         string.Equals(FaultType, "THÔNG MẠCH", StringComparison.OrdinalIgnoreCase);
+    public bool IsLiveTopologyPresentation =>
+        Kind == FaultKind.Info &&
+        ProductFaultType == ProductFaultType.None &&
+        string.Equals(FaultType, "CHẬP MẠCH", StringComparison.OrdinalIgnoreCase);
 
     public Brush RowBackgroundBrush => Kind switch
     {

@@ -22,7 +22,7 @@ public sealed class DiscardContactInterlock
         Idle,
         AwaitingOpenBaseline,
         AwaitingFirstPass,
-        AwaitingReleaseAfterFirstPass,
+        AwaitingReleaseAfterPass,
         Completed
     }
 
@@ -61,9 +61,9 @@ public sealed class DiscardContactInterlock
                     _state = State.AwaitingFirstPass;
                     break;
                 case State.AwaitingFirstPass when contactClosed:
-                    _state = State.AwaitingReleaseAfterFirstPass;
+                    _state = State.AwaitingReleaseAfterPass;
                     return DiscardContactTransition.FirstPassDetected;
-                case State.AwaitingReleaseAfterFirstPass when !contactClosed:
+                case State.AwaitingReleaseAfterPass when !contactClosed:
                     _state = State.Completed;
                     return DiscardContactTransition.Completed;
             }

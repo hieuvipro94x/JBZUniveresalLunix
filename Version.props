@@ -15,15 +15,15 @@
       VersionFileTag  12_10_2 -> next release
   -->
   <PropertyGroup>
-    <VersionPrefix>16.0.321</VersionPrefix>
-    <Version>16.0.321</Version>
-    <AssemblyVersion>16.0.321.0</AssemblyVersion>
-    <FileVersion>16.0.321.0</FileVersion>
-    <InformationalVersion>16.0.321</InformationalVersion>
+    <VersionPrefix>16.0.323</VersionPrefix>
+    <Version>16.0.323</Version>
+    <AssemblyVersion>16.0.323.0</AssemblyVersion>
+    <FileVersion>16.0.323.0</FileVersion>
+    <InformationalVersion>16.0.323</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
-    <VersionFileTag>16_0_321</VersionFileTag>
+    <VersionFileTag>16_0_323</VersionFileTag>
     <Product>JBZUniversalTester</Product>
-    <AssemblyTitle>JBZUniversalTester V16.0.321</AssemblyTitle>
+    <AssemblyTitle>JBZUniversalTester V16.0.323</AssemblyTitle>
     <Description>JBZ Universal Tester - Production Harness Tester</Description>
     <Company>JBZ</Company>
     <Copyright>Copyright ??????????????????렞??????猷뱀삌????怨????????????JBZ 2026</Copyright>

@@ -253,7 +253,22 @@ public sealed record ProductionResultCommitRequest(
             PartIdentitySnapshot.Capture(model),
             ModelIdentitySnapshot.Capture(model),
             ProductionConfigSnapshot.Capture(settings, appVersion),
-            faults.Select(FaultPersistenceSnapshot.Capture).ToArray(),
+            faults
+                .Select(FaultPersistenceSnapshot.Capture)
+                .DistinctBy(item => new
+                {
+                    item.Type,
+                    item.ExpectedSourceIo,
+                    item.ExpectedTargetIo,
+                    item.ActualSourceIo,
+                    item.ActualTargetIo,
+                    item.WireName,
+                    item.MeasuredResistance,
+                    item.ResistanceMin,
+                    item.ResistanceMax
+                })
+                .Select((item, order) => item with { Order = order })
+                .ToArray(),
             resistance.Select(ResistancePersistenceSnapshot.Capture).ToArray(),
             waterProof?.Select(item => new WaterProofPersistenceSnapshot(
                 item.Channel,

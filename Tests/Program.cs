@@ -57,6 +57,7 @@ internal static class Program
             ("Learned diagnostic topology normalization and persistence", TestLearnedTopology),
             ("Relay PASS/FAIL safe ordering", TestRelayOrdering),
             ("History SQLite/search/CSV/XLSX native types", TestHistory),
+            ("History exactly-once transaction crash recovery", TestHistoryTransactionAtomicity),
             ("Legacy SQLite without SchemaInfo initializes safely", TestLegacyDatabaseWithoutSchemaInfo),
             ("SQLite schema v5 many-to-many migration and query plans", TestDatabaseSchemaV5),
             ("History initialization waits for an active SQLite writer", TestHistoryInitializationWaitsForWriter),
@@ -227,21 +228,19 @@ internal static class Program
         tracker.Arm(contactClosed: false);
         Assert(tracker.Observe(contactClosed: true) == DiscardContactTransition.FirstPassDetected &&
                tracker.IsArmed && !tracker.IsCompleted,
-            "The first fresh NG-bin sensor activation locks Production");
+            "A fresh NG-bin sensor activation starts the one-pass confirmation");
         Assert(tracker.Observe(contactClosed: true) == DiscardContactTransition.None,
-            "A held contact cannot count as the second activation");
-        Assert(tracker.Observe(contactClosed: false) == DiscardContactTransition.None &&
-               tracker.Observe(contactClosed: true) == DiscardContactTransition.Completed &&
+            "A held contact cannot complete the one-pass confirmation");
+        Assert(tracker.Observe(contactClosed: false) == DiscardContactTransition.Completed &&
                tracker.IsCompleted,
-            "The sensor must release before the second activation completes the interlock");
+            "The first OFF after ON completes the one-pass confirmation");
 
         tracker.Arm(contactClosed: true);
         Assert(tracker.Observe(contactClosed: true) == DiscardContactTransition.None &&
                tracker.Observe(contactClosed: false) == DiscardContactTransition.None &&
                tracker.Observe(contactClosed: true) == DiscardContactTransition.FirstPassDetected &&
-               tracker.Observe(contactClosed: false) == DiscardContactTransition.None &&
-               tracker.Observe(contactClosed: true) == DiscardContactTransition.Completed,
-            "A sensor active at ARM must return open before two new activations can complete it");
+               tracker.Observe(contactClosed: false) == DiscardContactTransition.Completed,
+            "A sensor active at ARM must return open before one new ON-to-OFF pass can complete it");
 
         ScanFrame inputStyleSensorFrame = FrameSeq(2, (12, new[] { 97 }));
         Assert(DiscardContactInterlock.GetActiveContactIo(inputStyleSensorFrame, model.DiscardContactIo)
@@ -269,14 +268,45 @@ internal static class Program
                    .SequenceEqual(["_DISCARD IO(97)", "_DISCARD IO(98)"]),
             "First _DISCARD activation locks TEST and temporarily shows both configured _DISCARD rows");
         discardBoard.Publish(FrameSeq(11));
-        Assert(discardVm.IsProductRemovalPending,
-            "Releasing the sensor after pass one keeps TEST locked");
-        discardBoard.Publish(FrameSeq(12, (13, new[] { 98 })));
         Assert(!discardVm.IsProductRemovalPending &&
                discardVm.Total == totalBeforeDiscard &&
                discardVm.Fail == failBeforeDiscard,
-            $"Second _DISCARD activation unlocks TEST without recording a product result " +
+            $"One _DISCARD ON-to-OFF pass unlocks TEST without recording a product result " +
             $"(pending={discardVm.IsProductRemovalPending}, total={discardVm.Total}, fail={discardVm.Fail}, state={discardVm.State})");
+
+        TestViewModel faultDiscardVm = CreateTestViewModel(production, out FakeBoard faultDiscardBoard);
+        faultDiscardVm.LoadPreparedModelAsync(discardModel).GetAwaiter().GetResult();
+        faultDiscardVm.StartProductionTestAsync().GetAwaiter().GetResult();
+        MethodInfo armFaultRemoval = typeof(TestViewModel).GetMethod(
+            "ArmFaultProductRemoval",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Fault-removal ARM method not found");
+        MethodInfo tryCompleteFaultRemoval = typeof(TestViewModel).GetMethod(
+            "TryCompleteFaultProductRemoval",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Fault-removal completion method not found");
+        FieldInfo faultProductRemoved = typeof(TestViewModel).GetField(
+            "_faultProductRemoved",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Fault-removal product gate not found");
+
+        armFaultRemoval.Invoke(faultDiscardVm, [discardModel]);
+        faultProductRemoved.SetValue(faultDiscardVm, 1);
+        tryCompleteFaultRemoval.Invoke(faultDiscardVm, null);
+        Assert(faultDiscardVm.IsProductRemovalPending &&
+               faultDiscardVm.CenterResultText == "ĐƯA HÀNG VÀO THÙNG HÀNG LỖI" &&
+               faultDiscardVm.ResultStatusText == "CHỜ XÁC NHẬN THÙNG LỖI",
+            "Product removal alone cannot unlock a discard-required FAIL and both UI regions show the discard gate");
+
+        faultDiscardBoard.Publish(FrameSeq(20, (12, new[] { 97 })));
+        Assert(faultDiscardVm.IsProductRemovalPending,
+            "Discard OFF-to-ON is only the entry edge and cannot complete fault removal");
+        faultDiscardBoard.Publish(FrameSeq(21));
+        Assert(!faultDiscardVm.IsProductRemovalPending &&
+               faultDiscardVm.State == "CHỜ LẮP SẢN PHẨM" &&
+               faultDiscardVm.ResultStatusText == "LẮP SẢN PHẨM" &&
+               faultDiscardVm.CenterResultText == "LẮP SẢN PHẨM",
+            "One discard ON-to-OFF pass completes both gates and returns every UI state to ready");
 
         string testViewModelSource = File.ReadAllText(
             Path.Combine(Environment.CurrentDirectory, "ViewModels", "TestViewModel.cs"));
@@ -1156,10 +1186,10 @@ internal static class Program
         Assert(!enabledMasterVm.MasterApproved && enabledMasterVm.IsMasterSequenceActive,
             "Master min 1 keeps Master workflow enabled");
         Assert(enabledMasterVm.MasterRequiredFaultCount == 1, "Master min 1 requires one unique fault");
-        Assert(enabledMasterVm.ResultStatusText == "LẮP SẢN PHẨM" &&
+        Assert(enabledMasterVm.ResultStatusText == "KIỂM TRA MASTER ĐẠT" &&
                enabledMasterVm.State == "KIỂM TRA MASTER PASS" &&
                enabledMasterVm.StateBackground == "#FFF3A0",
-            "Waiting Master uses the shared install-product display and canonical yellow background");
+            "Waiting Master identifies the required good sample and keeps the canonical yellow background");
 
         TestViewModel masterExitVm = CreateTestViewModel(
             new ProductionSettings { MasterFaultRequiredCount = 1 },
@@ -1183,9 +1213,9 @@ internal static class Program
             "Master removal gate remains locked while the sample is physically connected");
         masterExitBoard.Publish(FrameSeq(102));
         Assert(!masterExitVm.IsProductRemovalPending &&
-               masterExitVm.ResultStatusText == "LẮP SẢN PHẨM" &&
+               masterExitVm.ResultStatusText == "KIỂM TRA MASTER ĐẠT" &&
                masterExitVm.Faults.Count == 0,
-            "Fresh empty frame after leaving Master clears the stale removal latch and table");
+            "Fresh empty frame after leaving Master clears the stale removal latch/table without losing the required Master type");
 
         FieldInfo masterGoodVerified = typeof(TestViewModel).GetField(
             "_masterGoodVerified",
@@ -1198,7 +1228,7 @@ internal static class Program
             ?? throw new InvalidOperationException("Bad-Master transition not found");
         transitionToBadMaster.Invoke(enabledMasterVm, null);
         Assert(enabledMasterVm.MasterState == MasterSequenceState.WaitingBadMaster &&
-               enabledMasterVm.ResultStatusText == "LẮP SẢN PHẨM" &&
+               enabledMasterVm.ResultStatusText == "KIỂM TRA MASTER LỖI" &&
                enabledMasterVm.WrongCountText == "0/1" &&
                enabledMasterVm.Faults.Count == 0,
             "Bad Master starts at 0/N in the wrong-wiring counter and keeps an empty table");
@@ -1773,8 +1803,10 @@ internal static class Program
         string d2xxSource = File.ReadAllText(
             Path.Combine(Environment.CurrentDirectory, "Services", "D2xxBoardTransport.cs"));
         Assert(d2xxSource.Contains("const int RelayCommandSettleMs = 100;", StringComparison.Ordinal) &&
-               d2xxSource.Contains("await Task.Delay(RelayCommandSettleMs, ct);", StringComparison.Ordinal),
-            "D2XX waits for firmware to latch relay OFF before RESET or START_SCAN");
+               d2xxSource.Contains("await Task.Delay(RelayCommandSettleMs, CancellationToken.None);", StringComparison.Ordinal) &&
+               d2xxSource.IndexOf("await Task.Delay(RelayCommandSettleMs, CancellationToken.None);", StringComparison.Ordinal) <
+               d2xxSource.IndexOf("Volatile.Write(ref _activeRelay, relayState);", StringComparison.Ordinal),
+            "D2XX completes the non-cancellable firmware relay settle before caching the new relay state");
     }
 
     private static void TestStartupIoInterlock()
@@ -2643,9 +2675,9 @@ internal static class Program
         Assert(resultStyleUses == 1 &&
                !xaml.Contains("WaterProofResultCellStyle", StringComparison.Ordinal),
             "Only the resistance/final result table remains; the removed Leak detail grid has no result column");
-        Assert(xaml.Contains("<Viewbox Margin=\"10\"", StringComparison.Ordinal) &&
+        Assert(xaml.Contains("<Viewbox Grid.Row=\"0\"", StringComparison.Ordinal) &&
                xaml.Contains("StretchDirection=\"DownOnly\"", StringComparison.Ordinal),
-            "Large result text scales down to keep PASS/KHÔNG ĐẠT/LẮP SẢN PHẨM inside its box");
+            "The fixed Htdrv header surface scales down at narrow resolutions without scaling up above design size");
 
         ProductModel connectorModel = HtdrvTwoEndpointModel();
         using TestEngine connectorEngine = CreateEngine(out _);
@@ -4975,6 +5007,67 @@ internal static class Program
                faultDialogXaml.Contains("x:Name=\"SummaryText\"", StringComparison.Ordinal) &&
                faultDialogSource.Contains("ApplyCompactSummary(summary);", StringComparison.Ordinal),
             "FAIL dialog uses a compact auto-height layout without duplicating its fault title");
+
+        MethodInfo compactFaultSummary = typeof(FaultConfirmationWindow).GetMethod(
+            "BuildShortSummary",
+            BindingFlags.Static | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Compact fault summary formatter not found");
+        var popupPins = new Dictionary<int, PinRecord>
+        {
+            [4] = new PinRecord("CN1", "BG1", 4, "1"),
+            [8] = new PinRecord("CN2", "BF2", 8, "2")
+        };
+        Func<int, PinRecord?> popupResolver = io => popupPins.GetValueOrDefault(io);
+        string popupMappedWrongSummary = (string)(compactFaultSummary.Invoke(null, [
+            new FaultDetail
+            {
+                Type = ProductFaultType.WrongWiring,
+                ActualSourceIo = 4,
+                ActualTargetIo = 8
+            },
+            popupResolver
+        ]) ?? string.Empty);
+        string popupUnmappedWrongSummary = (string)(compactFaultSummary.Invoke(null, [
+            new FaultDetail
+            {
+                Type = ProductFaultType.WrongWiring,
+                ActualSourceIo = 4,
+                ActualTargetIo = 12
+            },
+            popupResolver
+        ]) ?? string.Empty);
+        Assert(popupMappedWrongSummary == "LỖI SAI DÂY\n\nBG1 NỐI NHẦM BF2" &&
+               popupUnmappedWrongSummary == "LỖI SAI DÂY\n\nBG1 NỐI IO(12)",
+            "Fault popup prioritizes THT wire names and falls back to compact IO(n) only for unmapped endpoints");
+        PinRecord bg1 = new("CN1", "BG1", 4, "1");
+        PinRecord bf2 = new("CN2", "BF2", 8, "2");
+        Func<int, PinRecord?> namedResolver = io => io switch
+        {
+            4 => bg1,
+            8 => bf2,
+            _ => null
+        };
+        string namedWrongSummary = (string)(compactFaultSummary.Invoke(null, [
+            new FaultDetail
+            {
+                Type = ProductFaultType.WrongWiring,
+                ActualSourceIo = 4,
+                ActualTargetIo = 8
+            },
+            namedResolver
+        ]) ?? string.Empty);
+        string unmappedWrongSummary = (string)(compactFaultSummary.Invoke(null, [
+            new FaultDetail
+            {
+                Type = ProductFaultType.WrongWiring,
+                ActualSourceIo = 4,
+                ActualTargetIo = 12
+            },
+            namedResolver
+        ]) ?? string.Empty);
+        Assert(namedWrongSummary == "LỖI SAI DÂY\n\nBG1 NỐI NHẦM BF2" &&
+               unmappedWrongSummary == "LỖI SAI DÂY\n\nBG1 NỐI IO(12)",
+            "FAIL popup prioritizes THT wire names and falls back to compact IO(n) only for unmapped endpoints");
 
         string mainWindowXaml = File.ReadAllText(
             Path.Combine(Environment.CurrentDirectory, "Views", "MainWindow.xaml"));
@@ -7771,6 +7864,203 @@ internal static class Program
         return Convert.ToInt32(command.ExecuteScalar() ?? 0, CultureInfo.InvariantCulture);
     }
 
+    private static void TestHistoryTransactionAtomicity()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "JBZHistoryAtomicity", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string[] failurePoints =
+            [
+                "Tests:BEFORE INSERT ON Tests",
+                "Faults:BEFORE INSERT ON TestFaults",
+                "Resistance:BEFORE INSERT ON ResistanceMeasurements",
+                "WaterProof:BEFORE INSERT ON WaterProofMeasurements",
+                "Totals:BEFORE UPDATE OF TotalTests ON Parts",
+                "ActiveCycle:BEFORE DELETE ON ActiveTestCycles"
+            ];
+
+            foreach (string failurePoint in failurePoints)
+            {
+                string[] parts = failurePoint.Split(':', 2);
+                string databasePath = Path.Combine(root, parts[0] + ".db");
+                var store = new TestHistoryStore(databasePath);
+                string cycleId = "atomic-" + parts[0].ToLowerInvariant();
+                ProductModel model = Model(("ATOMIC-WIRE", new[] { 1, 18 }));
+                model.PartNumber = "ATOMIC-PART";
+                model.ModelName = "ATOMIC-MODEL";
+                model.SourcePath = Path.Combine(root, "atomic.tht");
+                DateTime at = new(2026, 9, 13, 10, 0, 0, DateTimeKind.Local);
+                var history = new TestHistoryRecord
+                {
+                    Started = at,
+                    Finished = at.AddSeconds(2),
+                    ResultAt = at.AddSeconds(2),
+                    InspectionType = HistoryInspectionType.Product,
+                    PartNumber = model.PartNumber,
+                    ModelName = model.ModelName,
+                    ModelFile = model.SourcePath,
+                    Result = "FAIL",
+                    Passed = false,
+                    CycleId = cycleId
+                };
+                var duplicateFault = new FaultDetail
+                {
+                    Type = ProductFaultType.WrongWiring,
+                    ExpectedSourceIo = 1,
+                    ExpectedTargetIo = 18,
+                    ActualSourceIo = 1,
+                    ActualTargetIo = 19,
+                    WireName = "ATOMIC-WIRE"
+                };
+                var resistance = new ResistanceResult
+                {
+                    Channel = 1,
+                    Name = "R1",
+                    ValueOhm = 101,
+                    MinOhm = 100,
+                    MaxOhm = 110,
+                    Passed = true
+                };
+                var waterProof = new WaterProofChannelMeasurement(1, true, 85, 84.8, 0.2, true);
+                ProductionResultCommitRequest request = ProductionResultCommitRequest.Capture(
+                    history,
+                    model,
+                    new ProductionSettings(),
+                    [duplicateFault, duplicateFault],
+                    [resistance],
+                    [waterProof],
+                    ProgramIdentityService.VersionText);
+                Assert(request.Faults.Count == 1,
+                    "Repeated physical fault observations collapse before the transaction boundary");
+
+                store.UpsertActiveCycle(cycleId, model.PartNumber, model.SourcePath, at, "TEST_STARTED");
+                ExecuteSql(databasePath,
+                    $"CREATE TRIGGER InjectFailure {parts[1]} BEGIN SELECT RAISE(ABORT,'injected crash'); END;");
+                AssertThrows<SqliteException>(
+                    () => store.CommitResult(request, null),
+                    $"Injected failure at {parts[0]} must escape the commit");
+                Assert(ScalarInt(databasePath,
+                           "SELECT (SELECT COUNT(*) FROM Tests) + " +
+                           "(SELECT COUNT(*) FROM TestFaults) + " +
+                           "(SELECT COUNT(*) FROM ResistanceMeasurements) + " +
+                           "(SELECT COUNT(*) FROM WaterProofMeasurements);") == 0 &&
+                       CountActiveCycles(databasePath, cycleId) == 1 &&
+                       ScalarText(databasePath, "PRAGMA integrity_check;") == "ok",
+                    $"Failure at {parts[0]} rolls back the whole result while retaining the recoverable active cycle");
+
+                ExecuteSql(databasePath, "DROP TRIGGER InjectFailure;");
+                ProductionCommitResult first = store.CommitResult(request, null);
+                ProductionCommitResult duplicate = store.CommitResult(request, null);
+                Assert(!first.AlreadyCommitted && duplicate.AlreadyCommitted &&
+                       first.TestId == duplicate.TestId &&
+                       ScalarInt(databasePath, "SELECT COUNT(*) FROM Tests;") == 1 &&
+                       ScalarInt(databasePath, "SELECT COUNT(*) FROM TestFaults;") == 1 &&
+                       ScalarInt(databasePath, "SELECT COUNT(*) FROM ResistanceMeasurements;") == 1 &&
+                       ScalarInt(databasePath, "SELECT COUNT(*) FROM WaterProofMeasurements;") == 1 &&
+                       ScalarInt(databasePath, "SELECT TotalTests FROM Parts WHERE PartNumber='ATOMIC-PART';") == 1 &&
+                       CountActiveCycles(databasePath, cycleId) == 0,
+                    $"Retry after {parts[0]} commits exactly once with one child row per physical observation");
+
+                DateTime removalStarted = at.AddSeconds(3);
+                Assert(store.UpdateRemovalTiming(cycleId, removalStarted, at.AddSeconds(4)) &&
+                       ScalarInt(databasePath, "SELECT COUNT(*) FROM Tests;") == 1,
+                    "Removal/discard completion updates the same CycleId and never inserts another result");
+                Assert(ScalarInt(databasePath,
+                           "SELECT COUNT(*) FROM TestFaults f LEFT JOIN Tests t ON t.Id=f.TestId WHERE t.Id IS NULL;") == 0 &&
+                       ScalarInt(databasePath,
+                           "SELECT COUNT(*) FROM ResistanceMeasurements r LEFT JOIN Tests t ON t.Id=r.TestId WHERE t.Id IS NULL;") == 0 &&
+                       ScalarInt(databasePath,
+                           "SELECT COUNT(*) FROM WaterProofMeasurements w LEFT JOIN Tests t ON t.Id=w.TestId WHERE t.Id IS NULL;") == 0,
+                    "Committed database contains no orphan detail rows");
+            }
+
+            string isolationPath = Path.Combine(root, "snapshot-isolation.db");
+            var isolationStore = new TestHistoryStore(isolationPath);
+            DateTime snapshotAt = new(2026, 9, 14, 0, 0, 1, DateTimeKind.Local);
+            ProductModel oldModel = Model(("OLD-WIRE", new[] { 1, 18 }));
+            oldModel.PartNumber = "OLD-PART";
+            oldModel.ModelName = "OLD-MODEL";
+            oldModel.SourcePath = Path.Combine(root, "old.tht");
+            var oldHistory = new TestHistoryRecord
+            {
+                Started = snapshotAt,
+                Finished = snapshotAt.AddSeconds(1),
+                ResultAt = snapshotAt.AddSeconds(1),
+                InspectionType = HistoryInspectionType.Product,
+                PartNumber = oldModel.PartNumber,
+                ModelName = oldModel.ModelName,
+                ModelFile = oldModel.SourcePath,
+                Result = "PASS",
+                Passed = true,
+                CycleId = "old-model-callback"
+            };
+            ProductionResultCommitRequest oldSnapshot = ProductionResultCommitRequest.Capture(
+                oldHistory, oldModel, new ProductionSettings(), [], [], null,
+                ProgramIdentityService.VersionText);
+            oldModel.PartNumber = "NEW-PART";
+            oldModel.ModelName = "NEW-MODEL";
+            oldModel.SourcePath = Path.Combine(root, "new.tht");
+            isolationStore.CommitResult(oldSnapshot, null);
+            Assert(ScalarText(isolationPath,
+                       "SELECT p.PartNumber || '|' || m.ModelName FROM Tests t " +
+                       "JOIN Parts p ON p.Id=t.PartId JOIN Models m ON m.Id=t.ModelId " +
+                       "WHERE t.CycleId='old-model-callback';") == "OLD-PART|OLD-MODEL" &&
+                   ScalarInt(isolationPath,
+                       "SELECT COUNT(*) FROM Tests t JOIN Parts p ON p.Id=t.PartId WHERE p.PartNumber='NEW-PART';") == 0,
+                "A queued persistence callback owns immutable old-model snapshots and cannot write into the newly selected model");
+
+            var masterHistory = oldHistory.ClonePersistenceSnapshot();
+            masterHistory.Id = 0;
+            masterHistory.CycleId = "master-good-isolated";
+            masterHistory.InspectionType = HistoryInspectionType.MasterGood;
+            masterHistory.Result = "MASTER_GOOD_PASS";
+            ProductionResultCommitRequest masterRequest = ProductionResultCommitRequest.Capture(
+                masterHistory, oldModel, new ProductionSettings(), [], [], null,
+                ProgramIdentityService.VersionText);
+            Assert(!masterRequest.UpdateProductionTotals,
+                "Master history request is explicitly excluded from production totals and LOT authority");
+            isolationStore.CommitResult(masterRequest, null);
+            ProductionStatisticsSnapshot isolatedStats = isolationStore.GetStatistics(oldSnapshot.Part, snapshotAt);
+            Assert(ScalarInt(isolationPath,
+                       "SELECT COUNT(*) FROM Tests WHERE InspectionType='MASTER_GOOD';") == 1 &&
+                   isolatedStats.LifetimeTotal == 1,
+                "Master history is stored separately while product counters still contain only the physical product cycle");
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static void ExecuteSql(string databasePath, string sql)
+    {
+        using var connection = new SqliteConnection($"Data Source={databasePath};Pooling=False");
+        connection.Open();
+        using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    private static int ScalarInt(string databasePath, string sql)
+    {
+        using var connection = new SqliteConnection($"Data Source={databasePath};Pooling=False");
+        connection.Open();
+        using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToInt32(command.ExecuteScalar() ?? 0, CultureInfo.InvariantCulture);
+    }
+
+    private static string ScalarText(string databasePath, string sql)
+    {
+        using var connection = new SqliteConnection($"Data Source={databasePath};Pooling=False");
+        connection.Open();
+        using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToString(command.ExecuteScalar(), CultureInfo.InvariantCulture) ?? string.Empty;
+    }
+
     private static void Assert(bool condition, string message)
     {
         if (!condition)
@@ -7874,17 +8164,20 @@ internal static class Program
                     (2, new[] { 4 }),
                     (4, new[] { 2 })),
                 capacity);
-            Assert(twoPairTopology.Rows.Count == 2 &&
+            Assert(twoPairTopology.Rows.Count == 4 &&
                    twoPairTopology.Pairs.SequenceEqual([
                        new LiveTopologyPair(1, 3),
                        new LiveTopologyPair(2, 4)]) &&
-                   twoPairTopology.Components.Count == 2,
-                "LiveTopology uses exact board edges and canonicalizes reverse directions once");
+                   twoPairTopology.Components.Count == 2 &&
+                   twoPairTopology.Rows.All(row => row.IsLiveTopologyPresentation) &&
+                   twoPairTopology.Rows.Select(row => row.IsNetworkStart)
+                       .SequenceEqual([true, false, true, false]),
+                "LiveTopology renders two safe rows per exact board edge and canonicalizes reverse directions once");
 
             LiveTopologySnapshot onePairRemoved = LiveTopologyPresenter.Build(
                 FrameSeq(21, (4, new[] { 2 })),
                 capacity);
-            Assert(onePairRemoved.Rows.Count == 1 &&
+            Assert(onePairRemoved.Rows.Count == 2 &&
                    onePairRemoved.Pairs.Single() == new LiveTopologyPair(2, 4),
                 "LiveTopology removal drops only the missing pair and retains the other pair");
 
@@ -7934,9 +8227,8 @@ internal static class Program
             board.Publish(FrameSeq(3, (4, new[] { 9 })));
 
             Assert(vm.IsIoMappingMode &&
-                   vm.Faults.Count == 1 &&
-                   vm.Faults[0].ActualSourceIo == 4 &&
-                   vm.Faults[0].ActualTargetIo == 9 &&
+                   vm.Faults.Count == 2 &&
+                   vm.Faults.All(row => row.ActualSourceIo == 4 && row.ActualTargetIo == 9) &&
                    vm.CurrentProductionRuntimeState == ProductionRuntimeState.TestingRealtime &&
                    vm.CurrentProductionPresentationMode == ProductionPresentationMode.LiveTopology &&
                    vm.Total == 0 && vm.Pass == 0 && vm.Fail == 0 &&
@@ -7969,9 +8261,8 @@ internal static class Program
 
             board.Publish(FrameSeq(5));
             Assert(!AppSoundService.Current.IsTestPointContactSoundActive &&
-                   vm.Faults.Count == 1 &&
-                   vm.Faults[0].ActualSourceIo == 4 &&
-                   vm.Faults[0].ActualTargetIo == 9 &&
+                   vm.Faults.Count == 2 &&
+                   vm.Faults.All(row => row.ActualSourceIo == 4 && row.ActualTargetIo == 9) &&
                    vm.CurrentProductionRuntimeState == ProductionRuntimeState.TestingRealtime &&
                    vm.CurrentProbePresentationState == ProbePresentationState.Released &&
                    vm.CurrentProductionPresentationMode == ProductionPresentationMode.LiveTopology &&
@@ -7979,17 +8270,18 @@ internal static class Program
                 "Blank THT Probe RELEASE restores the exact prior LiveTopology snapshot");
 
             board.Publish(FrameSeq(6, (1, new[] { 3 }), (3, new[] { 1 }), (2, new[] { 4 }), (4, new[] { 2 })));
-            Assert(vm.Faults.Count == 2 &&
+            Assert(vm.Faults.Count == 4 &&
                    vm.Faults.Select(row => (row.ActualSourceIo, row.ActualTargetIo)).SequenceEqual([
                        ((int?)1, (int?)3),
+                       ((int?)1, (int?)3),
+                       ((int?)2, (int?)4),
                        ((int?)2, (int?)4)]) &&
                    vm.Total == 0 && vm.Pass == 0 && vm.Fail == 0,
                 "Empty THT renders exactly two canonical live pairs without PASS/FAIL");
 
             board.Publish(FrameSeq(7, (4, new[] { 2 })));
-            Assert(vm.Faults.Count == 1 &&
-                   vm.Faults[0].ActualSourceIo == 2 &&
-                   vm.Faults[0].ActualTargetIo == 4,
+            Assert(vm.Faults.Count == 2 &&
+                   vm.Faults.All(row => row.ActualSourceIo == 2 && row.ActualTargetIo == 4),
                 "Empty THT removal removes IO1<->IO3 immediately and retains IO2<->IO4");
 
             board.Publish(FrameSeq(8, (1, new[] { 3 }), (2, new[] { 4 })));
@@ -8001,7 +8293,7 @@ internal static class Program
                    vm.CurrentProductionRuntimeState == ProductionRuntimeState.TestingRealtime,
                 "Empty THT Probe temporarily owns the table while ProductState remains Present");
             board.Publish(FrameSeq(10));
-            Assert(vm.Faults.Count == 2 &&
+            Assert(vm.Faults.Count == 4 &&
                    vm.Faults.Any(row => row.ActualSourceIo == 1 && row.ActualTargetIo == 3) &&
                    vm.Faults.Any(row => row.ActualSourceIo == 2 && row.ActualTargetIo == 4) &&
                    vm.CurrentProductionRuntimeState == ProductionRuntimeState.TestingRealtime,
@@ -8009,9 +8301,8 @@ internal static class Program
 
             board.Publish(FrameSeq(100, (1, new[] { 3 })));
             board.Publish(FrameSeq(99, (2, new[] { 4 })));
-            Assert(vm.Faults.Count == 1 &&
-                   vm.Faults[0].ActualSourceIo == 1 &&
-                   vm.Faults[0].ActualTargetIo == 3,
+            Assert(vm.Faults.Count == 2 &&
+                   vm.Faults.All(row => row.ActualSourceIo == 1 && row.ActualTargetIo == 3),
                 "An older LiveTopology snapshot cannot overwrite the latest rendered frame");
 
             ProductModel noEligibleNetModel = new()

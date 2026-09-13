@@ -43,7 +43,7 @@ public partial class FaultConfirmationWindow : Window
 
         string summary = primaryFault is null
             ? "KIỂM TRA SẢN PHẨM"
-            : BuildShortSummary(primaryFault);
+            : BuildShortSummary(primaryFault, _pinResolver);
         ApplyCompactSummary(summary);
 
         FaultItemsControl.ItemsSource = displays;
@@ -61,7 +61,9 @@ public partial class FaultConfirmationWindow : Window
             : "VUI LÒNG KIỂM TRA SẢN PHẨM";
     }
 
-    private string BuildShortSummary(FaultDetail fault)
+    private static string BuildShortSummary(
+        FaultDetail fault,
+        Func<int, PinRecord?>? pinResolver)
     {
         if (fault.Type == ProductFaultType.SystemDeviceError)
             return "LỖI GIAO TIẾP THIẾT BỊ\n\nVUI LÒNG KHỞI ĐỘNG LẠI";
@@ -69,8 +71,8 @@ public partial class FaultConfirmationWindow : Window
         if (fault.Type is not (ProductFaultType.WrongWiring or ProductFaultType.ShortCircuit))
             return FaultDisplayFormatter.FormatOperator(fault).Title;
 
-        PinRecord? actualFrom = ResolveActualPin(fault.ActualSourceIo);
-        PinRecord? actualTo = ResolveActualPin(fault.ActualTargetIo);
+        PinRecord? actualFrom = ResolveActualPin(fault.ActualSourceIo, pinResolver);
+        PinRecord? actualTo = ResolveActualPin(fault.ActualTargetIo, pinResolver);
 
         // Popup vận hành phải ưu tiên tên dây thật trong THT.
         // Chỉ khi IO không có WireName/cấu hình trong THT mới hiện IO(n).
@@ -145,12 +147,14 @@ public partial class FaultConfirmationWindow : Window
             : "IO(?)";
     }
 
-    private PinRecord? ResolveActualPin(int? io)
+    private static PinRecord? ResolveActualPin(
+        int? io,
+        Func<int, PinRecord?>? pinResolver)
     {
-        if (_pinResolver is null || io is not int value || value <= 0)
+        if (pinResolver is null || io is not int value || value <= 0)
             return null;
 
-        return _pinResolver(value);
+        return pinResolver(value);
     }
 
     private static string FormatMappedEndpoint(PinRecord pin, int? io)
