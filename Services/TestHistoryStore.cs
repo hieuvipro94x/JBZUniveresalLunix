@@ -1917,10 +1917,11 @@ public sealed class TestHistoryStore
         using SqliteConnection connection = Open();
         using SqliteCommand command = connection.CreateCommand();
         command.CommandText = """
-            SELECT DISTINCT m.FileName,m.FilePath,m.ModelName
+            SELECT m.FileName,m.FilePath,m.ModelName
             FROM Tests t
             JOIN Models m ON m.Id=t.ModelId
-            ORDER BY m.FileName COLLATE NOCASE,m.FilePath COLLATE NOCASE;
+            GROUP BY m.FileName,m.FilePath,m.ModelName
+            ORDER BY MAX(t.ResultAt) DESC,MAX(t.Id) DESC;
             """;
         using SqliteDataReader reader = command.ExecuteReader();
         var result = new List<HistoryPartOption> { new(string.Empty, "TẤT CẢ MÃ HÀNG") };
