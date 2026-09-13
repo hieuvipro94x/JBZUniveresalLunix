@@ -3522,13 +3522,19 @@ public sealed class TestViewModel : ObservableObject
                     // tracker nhận đủ RELEASE frame, nếu không frame đuôi này sẽ
                     // lọt sang ProductDetect/WRONG_CANDIDATE.
                     bool probeTransitionPending = _probeStateTracker.HasTrackedContacts;
+                    bool directConnectionEvidence =
+                        ProbeContactClassifier.HasDirectConnectionEvidence(frame);
                     bool discardContactClosed =
                         Volatile.Read(ref _discardContactClosed) != 0 &&
                         _model is { HasDiscardInterlock: true };
                     probeChanged = discardContactClosed
                         ? false
                         : UpdateInlineProbeContacts(Array.Empty<int>());
-                    preserveProductionFaultsForProbe = probeTransitionPending;
+                    // Trace Htdrv: sau khi nhấc đầu dò, dây chập còn lại xuất hiện
+                    // ngay thành cạnh low-fan-in (hit=1). Không được để debounce
+                    // RELEASE nuốt các frame điện thật đầu tiên của thao tác ngắn.
+                    preserveProductionFaultsForProbe =
+                        probeTransitionPending && !directConnectionEvidence;
                     if (preserveProductionFaultsForProbe)
                         Interlocked.Increment(ref _productionFramesRoutedToProbe);
 

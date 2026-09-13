@@ -180,6 +180,31 @@ public static class ProbeContactClassifier
         // bỏ lọt phần đầu/phần đuôi của thao tác chạm đang chuyển tiếp.
         Math.Clamp((sourceCount + 15) / 16, 6, 12);
 
+    /// <summary>
+    /// Htdrv trace phân biệt cạnh điện thật (mỗi target chỉ có một/vài source)
+    /// với đầu dò (một target có fan-in lớn). Dùng dấu hiệu này để không giữ
+    /// cạnh dây thật trong quarantine RELEASE của Probe.
+    /// </summary>
+    public static bool HasDirectConnectionEvidence(ScanFrame frame)
+    {
+        if (frame.Mode != BoardScanMode.Production ||
+            !frame.Complete ||
+            frame.UnknownBytes != 0 ||
+            !frame.TerminatorKnown)
+        {
+            return false;
+        }
+
+        var fanInByTarget = new Dictionary<int, int>();
+        foreach (KeyValuePair<int, IReadOnlySet<int>> pair in frame.Connections)
+        {
+            foreach (int target in pair.Value)
+                fanInByTarget[target] = fanInByTarget.GetValueOrDefault(target) + 1;
+        }
+
+        return fanInByTarget.Any(pair => pair.Value is > 0 and <= 2);
+    }
+
     private static HashSet<long> BuildExpectedEdges(ProductModel? model)
     {
         var result = new HashSet<long>();

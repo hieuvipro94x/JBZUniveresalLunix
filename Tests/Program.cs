@@ -3140,6 +3140,17 @@ internal static class Program
             boardCapacity: BoardCapacity.Create(10));
         Assert(detections.Count == 1 && detections[0].Io == 113 && detections[0].FanIn == 20,
             "A complete frame with strong repeated fan-in identifies one Probe IO");
+        Assert(!ProbeContactClassifier.HasDirectConnectionEvidence(strongFrame),
+            "Htdrv high-fan-in Probe signature is not treated as a direct wire connection");
+
+        ScanFrame directWireFrame = FrameSeq(10, (5, new[] { 8 }), (6, new[] { 7 }));
+        Assert(ProbeContactClassifier.DetectMany(
+                   directWireFrame,
+                   model,
+                   maxContacts: 2,
+                   boardCapacity: BoardCapacity.Create(10)).Count == 0 &&
+               ProbeContactClassifier.HasDirectConnectionEvidence(directWireFrame),
+            "Htdrv hit=1 edges 5-8 and 6-7 remain direct wire evidence, not Probe");
 
         int[] spliceIos = Enumerable.Range(1, 13).ToArray();
         ProductModel largeSplice = Model(("SPLICE", spliceIos));
@@ -3152,6 +3163,28 @@ internal static class Program
                    maxContacts: 1,
                    boardCapacity: BoardCapacity.Create(1)).Count == 0,
             "A large fan-in that belongs to the expected THT splice is not misclassified as Probe");
+
+        ScanFrame twoProbeContacts = FrameSeq(
+            10,
+            Enumerable.Range(20, 20)
+                .Select(source => (source, new[] { 113, 114 }))
+                .ToArray());
+        Assert(ProbeContactClassifier.DetectMany(
+                   twoProbeContacts,
+                   model,
+                   maxContacts: 2,
+                   boardCapacity: BoardCapacity.Create(10)).Count == 2 &&
+               !ProbeContactClassifier.HasDirectConnectionEvidence(twoProbeContacts),
+            "Htdrv trace: two high-fan-in targets remain two Probe contacts, not a direct wire fault");
+
+        ScanFrame directBridgeAfterProbe = FrameSeq(11, (113, new[] { 114 }));
+        Assert(ProbeContactClassifier.DetectMany(
+                   directBridgeAfterProbe,
+                   model,
+                   maxContacts: 2,
+                   boardCapacity: BoardCapacity.Create(10)).Count == 0 &&
+               ProbeContactClassifier.HasDirectConnectionEvidence(directBridgeAfterProbe),
+            "Htdrv trace: a low-fan-in edge after Probe release is direct electrical evidence and must reach TestEngine");
     }
 
     private static void TestManualProbeSession()
