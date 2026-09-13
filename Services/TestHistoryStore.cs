@@ -1904,24 +1904,24 @@ public sealed class TestHistoryStore
         using SqliteConnection connection = Open();
         using SqliteCommand command = connection.CreateCommand();
         command.CommandText = """
-            SELECT DISTINCT p.PartNumber,p.PartName
+            SELECT DISTINCT m.FileName,m.FilePath,m.ModelName
             FROM Tests t
-            JOIN Parts p ON p.Id=t.PartId
-            ORDER BY p.PartNumber COLLATE NOCASE,p.PartName COLLATE NOCASE;
+            JOIN Models m ON m.Id=t.ModelId
+            ORDER BY m.FileName COLLATE NOCASE,m.FilePath COLLATE NOCASE;
             """;
         using SqliteDataReader reader = command.ExecuteReader();
         var result = new List<HistoryPartOption> { new(string.Empty, "TẤT CẢ MÃ HÀNG") };
         while (reader.Read())
         {
-            string number = reader.GetString(0).Trim();
-            string name = reader.GetString(1).Trim();
-            string keyword = number.Length > 0 ? number : name;
+            string fileName = reader.GetString(0).Trim();
+            string filePath = reader.GetString(1).Trim();
+            string modelName = reader.GetString(2).Trim();
+            string keyword = fileName.Length > 0
+                ? fileName
+                : filePath.Length > 0 ? Path.GetFileName(filePath) : modelName;
             if (keyword.Length == 0)
                 continue;
-            string display = name.Length > 0 && !string.Equals(name, number, StringComparison.OrdinalIgnoreCase)
-                ? $"{number} - {name}".Trim(' ', '-')
-                : keyword;
-            result.Add(new HistoryPartOption(keyword, display));
+            result.Add(new HistoryPartOption(keyword, keyword));
         }
         return result;
     }
@@ -2101,7 +2101,7 @@ public sealed class TestHistoryStore
         if (criteria.LotNo is long lot) { clauses.Add("t.Lot=$Lot"); command.Parameters.AddWithValue("$Lot", lot); }
         if (!string.IsNullOrWhiteSpace(criteria.PartKeyword))
         {
-            clauses.Add("(p.PartNumber LIKE $Part OR p.PartName LIKE $Part OR m.ModelName LIKE $Part OR t.FaultSummary LIKE $Part OR t.CycleId LIKE $Part OR CAST(t.Lot AS TEXT) LIKE $Part OR EXISTS(SELECT 1 FROM TestFaults sf WHERE sf.TestId=t.Id AND (sf.WireName LIKE $Part OR sf.ConnectorFrom LIKE $Part OR sf.ConnectorTo LIKE $Part OR sf.ActualConnectorFrom LIKE $Part OR sf.ActualConnectorTo LIKE $Part OR sf.FaultType LIKE $Part OR sf.FaultCode LIKE $Part)))");
+            clauses.Add("(p.PartNumber LIKE $Part OR p.PartName LIKE $Part OR m.ModelName LIKE $Part OR m.FileName LIKE $Part OR m.FilePath LIKE $Part OR t.FaultSummary LIKE $Part OR t.CycleId LIKE $Part OR CAST(t.Lot AS TEXT) LIKE $Part OR EXISTS(SELECT 1 FROM TestFaults sf WHERE sf.TestId=t.Id AND (sf.WireName LIKE $Part OR sf.ConnectorFrom LIKE $Part OR sf.ConnectorTo LIKE $Part OR sf.ActualConnectorFrom LIKE $Part OR sf.ActualConnectorTo LIKE $Part OR sf.FaultType LIKE $Part OR sf.FaultCode LIKE $Part)))");
             command.Parameters.AddWithValue("$Part", $"%{criteria.PartKeyword.Trim()}%");
         }
         if (!string.IsNullOrWhiteSpace(criteria.Result) && !criteria.Result.Equals("ALL", StringComparison.OrdinalIgnoreCase))

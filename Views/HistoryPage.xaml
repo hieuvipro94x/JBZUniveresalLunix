@@ -304,7 +304,7 @@
                 </StackPanel>
 
                 <StackPanel Grid.Column="6" VerticalAlignment="Top">
-                    <TextBlock Text="Mã hàng / tên hàng" Style="{StaticResource FilterLabel}"/>
+                    <TextBlock Text="File THT" Style="{StaticResource FilterLabel}"/>
                     <ComboBox x:Name="PartComboBox"
                               Style="{StaticResource FilterComboBox}"
                               DisplayMemberPath="Display"

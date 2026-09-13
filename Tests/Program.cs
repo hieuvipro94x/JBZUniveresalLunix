@@ -3406,10 +3406,9 @@ internal static class Program
                    partASummary.Total == 1 && partASummary.ProductPass == 1 &&
                    failSummary.Total == 0,
                 "History SQL summary uses the complete filtered dataset independently of page size");
-            Assert(historyParts.Count == 3 && historyParts[0].Keyword.Length == 0 &&
-                   historyParts.Any(item => item.Keyword == "PART-M2M-A") &&
-                   historyParts.Any(item => item.Keyword == "PART-M2M-B"),
-                "History part ComboBox is populated from distinct Parts that own saved Test rows");
+            Assert(historyParts.Count == 2 && historyParts[0].Keyword.Length == 0 &&
+                   historyParts.Any(item => item.Keyword == "shared.tht"),
+                "History ComboBox is populated from distinct saved THT filenames, not PartNumber");
 
             IReadOnlyList<PartModelRelationSnapshot> partA = initial.GetModelsForPart("PN:PART-M2M-A");
             IReadOnlyList<PartModelRelationSnapshot> partB = initial.GetModelsForPart("PN:PART-M2M-B");
