@@ -1,4 +1,5 @@
 using System.IO;
+using System.Collections.ObjectModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -17,6 +18,11 @@ public partial class HistoryPage : UserControl
     private readonly object _storeGate = new();
     private TestHistoryStore? _store;
     private int _reloadGeneration;
+    private const int PageSize = 200;
+    private readonly ObservableCollection<TestHistoryRecord> _records = [];
+    private HistorySearchCriteria? _activeCriteria;
+    private HistorySummary _summary = new(0, 0, 0, 0, 0, 0);
+    private bool _loadingPage;
 
     public event EventHandler? RequestClose;
 
@@ -27,12 +33,23 @@ public partial class HistoryPage : UserControl
         _historyPath = RuntimePaths.DatabaseFile;
 
         SetDefaultFilters();
+        HistoryGrid.ItemsSource = _records;
         Loaded += HistoryPage_Loaded;
     }
 
-    private void HistoryPage_Loaded(object sender, RoutedEventArgs e)
+    private async void HistoryPage_Loaded(object sender, RoutedEventArgs e)
     {
         Loaded -= HistoryPage_Loaded;
+        try
+        {
+            IReadOnlyList<HistoryPartOption> parts = await Task.Run(() => GetStore().GetHistoryPartOptions());
+            PartComboBox.ItemsSource = parts;
+            PartComboBox.SelectedIndex = 0;
+        }
+        catch (Exception ex)
+        {
+            AsyncFileLogService.Current.Error($"History part list failed: {ex}");
+        }
         Reload();
     }
 
@@ -40,6 +57,7 @@ public partial class HistoryPage : UserControl
     {
         Loaded -= HistoryPage_Loaded;
         Interlocked.Increment(ref _reloadGeneration);
+        _records.Clear();
         HistoryGrid.ItemsSource = null;
         DataContext = null;
     }
@@ -51,8 +69,10 @@ public partial class HistoryPage : UserControl
         FromDatePicker.SelectedDate = DateTime.Today.AddDays(-7);
         ToDatePicker.SelectedDate = DateTime.Today;
         LotTextBox.Text = string.Empty;
-        PartTextBox.Text = string.Empty;
+        if (PartComboBox is not null)
+            PartComboBox.SelectedIndex = 0;
         ResultComboBox.SelectedIndex = 0;
+        InspectionTypeComboBox.SelectedIndex = 0;
     }
 
     private void Search_Click(object sender, RoutedEventArgs e) => Reload();
@@ -84,27 +104,38 @@ public partial class HistoryPage : UserControl
         try
         {
             HistorySearchCriteria criteria = CreateSearchCriteria();
-            IReadOnlyList<TestHistoryRecord> rows = await Task.Run(() =>
-                GetStore().SearchAllSummary(criteria));
+            _activeCriteria = criteria;
+            _records.Clear();
+            Task<HistorySummary> summaryTask = Task.Run(() => GetStore().GetHistorySummary(criteria));
+            Task<IReadOnlyList<TestHistoryRecord>> pageTask = Task.Run(() =>
+                GetStore().SearchSummary(criteria with { MaxRows = PageSize, Offset = 0 }));
+            await Task.WhenAll(summaryTask, pageTask);
             if (generation != Volatile.Read(ref _reloadGeneration))
                 return;
 
-            HistoryGrid.ItemsSource = rows;
+            _summary = summaryTask.Result;
+            IReadOnlyList<TestHistoryRecord> rows = pageTask.Result;
+            foreach (TestHistoryRecord row in rows)
+                _records.Add(row);
 
-            int productCount = rows.Count(row => row.IsProductionRecord);
-            int pass = rows.Count(row => row.IsProductionRecord && row.Passed);
-            int fail = productCount - pass;
-            int master = rows.Count(row => row.IsMasterRecord);
-            int leakRetest = rows.Count(row =>
-                HistoryInspectionType.IsLeakRetest(row.InspectionType));
+            long productCount = _summary.ProductTotal;
+            long pass = _summary.ProductPass;
+            long fail = _summary.ProductFail;
+            long master = _summary.MasterTotal;
+            long leakRetest = _summary.LeakRetestTotal;
 
             TotalCountText.Text = productCount.ToString("N0");
             PassCountText.Text = pass.ToString("N0");
             FailCountText.Text = fail.ToString("N0");
+            LoadMoreButton.IsEnabled = _records.Count < _summary.Total;
 
             SummaryText.Text =
                 $"{rows.Count:N0} bản ghi | SẢN PHẨM {productCount:N0} " +
                 $"(PASS {pass:N0} / FAIL {fail:N0}) | LEAK RETEST {leakRetest:N0} | MASTER {master:N0}";
+            SummaryText.Text =
+                $"Đang hiển thị {_records.Count:N0} / {_summary.Total:N0} bản ghi | " +
+                $"SẢN PHẨM {productCount:N0} (PASS {pass:N0} / FAIL {fail:N0}, {_summary.ProductPassRate:0.00}%) | " +
+                $"LEAK RETEST {leakRetest:N0} | MASTER {master:N0}";
         }
         catch (Exception ex)
         {
@@ -117,18 +148,53 @@ public partial class HistoryPage : UserControl
         }
     }
 
+    private async void LoadMore_Click(object sender, RoutedEventArgs e)
+    {
+        if (_loadingPage || _activeCriteria is null || _records.Count == 0 || _records.Count >= _summary.Total)
+            return;
+
+        _loadingPage = true;
+        int generation = Volatile.Read(ref _reloadGeneration);
+        LoadMoreButton.IsEnabled = false;
+        try
+        {
+            TestHistoryRecord cursor = _records[^1];
+            HistorySearchCriteria pageCriteria = _activeCriteria with
+            {
+                MaxRows = PageSize,
+                Offset = 0,
+                BeforeResultAt = cursor.EffectiveResultAt,
+                BeforeId = cursor.Id
+            };
+            IReadOnlyList<TestHistoryRecord> page = await Task.Run(() => GetStore().SearchSummary(pageCriteria));
+            if (generation != Volatile.Read(ref _reloadGeneration))
+                return;
+            foreach (TestHistoryRecord row in page)
+                _records.Add(row);
+            SummaryText.Text = $"Đang hiển thị {_records.Count:N0} / {_summary.Total:N0} bản ghi";
+        }
+        finally
+        {
+            _loadingPage = false;
+            LoadMoreButton.IsEnabled = _records.Count < _summary.Total;
+        }
+    }
+
     private HistorySearchCriteria CreateSearchCriteria()
     {
         DateTime? from = FromDatePicker.SelectedDate?.Date;
         DateTime? to = ToDatePicker.SelectedDate?.Date.AddDays(1);
         long? lot = long.TryParse(LotTextBox.Text?.Trim(), out long n) ? n : null;
         string result = (ResultComboBox.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "ALL";
+        string inspectionType =
+            (InspectionTypeComboBox.SelectedItem as ComboBoxItem)?.Tag?.ToString() ?? string.Empty;
         return new HistorySearchCriteria(
             from,
             to,
             lot,
-            PartTextBox.Text?.Trim() ?? string.Empty,
-            result);
+            PartComboBox.SelectedValue?.ToString()?.Trim() ?? string.Empty,
+            result,
+            InspectionType: inspectionType);
     }
 
     private async void ExportCsv_Click(object sender, RoutedEventArgs e)

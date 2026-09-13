@@ -3393,6 +3393,24 @@ internal static class Program
             Assert(first.TestId > 0 && second.TestId > first.TestId,
                 "Two Parts using one harness both commit normally");
 
+            HistorySearchCriteria allHistory = new(
+                at.Date, at.Date.AddDays(1), null, string.Empty, "ALL", MaxRows: 1);
+            HistorySummary allSummary = initial.GetHistorySummary(allHistory);
+            HistorySummary partASummary = initial.GetHistorySummary(
+                allHistory with { PartKeyword = "PART-M2M-A" });
+            HistorySummary failSummary = initial.GetHistorySummary(
+                allHistory with { Result = "FAIL" });
+            IReadOnlyList<HistoryPartOption> historyParts = initial.GetHistoryPartOptions();
+            Assert(allSummary.Total == 2 && allSummary.ProductTotal == 2 &&
+                   allSummary.ProductPass == 2 && allSummary.ProductFail == 0 &&
+                   partASummary.Total == 1 && partASummary.ProductPass == 1 &&
+                   failSummary.Total == 0,
+                "History SQL summary uses the complete filtered dataset independently of page size");
+            Assert(historyParts.Count == 3 && historyParts[0].Keyword.Length == 0 &&
+                   historyParts.Any(item => item.Keyword == "PART-M2M-A") &&
+                   historyParts.Any(item => item.Keyword == "PART-M2M-B"),
+                "History part ComboBox is populated from distinct Parts that own saved Test rows");
+
             IReadOnlyList<PartModelRelationSnapshot> partA = initial.GetModelsForPart("PN:PART-M2M-A");
             IReadOnlyList<PartModelRelationSnapshot> partB = initial.GetModelsForPart("PN:PART-M2M-B");
             Assert(partA.Count == 1 && partB.Count == 1 && partA[0].ModelId == partB[0].ModelId,
@@ -3420,6 +3438,8 @@ internal static class Program
                     BeforeId: firstPage[0].Id));
             Assert(secondPage.Count == 1 && secondPage[0].Id != firstPage[0].Id,
                 "History keyset cursor returns the next stable page without OFFSET");
+            Assert(firstPage.Count + secondPage.Count == allSummary.Total,
+                "Incremental keyset pages can reach the final matching row while summary remains global");
 
             SqliteConnection.ClearAllPools();
             using (var downgrade = new SqliteConnection($"Data Source={dbPath};Pooling=False"))
@@ -5178,15 +5198,17 @@ internal static class Program
             Path.Combine(Environment.CurrentDirectory, "Views", "HistoryPage.xaml.cs"));
         Assert(!historyPageXaml.Contains("NHẬP LỊCH SỬ CŨ", StringComparison.Ordinal) &&
                historyPageXaml.Contains("x:Name=\"CloseButton\"", StringComparison.Ordinal) &&
-               historyPageSource.Contains("SearchAllSummary(criteria)", StringComparison.Ordinal) &&
+               historyPageSource.Contains("GetHistorySummary(criteria)", StringComparison.Ordinal) &&
+               historyPageSource.Contains("MaxRows = PageSize", StringComparison.Ordinal) &&
+               historyPageSource.Contains("BeforeResultAt = cursor.EffectiveResultAt", StringComparison.Ordinal) &&
                !historyPageSource.Contains("UiRowLimit", StringComparison.Ordinal),
-            "History displays every filtered SQLite row and exposes no legacy import action");
+            "History uses full SQL summary plus incremental keyset pages and exposes no legacy import action");
         System.Xml.Linq.XElement[] historyButtons =
             System.Xml.Linq.XDocument.Parse(historyPageXaml)
                 .Descendants()
                 .Where(element => element.Name.LocalName == "Button")
                 .ToArray();
-        Assert(historyButtons.Length == 5 &&
+        Assert(historyButtons.Length == 6 &&
                historyButtons.All(button =>
                    button.Attribute("Style")?.Value.Contains("StaticResource", StringComparison.Ordinal) == true) &&
                historyPageXaml.Contains("HistoryCsvButtonStyle", StringComparison.Ordinal) &&
@@ -5507,6 +5529,27 @@ internal static class Program
         Directory.CreateDirectory(root);
         try
         {
+            var perModelMeasurement = new ProductionSettings();
+            ProductionConfigService.SetResistanceProfileForPath(
+                perModelMeasurement, @"C:\ITEM\PART-A.tht",
+                [new ResistanceChannelSetting { Name = "R1", Enabled = true, Channel = 3, MinOhm = 10, MaxOhm = 20 }]);
+            ProductionConfigService.SetResistanceProfileForPath(
+                perModelMeasurement, @"C:\ITEM\PART-B.tht",
+                [new ResistanceChannelSetting { Name = "R1", Enabled = false, Channel = 7, MinOhm = 30, MaxOhm = 40 }]);
+            ResistanceChannelSetting resistanceA = ProductionConfigService
+                .GetResistanceProfileForPath(perModelMeasurement, @"C:\ITEM\PART-A.tht")[0];
+            ResistanceChannelSetting resistanceB = ProductionConfigService
+                .GetResistanceProfileForPath(perModelMeasurement, @"C:\ITEM\PART-B.tht")[0];
+            Assert(resistanceA.Enabled && resistanceA.Channel == 3 && resistanceA.MinOhm == 10 &&
+                   !resistanceB.Enabled && resistanceB.Channel == 7 && resistanceB.MinOhm == 30,
+                "Resistance Enabled/channel/limits are isolated and restored by THT model key");
+            string perModelCfg = Path.Combine(root, "per-model-measurement.cfg");
+            ProductionConfigService.SaveLegacyCfg(perModelMeasurement, perModelCfg);
+            string cfgText = File.ReadAllText(perModelCfg);
+            Assert(cfgText.Contains("[Resistance.Model.PART-A.R1]1;3;10;20", StringComparison.Ordinal) &&
+                   cfgText.Contains("[Resistance.Model.PART-B.R1]0;7;30;40", StringComparison.Ordinal),
+                "Per-model Resistance profiles persist Enabled/channel/min/max in station configuration");
+
             string path = Path.Combine(root, "production.statistics.json");
             var clock = new ManualTimeProvider(new DateTimeOffset(2026, 8, 9, 8, 0, 0, TimeSpan.Zero));
             var store = new ProductionStatisticsStore(path, clock);
@@ -5574,6 +5617,62 @@ internal static class Program
             applyDailyStatistics.Invoke(lotDisplayVm, [new ModelProductionStatistics()]);
             Assert(lotDisplayVm.Lot == "2000" && lotDisplayVm.Total == 0,
                 "New daily period resets production to zero and LOT display to its starting value");
+
+            var switchSettings = new ProductionSettings
+            {
+                MasterFaultRequiredCount = 0,
+                LotSettingsByProduct = new Dictionary<string, ProductLotSettings>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["PART-A"] = new() { StartLotNo = 2000, LotNo = 2010, LotNoDate = DateTime.Now.ToString("yyyy-MM-dd") },
+                    ["PART-B"] = new() { StartLotNo = 7000, LotNo = 7003, LotNoDate = DateTime.Now.ToString("yyyy-MM-dd") }
+                }
+            };
+            TestViewModel switchVm = CreateTestViewModel(switchSettings);
+            ProductModel partA = Model(("SHARED", new[] { 1, 2 }));
+            partA.PartNumber = "PART-A";
+            partA.ModelName = "SAME-MODEL";
+            ProductModel partB = Model(("SHARED", new[] { 1, 2 }));
+            partB.PartNumber = "PART-B";
+            partB.ModelName = "SAME-MODEL";
+            MethodInfo applyProductionStatistics = typeof(TestViewModel).GetMethod(
+                "ApplyProductionStatistics", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException("Production statistics UI method not found");
+            MethodInfo activeStatisticsContext = typeof(TestViewModel).GetMethod(
+                "IsActiveStatisticsContext", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new InvalidOperationException("Statistics context guard not found");
+
+            switchVm.SetModel(partA);
+            long generationA = (long)(typeof(TestViewModel).GetField(
+                "_statisticsLoadGeneration", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(switchVm) ?? 0L);
+            applyProductionStatistics.Invoke(switchVm,
+                [new ProductionStatisticsSnapshot(12, 10, 2, 12, 12, 10, 2, 2009, "FAIL")]);
+            Assert(switchVm.Total == 12 && switchVm.Pass == 10 && switchVm.Fail == 2 && switchVm.Lot == "2010",
+                "CASE A: Part A shows only A daily totals and StartLot 2000 + PASS 10");
+
+            switchVm.SetModel(partB);
+            long generationB = (long)(typeof(TestViewModel).GetField(
+                "_statisticsLoadGeneration", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(switchVm) ?? 0L);
+            applyProductionStatistics.Invoke(switchVm,
+                [new ProductionStatisticsSnapshot(4, 3, 1, 4, 4, 3, 1, 7002, "FAIL")]);
+            Assert(switchVm.Total == 4 && switchVm.Pass == 3 && switchVm.Fail == 1 && switchVm.Lot == "7003",
+                "CASE A: Part B replaces A totals and uses B StartLot");
+            bool staleAAllowed = (bool)(activeStatisticsContext.Invoke(switchVm,
+                [partA, PartIdentitySnapshot.Capture(partA), generationA]) ?? true);
+            bool currentBAllowed = (bool)(activeStatisticsContext.Invoke(switchVm,
+                [partB, PartIdentitySnapshot.Capture(partB), generationB]) ?? false);
+            Assert(!staleAAllowed && currentBAllowed,
+                "CASE D: stale Part A statistics cannot apply after Part B becomes active");
+
+            switchVm.SetModel(partA);
+            applyProductionStatistics.Invoke(switchVm,
+                [new ProductionStatisticsSnapshot(13, 11, 2, 13, 13, 11, 2, 2010, "PASS")]);
+            Assert(switchVm.Total == 13 && switchVm.Pass == 11 && switchVm.Fail == 2 && switchVm.Lot == "2011",
+                "CASE A/E: switching back restores A and one PASS advances only A Total/PASS/LOT");
+            switchVm.SetModel(partB);
+            applyProductionStatistics.Invoke(switchVm,
+                [new ProductionStatisticsSnapshot(4, 3, 1, 4, 4, 3, 1, 7002, "FAIL")]);
+            Assert(switchVm.Total == 4 && switchVm.Pass == 3 && switchVm.Fail == 1 && switchVm.Lot == "7003",
+                "CASE B/C: B remains isolated; FAIL contributes to Total/FAIL but not LOT");
 
             clock.Advance(TimeSpan.FromDays(24));
             Assert(restarted.Get(modelA).MonthlyTestCount == 0 && restarted.Get(modelA).ProbeCycleCount == 1, "Monthly period rolls without resetting probe");

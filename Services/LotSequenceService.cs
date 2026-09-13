@@ -225,7 +225,7 @@ public sealed class LotSequenceService
             if (previousLot != lot.LotNo)
             {
                 AsyncFileLogService.Current.Test(
-                    $"LOTNO DAILY RESET product={productKey} date={today} previous={previousLot} next=0");
+                    $"LOTNO DAILY RESET product={productKey} date={today} previous={previousLot} next={lot.LotNo}");
             }
             return true;
         }

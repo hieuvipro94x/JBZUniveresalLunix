@@ -220,6 +220,19 @@ public static class ProductionConfigService
                 $"{Uri.EscapeDataString(profile.Channel3Connector)}");
         }
 
+        foreach ((string modelKey, ResistanceChannelSetting[] profile) in settings.ResistanceProfilesByModel
+                     .OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            string encodedKey = Uri.EscapeDataString(modelKey);
+            foreach (ResistanceChannelSetting resistance in ResistanceMeasurementPlan.Normalize(profile))
+            {
+                lines.Add(
+                    $"[Resistance.Model.{encodedKey}.{resistance.Name}]" +
+                    $"{Bool(resistance.Enabled)};{resistance.Channel};" +
+                    $"{F(resistance.MinOhm)};{F(resistance.MaxOhm)}");
+            }
+        }
+
         foreach (ResistanceChannelSetting resistance in settings.ResistanceChannels)
         {
             lines.Add(
@@ -389,6 +402,46 @@ public static class ProductionConfigService
         string key = GetMasterModelKeyFromPath(path);
         settings.WaterProofProfilesByModel[key] = NormalizeWaterProofProfile(profile.Clone());
     }
+
+    public static ResistanceChannelSetting[] GetResistanceProfileForPath(
+        ProductionSettings settings,
+        string? path)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        Normalize(settings);
+        string key = GetMasterModelKeyFromPath(path);
+        ResistanceChannelSetting[] source = settings.ResistanceProfilesByModel.TryGetValue(key, out ResistanceChannelSetting[]? profile)
+            ? profile
+            : settings.ResistanceChannels;
+        return ResistanceMeasurementPlan.Normalize(source)
+            .Select(CloneResistanceChannel)
+            .ToArray();
+    }
+
+    public static void SetResistanceProfileForPath(
+        ProductionSettings settings,
+        string? path,
+        IEnumerable<ResistanceChannelSetting> profile)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        ArgumentNullException.ThrowIfNull(profile);
+        Normalize(settings);
+        string key = GetMasterModelKeyFromPath(path);
+        ResistanceChannelSetting[] normalized = ResistanceMeasurementPlan.Normalize(profile.ToArray())
+            .Select(CloneResistanceChannel)
+            .ToArray();
+        settings.ResistanceProfilesByModel[key] = normalized;
+        settings.ResistanceChannels = normalized.Select(CloneResistanceChannel).ToArray();
+    }
+
+    private static ResistanceChannelSetting CloneResistanceChannel(ResistanceChannelSetting item) => new()
+    {
+        Enabled = item.Enabled,
+        Name = item.Name,
+        Channel = item.Channel,
+        MinOhm = item.MinOhm,
+        MaxOhm = item.MaxOhm
+    };
 
     public static void EnsureSavedOnStartup(ProductionSettings settings)
     {
@@ -596,6 +649,32 @@ public static class ProductionConfigService
             if (parts.Length > 3 && double.TryParse(parts[3], NumberStyles.Float, CultureInfo.InvariantCulture, out double max)) channel.MaxOhm = max;
         }
 
+        foreach ((string key, string value) in map)
+        {
+            const string prefix = "Resistance.Model.";
+            if (!key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                continue;
+            string remainder = key[prefix.Length..];
+            int separator = remainder.LastIndexOf('.');
+            if (separator <= 0 || separator >= remainder.Length - 1)
+                continue;
+            string modelKey = Uri.UnescapeDataString(remainder[..separator]);
+            string channelName = remainder[(separator + 1)..];
+            ResistanceChannelSetting[] profile = settings.ResistanceProfilesByModel.TryGetValue(modelKey, out ResistanceChannelSetting[]? existing)
+                ? existing
+                : ResistanceMeasurementPlan.Normalize([]);
+            ResistanceChannelSetting? channel = profile.FirstOrDefault(item =>
+                string.Equals(item.Name, channelName, StringComparison.OrdinalIgnoreCase));
+            if (channel is null)
+                continue;
+            string[] parts = value.Split(';');
+            if (parts.Length > 0) channel.Enabled = ParseBool(parts[0], channel.Enabled);
+            if (parts.Length > 1 && int.TryParse(parts[1], out int c)) channel.Channel = c;
+            if (parts.Length > 2 && double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out double min)) channel.MinOhm = min;
+            if (parts.Length > 3 && double.TryParse(parts[3], NumberStyles.Float, CultureInfo.InvariantCulture, out double max)) channel.MaxOhm = max;
+            settings.ResistanceProfilesByModel[modelKey] = profile;
+        }
+
         return settings;
     }
 
@@ -608,6 +687,7 @@ public static class ProductionConfigService
         settings.ResistanceChannels ??= [];
         settings.WaterProofMachine ??= new WaterProofMachineSettings();
         settings.WaterProofProfilesByModel ??= new Dictionary<string, WaterProofModelSettings>(StringComparer.OrdinalIgnoreCase);
+        settings.ResistanceProfilesByModel ??= new Dictionary<string, ResistanceChannelSetting[]>(StringComparer.OrdinalIgnoreCase);
         settings.MasterFaultCountsByModel ??= new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         settings.LotSettingsByProduct ??= new Dictionary<string, ProductLotSettings>(StringComparer.OrdinalIgnoreCase);
         if (settings.MasterFaultCountsByModel.Comparer != StringComparer.OrdinalIgnoreCase)
@@ -621,6 +701,9 @@ public static class ProductionConfigService
             settings.WaterProofProfilesByModel = new Dictionary<string, WaterProofModelSettings>(
                 settings.WaterProofProfilesByModel,
                 StringComparer.OrdinalIgnoreCase);
+        if (settings.ResistanceProfilesByModel.Comparer != StringComparer.OrdinalIgnoreCase)
+            settings.ResistanceProfilesByModel = new Dictionary<string, ResistanceChannelSetting[]>(
+                settings.ResistanceProfilesByModel, StringComparer.OrdinalIgnoreCase);
         }
         if (settings.LotSettingsByProduct.Comparer != StringComparer.OrdinalIgnoreCase)
         {

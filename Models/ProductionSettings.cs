@@ -70,6 +70,10 @@ public sealed class ProductionSettings
     public Dictionary<string, WaterProofModelSettings> WaterProofProfilesByModel { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Cấu hình 10 kênh điện trở riêng theo file/model THT.</summary>
+    public Dictionary<string, ResistanceChannelSetting[]> ResistanceProfilesByModel { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>
     /// Số card mở rộng 64 I/O người vận hành cấu hình: 1..10.
     /// Mỗi card có 2 port nội bộ x 32 I/O; operator không cấu hình số port.

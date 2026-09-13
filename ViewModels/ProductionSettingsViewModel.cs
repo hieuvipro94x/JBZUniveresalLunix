@@ -151,7 +151,7 @@ public sealed class ProductionSettingsViewModel : ObservableObject
         _manualRuntimeActive = test?.IsManualModeActive == true;
         _manualStatus = "Sẵn sàng thao tác tay - không cần lưu cài đặt";
         ResistanceChannels = new ObservableCollection<ResistanceChannelEditor>(
-            Settings.ResistanceChannels.Select((setting, index) =>
+            ProductionConfigService.GetResistanceProfileForPath(Settings, _modelPath).Select((setting, index) =>
                 new ResistanceChannelEditor(setting, index + 1)));
         WaterProof = ProductionConfigService.GetWaterProofProfileForPath(
             Settings, _modelPath);
@@ -567,6 +567,8 @@ public sealed class ProductionSettingsViewModel : ObservableObject
         Settings.ResistanceChannels = ResistanceChannels
             .Select(editor => editor.ToSetting())
             .ToArray();
+        ProductionConfigService.SetResistanceProfileForPath(
+            Settings, _modelPath, Settings.ResistanceChannels);
         Settings.AutoMasterSequence = true;
         // Manual là thao tác runtime tức thời, không phải cấu hình cần lưu.
         Settings.ManualModeEnabled = false;

@@ -1872,6 +1872,60 @@ public sealed class TestHistoryStore
         return EnumerateCore(criteria, exportAll: true, includeLabelPayload: false);
     }
 
+    public HistorySummary GetHistorySummary(HistorySearchCriteria criteria)
+    {
+        ArgumentNullException.ThrowIfNull(criteria);
+        using SqliteConnection connection = Open();
+        using SqliteCommand command = connection.CreateCommand();
+        List<string> clauses = ConfigureHistoryFilter(command, criteria, includeCursor: false);
+        command.CommandText = $"""
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN t.InspectionType='PRODUCT' THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN t.InspectionType='PRODUCT' AND t.Passed=1 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN t.InspectionType='PRODUCT' AND t.Passed=0 THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN t.InspectionType IN ('MASTER_GOOD','MASTER_BAD') THEN 1 ELSE 0 END),0),
+                COALESCE(SUM(CASE WHEN t.InspectionType='LEAK_RETEST' THEN 1 ELSE 0 END),0)
+            FROM Tests t
+            JOIN Parts p ON p.Id=t.PartId
+            JOIN Models m ON m.Id=t.ModelId
+            {(clauses.Count == 0 ? "" : "WHERE " + string.Join(" AND ", clauses))};
+            """;
+        using SqliteDataReader reader = command.ExecuteReader();
+        return reader.Read()
+            ? new HistorySummary(
+                reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2),
+                reader.GetInt64(3), reader.GetInt64(4), reader.GetInt64(5))
+            : new HistorySummary(0, 0, 0, 0, 0, 0);
+    }
+
+    public IReadOnlyList<HistoryPartOption> GetHistoryPartOptions()
+    {
+        using SqliteConnection connection = Open();
+        using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT DISTINCT p.PartNumber,p.PartName
+            FROM Tests t
+            JOIN Parts p ON p.Id=t.PartId
+            ORDER BY p.PartNumber COLLATE NOCASE,p.PartName COLLATE NOCASE;
+            """;
+        using SqliteDataReader reader = command.ExecuteReader();
+        var result = new List<HistoryPartOption> { new(string.Empty, "TẤT CẢ MÃ HÀNG") };
+        while (reader.Read())
+        {
+            string number = reader.GetString(0).Trim();
+            string name = reader.GetString(1).Trim();
+            string keyword = number.Length > 0 ? number : name;
+            if (keyword.Length == 0)
+                continue;
+            string display = name.Length > 0 && !string.Equals(name, number, StringComparison.OrdinalIgnoreCase)
+                ? $"{number} - {name}".Trim(' ', '-')
+                : keyword;
+            result.Add(new HistoryPartOption(keyword, display));
+        }
+        return result;
+    }
+
     private IReadOnlyList<TestHistoryRecord> SearchCore(
         HistorySearchCriteria criteria,
         bool exportAll,
@@ -1889,7 +1943,8 @@ public sealed class TestHistoryStore
         long started = Stopwatch.GetTimestamp();
         using SqliteConnection connection = Open();
         using SqliteCommand command = connection.CreateCommand();
-        var clauses = new List<string>();
+        List<string> clauses = ConfigureHistoryFilter(command, criteria, includeCursor: !exportAll);
+        /*
         if (criteria.From is DateTime from)
         {
             clauses.Add("t.ResultAt >= $From");
@@ -1988,7 +2043,8 @@ public sealed class TestHistoryStore
             command.Parameters.AddWithValue("$BeforeId", beforeId);
         }
 
-        int limit = Math.Clamp(criteria.MaxRows, 1, 50_000);
+        */
+        int limit = Math.Clamp(criteria.MaxRows, 1, 5_000);
         int offset = Math.Max(0, criteria.Offset);
         string order = exportAll
             ? "ORDER BY p.PartNumber COLLATE NOCASE,t.StartedAt,t.Id"
@@ -2032,6 +2088,50 @@ public sealed class TestHistoryStore
         }
         AsyncFileLogService.Current.Performance(
             $"HISTORY_QUERY rows={rows} duration_ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:0.###}");
+    }
+
+    private static List<string> ConfigureHistoryFilter(
+        SqliteCommand command,
+        HistorySearchCriteria criteria,
+        bool includeCursor)
+    {
+        var clauses = new List<string>();
+        if (criteria.From is DateTime from) { clauses.Add("t.ResultAt >= $From"); command.Parameters.AddWithValue("$From", from.ToString("O", CultureInfo.InvariantCulture)); }
+        if (criteria.To is DateTime to) { clauses.Add("t.ResultAt < $To"); command.Parameters.AddWithValue("$To", to.ToString("O", CultureInfo.InvariantCulture)); }
+        if (criteria.LotNo is long lot) { clauses.Add("t.Lot=$Lot"); command.Parameters.AddWithValue("$Lot", lot); }
+        if (!string.IsNullOrWhiteSpace(criteria.PartKeyword))
+        {
+            clauses.Add("(p.PartNumber LIKE $Part OR p.PartName LIKE $Part OR m.ModelName LIKE $Part OR t.FaultSummary LIKE $Part OR t.CycleId LIKE $Part OR CAST(t.Lot AS TEXT) LIKE $Part OR EXISTS(SELECT 1 FROM TestFaults sf WHERE sf.TestId=t.Id AND (sf.WireName LIKE $Part OR sf.ConnectorFrom LIKE $Part OR sf.ConnectorTo LIKE $Part OR sf.ActualConnectorFrom LIKE $Part OR sf.ActualConnectorTo LIKE $Part OR sf.FaultType LIKE $Part OR sf.FaultCode LIKE $Part)))");
+            command.Parameters.AddWithValue("$Part", $"%{criteria.PartKeyword.Trim()}%");
+        }
+        if (!string.IsNullOrWhiteSpace(criteria.Result) && !criteria.Result.Equals("ALL", StringComparison.OrdinalIgnoreCase))
+        {
+            string value = criteria.Result.Trim().ToUpperInvariant();
+            if (value == "PASS") clauses.Add("t.Passed=1");
+            else if (value == "FAIL") clauses.Add("t.Passed=0");
+            else if (TryMapHistoryFaultFilter(value, out string code))
+            {
+                clauses.Add("(REPLACE(UPPER(t.ResultCode),' ','_')=$ResultFault OR " +
+                            "EXISTS(SELECT 1 FROM TestFaults rf WHERE rf.TestId=t.Id AND " +
+                            "(REPLACE(UPPER(rf.FaultCode),' ','_')=$ResultFault OR " +
+                            "REPLACE(UPPER(rf.FaultType),' ','_')=$ResultFault)))");
+                command.Parameters.AddWithValue("$ResultFault", code);
+            }
+            else { clauses.Add("(t.Result LIKE $Result OR t.FaultType LIKE $Result OR t.ResultCode LIKE $Result)"); command.Parameters.AddWithValue("$Result", $"%{criteria.Result.Trim()}%"); }
+        }
+        if (!string.IsNullOrWhiteSpace(criteria.InspectionType)) { clauses.Add("t.InspectionType=$Inspection"); command.Parameters.AddWithValue("$Inspection", criteria.InspectionType.Trim()); }
+        if (!string.IsNullOrWhiteSpace(criteria.FaultType)) { clauses.Add("EXISTS(SELECT 1 FROM TestFaults f WHERE f.TestId=t.Id AND (f.FaultType LIKE $Fault OR f.FaultCode LIKE $Fault))"); command.Parameters.AddWithValue("$Fault", $"%{criteria.FaultType.Trim()}%"); }
+        if (criteria.Io is int io) { clauses.Add("EXISTS(SELECT 1 FROM TestFaults f WHERE f.TestId=t.Id AND $Io IN (f.ExpectedSourceIo,f.ExpectedTargetIo,f.ActualSourceIo,f.ActualTargetIo))"); command.Parameters.AddWithValue("$Io", io); }
+        if (!string.IsNullOrWhiteSpace(criteria.WireName)) { clauses.Add("EXISTS(SELECT 1 FROM TestFaults f WHERE f.TestId=t.Id AND f.WireName LIKE $Wire)"); command.Parameters.AddWithValue("$Wire", $"%{criteria.WireName.Trim()}%"); }
+        if (!string.IsNullOrWhiteSpace(criteria.CycleId)) { clauses.Add("t.CycleId=$Cycle"); command.Parameters.AddWithValue("$Cycle", criteria.CycleId.Trim()); }
+        if (!string.IsNullOrWhiteSpace(criteria.AppVersion)) { clauses.Add("t.AppVersion LIKE $AppVersion"); command.Parameters.AddWithValue("$AppVersion", $"%{criteria.AppVersion.Trim()}%"); }
+        if (includeCursor && criteria.BeforeResultAt is DateTime cursor && criteria.BeforeId is long id)
+        {
+            clauses.Add("(t.ResultAt < $BeforeResultAt OR (t.ResultAt=$BeforeResultAt AND t.Id < $BeforeId))");
+            command.Parameters.AddWithValue("$BeforeResultAt", cursor.ToString("O", CultureInfo.InvariantCulture));
+            command.Parameters.AddWithValue("$BeforeId", id);
+        }
+        return clauses;
     }
 
     private static bool TryMapHistoryFaultFilter(string value, out string faultCode)

@@ -1,0 +1,614 @@
+Hãy audit và sửa TRIỆT ĐỂ logic LOTNO + sản lượng khi đổi mã hàng trong cùng một ngày của JBZUniversalTester hiện tại.
+
+KHÔNG chỉ kiểm tra giao diện. Phải lần theo toàn bộ luồng:
+
+Chọn mã hàng
+→ SetModel / load model
+→ active Part/Model
+→ SQLite statistics query
+→ ApplyDailyProductionStatistics
+→ Total / Pass / Fail
+→ LotSequenceService
+→ LOTNO hiển thị
+→ PASS/FAIL commit
+→ đổi sang mã khác
+→ quay lại mã cũ.
+
+============================================================
+1. YÊU CẦU NGHIỆP VỤ BẮT BUỘC
+============================================================
+
+Sản lượng và LOTNO phải thuộc ĐÚNG MÃ HÀNG ĐANG ĐƯỢC CHỌN.
+
+Trong cùng một ngày, mỗi mã hàng phải có bộ số liệu riêng:
+
+- Total hôm nay
+- PASS hôm nay
+- FAIL hôm nay
+- LOTNO hiện tại
+- StartLot/cấu hình LOT của mã đó
+
+Không được dùng chung counter giữa các mã.
+
+Ví dụ:
+
+Mã A:
+StartLot = 2000
+Hôm nay đã:
+PASS = 10
+FAIL = 2
+Total = 12
+
+UI khi chọn A phải hiện:
+
+Total = 12
+PASS = 10
+FAIL = 2
+LOTNO = 2010
+
+Sau đó đổi sang mã B:
+
+Mã B:
+StartLot = 7000
+PASS = 3
+FAIL = 1
+Total = 4
+
+UI phải đổi NGAY thành:
+
+Total = 4
+PASS = 3
+FAIL = 1
+LOTNO = 7003
+
+TUYỆT ĐỐI không được còn:
+
+Total = 12
+PASS = 10
+FAIL = 2
+LOTNO = 2010
+
+của mã A.
+
+Sau đó quay lại mã A trong CÙNG NGÀY:
+
+phải phục hồi lại:
+
+Total = 12
+PASS = 10
+FAIL = 2
+LOTNO = 2010
+
+Nếu tiếp tục test A PASS thêm 1 sản phẩm:
+
+A:
+Total = 13
+PASS = 11
+FAIL = 2
+LOTNO = 2011
+
+Mã B vẫn phải giữ nguyên:
+Total = 4
+PASS = 3
+FAIL = 1
+LOTNO = 7003
+
+============================================================
+2. LOTNO PHẢI THEO MÃ HÀNG
+============================================================
+
+Audit kỹ LotSequenceService và mọi nơi tính LOT.
+
+Theo logic hiện tại:
+
+display LOT = StartLot của mã đang chọn + PASS hôm nay của chính mã đó.
+
+Ví dụ:
+
+A StartLot=2000, PASS hôm nay=10
+=> LOTNO = 2010
+
+B StartLot=7000, PASS hôm nay=3
+=> LOTNO = 7003
+
+C StartLot=0, PASS hôm nay=25
+=> LOTNO = 25
+
+Không được dùng PASS của mã trước.
+
+FAIL:
+- tăng Total
+- tăng Fail
+- KHÔNG tăng PASS
+- do đó KHÔNG làm tăng LOTNO.
+
+Master:
+- không tăng Total/PASS/FAIL production
+- không tăng LOTNO.
+
+IO Mapping:
+- không tăng Total/PASS/FAIL
+- không tăng LOTNO.
+
+Probe:
+- không tăng production counter
+- không tăng LOTNO.
+
+============================================================
+3. KHÓA NHẬN DIỆN PHẢI ĐÚNG
+============================================================
+
+Audit xem statistics hiện tại đang group/filter theo khóa nào:
+
+- PartId?
+- ModelId?
+- PartNumber?
+- ProductCode?
+- ModelName?
+- combination PartId + ModelId?
+- active product/config?
+
+Không được dựa vào tên hiển thị nếu DB đã có ID ổn định.
+
+Phải xác định "mã hàng" production thực tế tương ứng với key nào.
+
+Nếu một harness/model có thể liên kết nhiều Part thông qua PartModels thì phải đặc biệt kiểm tra:
+
+MODEL giống nhau nhưng PART khác nhau
+không được vô tình dùng chung sản lượng nếu nghiệp vụ coi đó là hai mã hàng khác nhau.
+
+Ví dụ:
+
+Part A + Model X
+Part B + Model X
+
+nếu là hai mã hàng khác nhau thì statistics/LOT phải tách riêng theo Part.
+
+Không sửa schema DB nếu schema hiện tại đã đủ khả năng biểu diễn đúng.
+
+============================================================
+4. AUDIT RACE KHI ĐỔI MÃ NHANH
+============================================================
+
+Đây là phần rất quan trọng.
+
+Tìm tất cả async task liên quan:
+
+_statisticsLoadTask
+_statisticsLoadGeneration
+_statisticsLoadGate
+Load...
+GetModelProductionStatistics...
+ApplyDailyProductionStatistics...
+SetModel...
+UpdateDailyLotDisplay...
+LotSequenceService.RefreshActiveProduct...
+
+Phải chứng minh tình huống sau không xảy ra:
+
+1. chọn mã A
+2. bắt đầu query SQLite A
+3. operator nhanh chóng chọn mã B
+4. query B trả về trước
+5. UI hiển thị B đúng
+6. query A cũ trả về muộn
+7. query A GHI ĐÈ Total/PASS/FAIL/LOT của B
+
+Đây là BUG NGHIÊM TRỌNG nếu tồn tại.
+
+Mọi kết quả async statistics phải gắn với:
+- generation hiện tại
+- selected model/part hiện tại
+- cancellation/context phù hợp
+
+Trước khi ApplyDailyProductionStatistics phải xác nhận response vẫn thuộc đúng mã hàng hiện tại.
+
+Nếu request cũ hoàn thành muộn:
+=> bỏ kết quả cũ, không được chạm UI.
+
+============================================================
+5. KHI CHỌN MÃ MỚI PHẢI RESET PRESENTATION TẠM THỜI
+============================================================
+
+Audit khoảng thời gian:
+
+mã A đang hiện:
+Total 100
+PASS 95
+FAIL 5
+LOT 2095
+
+operator chọn B.
+
+Trong khi query B chưa hoàn tất, UI không được tiếp tục làm operator tưởng:
+
+B = Total 100 / PASS 95 / LOT 2095.
+
+Nên chọn một behavior rõ ràng và an toàn:
+
+- hoặc reset tạm:
+  Total = 0
+  PASS = 0
+  FAIL = 0
+  LOT = StartLot B
+
+rồi apply DB stats B;
+
+hoặc dùng trạng thái loading rõ ràng nếu UI đã có.
+
+Không được để số của mã trước tồn tại dưới tên mã mới.
+
+Ưu tiên thay đổi ít nhất nhưng không gây hiểu nhầm production.
+
+============================================================
+6. KHI PASS/FAIL PHẢI UPDATE ĐÚNG MÃ
+============================================================
+
+Audit RecordCompletedProductAsync / persistence service.
+
+Khi cycle bắt đầu bằng mã A thì toàn bộ result của cycle phải giữ reference/key của A.
+
+Nếu trong lúc persistence đang chạy có thao tác đổi mã thì:
+- không được ghi result A thành mã B.
+- không được tăng counter UI B.
+- không được tăng LOT B.
+
+Tốt nhất cycle phải capture immutable:
+
+cycleModel
+cycle PartId
+cycle ModelId
+cycle PartNumber
+
+ngay khi ARM cycle.
+
+Callback/persistence hoàn thành muộn phải dùng cycle context đó.
+
+============================================================
+7. DAILY COUNTER
+============================================================
+
+Các counter phải là:
+
+DailyTestCount của đúng mã
+DailyPassCount của đúng mã
+DailyFailCount của đúng mã
+
+và đúng ngày production hiện tại.
+
+Ngày mới:
+A bắt đầu lại daily:
+0 / 0 / 0
+LOT = StartLot A
+
+B cũng:
+0 / 0 / 0
+LOT = StartLot B
+
+Nhưng history ngày hôm trước vẫn giữ nguyên.
+
+Không DELETE history để reset counter.
+
+============================================================
+8. MONTHLY / LIFETIME
+============================================================
+
+Audit xem UI có sử dụng:
+
+DailyTestCount
+MonthlyTestCount
+LifetimeTestCount
+
+Nếu có thì phải xác định rõ chúng có phải per-Part/per-model hay global.
+
+Không âm thầm thay semantics hiện tại.
+
+Nếu UI production đang hiển thị Total/PASS/FAIL theo NGÀY + MÃ HÀNG thì phải giữ chính xác semantics đó.
+
+Nếu monthly/lifetime chỉ dùng maintenance/statistics riêng thì không được vô tình reset khi đổi model.
+
+============================================================
+9. TEST BẮT BUỘC
+============================================================
+
+Bổ sung self-tests ít nhất các case sau.
+
+CASE A - hai mã độc lập cùng ngày
+
+A:
+StartLot=2000
+PASS=10
+FAIL=2
+
+B:
+StartLot=7000
+PASS=3
+FAIL=1
+
+Select A:
+12 / 10 / 2 / LOT 2010
+
+Select B:
+4 / 3 / 1 / LOT 7003
+
+Select A:
+12 / 10 / 2 / LOT 2010
+
+PASS A:
+13 / 11 / 2 / LOT 2011
+
+Select B:
+vẫn 4 / 3 / 1 / LOT 7003.
+
+------------------------------------------------------------
+
+CASE B - FAIL không tăng LOT
+
+A:
+StartLot=2000
+PASS=10
+FAIL=2
+
+FAIL thêm một sản phẩm:
+
+Total=13
+PASS=10
+FAIL=3
+LOT=2010
+
+------------------------------------------------------------
+
+CASE C - StartLot khác nhau
+
+A StartLot=0
+B StartLot=2000
+C StartLot=7000
+
+Đổi qua lại phải lấy đúng StartLot của từng mã.
+
+------------------------------------------------------------
+
+CASE D - async stale statistics
+
+Giả lập:
+
+Load A chậm.
+Load B nhanh.
+
+B được chọn sau A.
+
+Cho B result hoàn tất trước rồi A result hoàn tất sau.
+
+Kết quả cuối UI B PHẢI vẫn là B.
+
+A stale result không được ghi đè.
+
+------------------------------------------------------------
+
+CASE E - đổi A -> B -> A nhanh
+
+Giả lập cả 3 statistics request trả về sai thứ tự.
+
+Chỉ generation cuối cùng của A mới được phép Apply.
+
+------------------------------------------------------------
+
+CASE F - cycle context
+
+ARM cycle A.
+Trong quá trình persistence giả lập context UI đổi sang B.
+
+Result của cycle A:
+- phải lưu A
+- tăng stats A
+- không tăng B
+- không tăng LOT B.
+
+Nếu UI hiện đang ở B thì không được lấy result A cộng trực tiếp vào counter B.
+
+------------------------------------------------------------
+
+CASE G - Master
+
+Master Good/Bad của A:
+- history đúng A
+- production Total/PASS/FAIL của A không đổi
+- LOT A không đổi.
+
+------------------------------------------------------------
+
+CASE H - IO Mapping
+
+Chọn mã THT trống.
+Kết nối nhiều IO.
+Không thay đổi Total/PASS/FAIL/LOT.
+
+------------------------------------------------------------
+
+CASE I - ngày mới
+
+Dùng clock/test date controllable.
+
+Ngày D:
+A PASS=10
+
+Ngày D+1:
+Select A phải Daily PASS=0.
+
+History ngày D vẫn còn.
+
+LOT ngày mới phải theo quy tắc production hiện tại:
+StartLot + PASS của ngày mới.
+
+Nếu requirement hiện tại của LotSequenceService khác, báo rõ trước khi đổi semantics.
+
+============================================================
+10. ĐỐI CHIẾU SQLITE TRỰC TIẾP
+============================================================
+
+Sau test, query DB để chứng minh:
+
+GROUP BY mã hàng + production date
+
+cho kết quả đúng.
+
+Kiểm tra không có:
+
+- record Part A nhưng PartId của B.
+- ModelId sai.
+- duplicate cycle.
+- PASS A xuất hiện trong stats B.
+- FAIL B xuất hiện trong stats A.
+
+Nếu schema có PartId và ModelId thì audit index/query WHERE để chắc filter sử dụng đúng key.
+
+============================================================
+11. KHÔNG ĐƯỢC PHÁ CÁC PHẦN KHÁC
+============================================================
+
+Không thay đổi:
+
+- electrical classifier
+- D2XX protocol
+- relay timing
+- Master electrical state machine
+- discard sensor state machine
+- history schema nếu không bắt buộc
+- LOT print format
+- label payload format
+- UI layout ngoài khu vực counter/LOT nếu không cần
+
+Không dùng global static counter để giải quyết.
+
+Nguồn sự thật phải là DB + active model/part context.
+
+============================================================
+12. TÌM CODE TRƯỚC KHI SỬA
+============================================================
+
+Dùng rg tìm toàn bộ:
+
+ApplyDailyProductionStatistics
+LoadProductionStatistics
+ModelProductionStatistics
+DailyPassCount
+DailyFailCount
+DailyTestCount
+MonthlyTestCount
+LifetimeTestCount
+UpdateDailyLotDisplay
+StartLot
+LotSequenceService
+RefreshActiveProduct
+PartId
+ModelId
+PartModels
+RecordCompletedProductAsync
+_statisticsLoadGeneration
+_statisticsLoadTask
+_statisticsLoadGate
+SetModel
+LoadModel
+LOT
+LOTNO
+
+Sau đó lập call-chain ngắn trước khi sửa.
+
+============================================================
+13. BUILD + TEST
+============================================================
+
+Sau khi sửa:
+
+dotnet build -c Release
+
+phải:
+0 warning
+0 error
+
+Chạy TOÀN BỘ self-tests cũ + test mới.
+
+Không chỉ chạy riêng test LOT.
+
+============================================================
+14. BÁO CÁO CUỐI
+============================================================
+
+Báo đúng format:
+
+LOT / PRODUCT STATISTICS AUDIT
+
+Current key used:
+- PartId:
+- ModelId:
+- Date:
+- StartLot source:
+
+Model-switch behavior:
+- A -> B:
+- B -> A:
+- stale async protection:
+
+PASS behavior:
+- Total:
+- PASS:
+- FAIL:
+- LOT:
+
+FAIL behavior:
+- Total:
+- PASS:
+- FAIL:
+- LOT:
+
+Master behavior:
+- counters:
+- LOT:
+
+IO Mapping behavior:
+- counters:
+- LOT:
+
+DB query proof:
+- A:
+- B:
+- cross-contamination:
+
+Tests:
+- total:
+- passed:
+- failed:
+
+Files changed:
+-
+
+Remaining risks:
+-
+
+ACCEPTANCE EXAMPLE:
+
+08:00 chọn A:
+Total 0 / PASS 0 / FAIL 0 / LOT 2000
+
+10:00 A:
+Total 100 / PASS 95 / FAIL 5 / LOT 2095
+
+10:01 đổi B:
+phải lập tức dùng statistics của B,
+KHÔNG được giữ số A.
+
+B:
+Total 20 / PASS 18 / FAIL 2 / LOT 7018
+
+11:00 quay lại A:
+phải trở lại:
+Total 100 / PASS 95 / FAIL 5 / LOT 2095
+
+PASS thêm A:
+Total 101 / PASS 96 / FAIL 5 / LOT 2096
+
+Đổi lại B:
+vẫn:
+Total 20 / PASS 18 / FAIL 2 / LOT 7018
+
+Chỉ kết luận PASS khi các case trên được chứng minh bằng self-test và database query.

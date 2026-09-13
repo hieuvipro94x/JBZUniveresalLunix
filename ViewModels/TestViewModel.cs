@@ -8704,6 +8704,10 @@ public sealed class TestViewModel : ObservableObject
         if (!string.IsNullOrWhiteSpace(CurrentModelPath))
             _productionSettings.LastThtPath = CurrentModelPath;
 
+        _productionSettings.ResistanceChannels =
+            ProductionConfigService.GetResistanceProfileForPath(
+                _productionSettings,
+                CurrentModelPath ?? model.SourcePath);
         LoadWaterProofProfileForCurrentModel();
 
         // Đồng bộ model lên MainWindow ngay cả khi model được tự nạp lúc startup.
@@ -8877,8 +8881,7 @@ public sealed class TestViewModel : ObservableObject
 
             await InvokeUiAsync(() =>
             {
-                if (!ReferenceEquals(_model, model) ||
-                    generation != Volatile.Read(ref _statisticsLoadGeneration))
+                if (!IsActiveStatisticsContext(model, part, generation))
                 {
                     return;
                 }
@@ -8899,8 +8902,10 @@ public sealed class TestViewModel : ObservableObject
         {
             await InvokeUiAsync(() =>
             {
-                if (!ReferenceEquals(_model, model) ||
-                    generation != Volatile.Read(ref _statisticsLoadGeneration))
+                if (!IsActiveStatisticsContext(
+                        model,
+                        PartIdentitySnapshot.Capture(model),
+                        generation))
                 {
                     return;
                 }
@@ -8921,6 +8926,21 @@ public sealed class TestViewModel : ObservableObject
         {
             _statisticsLoadGate.Release();
         }
+    }
+
+    private bool IsActiveStatisticsContext(
+        ProductModel requestedModel,
+        PartIdentitySnapshot requestedPart,
+        long generation)
+    {
+        ProductModel? activeModel = _model;
+        return ReferenceEquals(activeModel, requestedModel) &&
+               generation == Volatile.Read(ref _statisticsLoadGeneration) &&
+               activeModel is not null &&
+               string.Equals(
+                   PartIdentitySnapshot.Capture(activeModel).PartKey,
+                   requestedPart.PartKey,
+                   StringComparison.Ordinal);
     }
 
     private string BuildProductInspectionTrace(DateTime resultAt)
@@ -9141,6 +9161,21 @@ public sealed class TestViewModel : ObservableObject
             _recordedHistoryStore = historyStore;
             await InvokeUiAsync(() =>
             {
+                // SQLite commit owns the immutable cycle Part. A model switch can
+                // happen while the queued writer is running; that durable result
+                // must never be painted onto counters/LOT of the newly active Part.
+                ProductModel? activeModel = _model;
+                if (!ReferenceEquals(activeModel, cycleModel) ||
+                    !IsRuntimeContext(RuntimeMode.Production, runtimeGeneration) ||
+                    activeModel is null ||
+                    !string.Equals(
+                        PartIdentitySnapshot.Capture(activeModel).PartKey,
+                        commitRequest.Part.PartKey,
+                        StringComparison.Ordinal))
+                {
+                    return;
+                }
+
                 ApplyProductionStatistics(databaseResult.Statistics);
                 ApplyPartCounter(databaseResult.ProbeCounter);
             });

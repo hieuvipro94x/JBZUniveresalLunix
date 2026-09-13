@@ -251,6 +251,24 @@ public sealed record HistorySearchCriteria(
     DateTime? BeforeResultAt = null,
     long? BeforeId = null);
 
+public sealed record HistorySummary(
+    long Total,
+    long ProductTotal,
+    long ProductPass,
+    long ProductFail,
+    long MasterTotal,
+    long LeakRetestTotal)
+{
+    public double ProductPassRate => ProductTotal == 0
+        ? 0
+        : ProductPass * 100d / ProductTotal;
+}
+
+public sealed record HistoryPartOption(string Keyword, string Display)
+{
+    public override string ToString() => Display;
+}
+
 public sealed record LabelPrintData(
     string PartName,
     string PartNumber,

@@ -270,7 +270,7 @@
                 Margin="0,0,0,4">
             <ScrollViewer HorizontalScrollBarVisibility="Auto"
                           VerticalScrollBarVisibility="Disabled">
-            <Grid MinWidth="1030">
+            <Grid MinWidth="1200">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="142"/>
                     <ColumnDefinition Width="8"/>
@@ -285,7 +285,7 @@
                     <ColumnDefinition Width="106"/>
                     <ColumnDefinition Width="8"/>
                     <ColumnDefinition Width="92"/>
-                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="160"/>
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Grid.Column="0" VerticalAlignment="Top">
@@ -305,7 +305,10 @@
 
                 <StackPanel Grid.Column="6" VerticalAlignment="Top">
                     <TextBlock Text="Mã hàng / tên hàng" Style="{StaticResource FilterLabel}"/>
-                    <TextBox x:Name="PartTextBox" Style="{StaticResource FilterTextBox}"/>
+                    <ComboBox x:Name="PartComboBox"
+                              Style="{StaticResource FilterComboBox}"
+                              DisplayMemberPath="Display"
+                              SelectedValuePath="Keyword"/>
                 </StackPanel>
 
                 <StackPanel Grid.Column="8" VerticalAlignment="Top">
@@ -338,6 +341,19 @@
                         VerticalAlignment="Bottom"
                         Style="{StaticResource CompactButton}"
                         Click="ClearFilter_Click"/>
+
+                <StackPanel Grid.Column="13" Margin="8,0,0,0" VerticalAlignment="Top">
+                    <TextBlock Text="Loại kiểm tra" Style="{StaticResource FilterLabel}"/>
+                    <ComboBox x:Name="InspectionTypeComboBox"
+                              Style="{StaticResource FilterComboBox}"
+                              SelectedIndex="0">
+                        <ComboBoxItem Content="TẤT CẢ" Tag=""/>
+                        <ComboBoxItem Content="PRODUCTION" Tag="PRODUCT"/>
+                        <ComboBoxItem Content="MASTER ĐẠT" Tag="MASTER_GOOD"/>
+                        <ComboBoxItem Content="MASTER LỖI" Tag="MASTER_BAD"/>
+                        <ComboBoxItem Content="LEAK RETEST" Tag="LEAK_RETEST"/>
+                    </ComboBox>
+                </StackPanel>
             </Grid>
             </ScrollViewer>
         </Border>
@@ -431,6 +447,7 @@
         <Grid Grid.Row="3" Margin="2,4,2,0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="110"/>
                 <ColumnDefinition Width="310"/>
             </Grid.ColumnDefinitions>
 
@@ -441,7 +458,14 @@
                        FontSize="10.5"
                        TextTrimming="CharacterEllipsis"/>
 
-            <TextBlock Grid.Column="1"
+            <Button x:Name="LoadMoreButton"
+                    Grid.Column="1"
+                    Content="TẢI THÊM"
+                    Height="24"
+                    Style="{StaticResource CompactButton}"
+                    Click="LoadMore_Click"/>
+
+            <TextBlock Grid.Column="2"
                        Text="Enter: tìm kiếm  •  Có thể kéo giãn và sắp xếp cột"
                        VerticalAlignment="Center"
                        Foreground="#9098A1"
