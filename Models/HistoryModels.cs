@@ -62,8 +62,10 @@ public sealed class TestHistoryRecord
 
     public TestHistoryRecord ClonePersistenceSnapshot() => (TestHistoryRecord)MemberwiseClone();
 
-    public string DateText => EffectiveResultAt.ToString("yyyy/MM/dd");
-    public string TimeText => EffectiveResultAt.ToString("HH:mm:ss");
+    // Cột Ngày/Thời gian của History biểu diễn thời điểm BẮT ĐẦU TEST.
+    // Việc sắp xếp/query/cursor trong TestHistoryStore phải dùng cùng timestamp này.
+    public string DateText => EffectiveTestStartedAt.ToString("yyyy/MM/dd");
+    public string TimeText => EffectiveTestStartedAt.ToString("HH:mm:ss");
     public string PassedText => Passed ? "PASS" : "FAIL";
     public string LabelTypeText => !string.IsNullOrWhiteSpace(LabelTemplateType)
         ? LabelTemplateType

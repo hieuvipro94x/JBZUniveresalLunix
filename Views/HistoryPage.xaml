@@ -406,16 +406,10 @@
                 </DataGrid.RowStyle>
 
                 <DataGrid.Columns>
-                    <!-- Ngày/Thời gian dùng đúng ResultAt - cùng timestamp với SQL ORDER BY,
-                         bộ lọc thời gian và keyset pagination: mới nhất -> cũ nhất. -->
-                    <DataGridTextColumn Header="Ngày"
-                                        Binding="{Binding EffectiveResultAt, StringFormat={}{0:yyyy/MM/dd}}"
-                                        SortMemberPath="EffectiveResultAt"
-                                        Width="100"/>
-                    <DataGridTextColumn Header="Thời gian"
-                                        Binding="{Binding EffectiveResultAt, StringFormat={}{0:HH:mm:ss}}"
-                                        SortMemberPath="EffectiveResultAt"
-                                        Width="90"/>
+                    <!-- Ngày/Thời gian = thời điểm BẮT ĐẦU TEST (EffectiveTestStartedAt).
+                         TestHistoryStore sắp xếp DESC theo đúng timestamp này. -->
+                    <DataGridTextColumn Header="Ngày" Binding="{Binding DateText}" Width="100"/>
+                    <DataGridTextColumn Header="Thời gian" Binding="{Binding TimeText}" Width="90"/>
                     <DataGridTextColumn Header="File" Binding="{Binding ExportModelFileName}" Width="180"/>
                     <DataGridTextColumn Header="Loại kiểm tra" Binding="{Binding InspectionTypeText}" Width="120"/>
                     <DataGridTextColumn Header="Tên sản phẩm" Binding="{Binding PartName}" Width="150"/>

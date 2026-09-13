@@ -1,0 +1,666 @@
+Hãy audit và sửa TRIỆT ĐỂ lỗi SQLite/History hiện tại của JBZUniversalTester.
+
+TÌNH TRẠNG HIỆN TẠI:
+
+Command:
+
+dotnet run --project Tests -c Release
+
+Kết quả:
+
+SELF-TEST SUMMARY: 41/51 PASS
+
+Nhiều test History/SQLite cùng FAIL với lỗi:
+
+SQLite Error 1: 'no such column: Started'
+
+Stack trace đều đi qua:
+
+TestHistoryStore.CreateSchema()
+→ TestHistoryStore.Initialize()
+→ TestHistoryStore..ctor(...)
+
+Không coi đây là 10 lỗi độc lập.
+Trước tiên phải xác định ROOT CAUSE chung.
+
+======================================================================
+1. ROOT CAUSE ĐÃ BIẾT
+======================================================================
+
+Bảng Tests hiện tại dùng các cột timestamp:
+
+StartedAt
+InstallStartedAt
+TestStartedAt
+ResultAt
+RemovalStartedAt
+RemovedAt
+FinishedAt
+
+KHÔNG có cột:
+
+Started
+
+Do đó hãy tìm toàn bộ SQL/schema/index/query mới sửa gần đây có dạng:
+
+Started
+
+COALESCE(TestStartedAt, Started)
+
+ORDER BY Started
+
+WHERE Started
+
+INDEX(... Started ...)
+
+và xác định chỗ nào đang tham chiếu nhầm tên cột.
+
+Dùng:
+
+rg -n "\bStarted\b|StartedAt|TestStartedAt|ResultAt|COALESCE" Services Models Views Tests
+
+Đặc biệt audit:
+
+Services/TestHistoryStore.cs
+Models/HistoryModels.cs
+Views/HistoryPage.xaml
+Views/HistoryPage.xaml.cs
+Tests/Program.cs
+
+======================================================================
+2. KHÔNG ĐƯỢC SỬA KIỂU THAY MÙ QUÁ MỨC
+======================================================================
+
+Không global replace toàn project:
+
+Started -> StartedAt
+
+vì TestHistoryRecord vẫn có property C#:
+
+Started
+
+và legacy TestHistory table có thể vẫn dùng column:
+
+Started
+
+Chỉ sửa đúng SQL đang thao tác với bảng:
+
+Tests
+
+Bảng Tests dùng:
+
+StartedAt
+
+Legacy TestHistory nếu schema cũ dùng:
+
+Started
+
+thì phải giữ nguyên compatibility.
+
+Phải phân biệt rõ:
+
+C# property:
+history.Started
+
+SQLite Tests:
+StartedAt
+
+SQLite legacy TestHistory:
+có thể là Started
+
+Không được phá migration cũ.
+
+======================================================================
+3. AUDIT CREATE SCHEMA
+======================================================================
+
+Audit toàn bộ:
+
+CreateSchema(...)
+Ensure...
+Migrate...
+ReplaceRedundantIndexes...
+schema version
+legacy migration.
+
+Nếu có index mới phục vụ History sorting theo thời điểm bắt đầu test, phải dùng đúng:
+
+COALESCE(TestStartedAt, StartedAt)
+
+Ví dụ hợp lệ:
+
+CREATE INDEX IF NOT EXISTS IX_Tests_HistoryAt_Id
+ON Tests(
+    COALESCE(TestStartedAt, StartedAt) DESC,
+    Id DESC
+);
+
+Nếu index per Part/Inspection:
+
+CREATE INDEX IF NOT EXISTS IX_Tests_Part_Inspection_HistoryAt_Id
+ON Tests(
+    PartId,
+    InspectionType,
+    COALESCE(TestStartedAt, StartedAt) DESC,
+    Id DESC
+);
+
+TUYỆT ĐỐI không được còn:
+
+COALESCE(TestStartedAt, Started)
+
+trên bảng Tests.
+
+======================================================================
+4. MỤC TIÊU HISTORY SORTING
+======================================================================
+
+Sau khi sửa schema crash, giữ đúng requirement History:
+
+Ngày/Thời gian trên History phải dùng:
+
+EffectiveTestStartedAt =
+TestStartedAt ?? Started
+
+Trong DB tương đương:
+
+COALESCE(t.TestStartedAt, t.StartedAt)
+
+History phải sắp xếp:
+
+MỚI NHẤT
+→ CŨ NHẤT
+
+tức:
+
+ORDER BY
+    COALESCE(t.TestStartedAt, t.StartedAt) DESC,
+    t.Id DESC
+
+Không quay lại ResultAt nếu requirement hiện tại đã chốt theo thời điểm bắt đầu test.
+
+Ví dụ:
+
+13/09/2026 08:59:12
+13/09/2026 08:58:36
+12/09/2026 16:36:33
+12/09/2026 14:44:20
+11/09/2026 14:00:33
+
+phải hiện đúng thứ tự này.
+
+======================================================================
+5. FILTER THỜI GIAN PHẢI CÙNG NGUỒN
+======================================================================
+
+Nếu UI hiển thị ngày theo TestStartedAt/StartedAt thì filter ngày cũng phải dùng cùng timestamp.
+
+Ví dụ:
+
+FromDate <= COALESCE(TestStartedAt, StartedAt)
+< ToDateExclusive
+
+Không được:
+
+UI hiển thị TestStartedAt
+nhưng filter bằng ResultAt
+
+vì sẽ tạo trường hợp record nhìn thuộc ngày A nhưng query lại thuộc ngày B.
+
+Audit:
+
+ConfigureHistoryFilter(...)
+
+From
+To
+
+và thống nhất semantics.
+
+======================================================================
+6. KEYSET PAGINATION PHẢI ĐỒNG BỘ
+======================================================================
+
+Hiện History dùng keyset pagination.
+
+Nếu sort key đổi sang:
+
+COALESCE(TestStartedAt, StartedAt)
+
+thì cursor cũng phải dùng CÙNG key.
+
+Không được:
+
+ORDER BY TestStartedAt
+nhưng cursor BeforeResultAt dùng ResultAt.
+
+Nếu model hiện có field:
+
+BeforeResultAt
+
+nhưng semantics mới là History timestamp,
+có thể:
+
+A. đổi tên thành BeforeHistoryAt / BeforeTestStartedAt
+
+nếu không gây ảnh hưởng lớn;
+
+hoặc
+
+B. giữ tên cũ để tránh scope change nhưng phải document rõ semantics.
+
+Ưu tiên code rõ ràng nếu thay đổi an toàn.
+
+Cursor phải tương đương:
+
+historyAt < cursorHistoryAt
+
+OR
+
+historyAt = cursorHistoryAt
+AND Id < cursorId
+
+với:
+
+historyAt = COALESCE(TestStartedAt, StartedAt)
+
+Page 1 + Page 2 không:
+- duplicate
+- mất row
+- đảo thứ tự.
+
+======================================================================
+7. HISTORY MODEL
+======================================================================
+
+Audit:
+
+TestHistoryRecord.DateText
+TestHistoryRecord.TimeText
+EffectiveTestStartedAt
+EffectiveResultAt
+
+Requirement:
+
+DateText
+TimeText
+
+phải phản ánh thời điểm bắt đầu test:
+
+EffectiveTestStartedAt
+
+Không được một chỗ dùng EffectiveResultAt còn chỗ khác dùng EffectiveTestStartedAt.
+
+XAML cũng phải bind cùng timestamp.
+
+======================================================================
+8. EXPORT
+======================================================================
+
+Audit CSV/XLSX.
+
+History trên màn hình yêu cầu mới nhất -> cũ nhất.
+
+Nếu export cũng yêu cầu giữ cùng thứ tự hiện tại thì:
+
+ORDER BY historyAt DESC, Id DESC
+
+Không được export lại theo:
+
+PartNumber ASC
+StartedAt ASC
+
+trừ khi test/spec hiện hành bắt buộc format export cũ.
+
+Nếu có conflict giữa:
+- requirement UI mới nhất -> cũ nhất
+- legacy export sorting
+
+hãy tách semantics rõ:
+UI sorting không được bị phá chỉ để làm export test pass.
+
+Chỉ thay export nếu requirement hiện tại đã yêu cầu export cùng thứ tự History.
+
+======================================================================
+9. LEGACY DATABASE COMPATIBILITY
+======================================================================
+
+Rất quan trọng.
+
+Self-test có:
+
+Legacy SQLite without SchemaInfo initializes safely
+
+Do đó phải test database cũ chưa có:
+
+TestStartedAt
+
+hoặc schema version cũ.
+
+Không được tạo index expression trên column chưa tồn tại TRƯỚC khi migration/add-column hoàn tất.
+
+Thứ tự initialization phải là:
+
+1. create/read schema cơ bản
+2. add missing columns
+3. migrate
+4. sau khi chắc column tồn tại mới create index mới.
+
+Nếu CreateSchema hiện create index dùng TestStartedAt trước EnsureColumn,
+hãy sửa thứ tự.
+
+Không được để database v4/v5 cũ mở app là crash.
+
+======================================================================
+10. ROOT CAUSE TEST
+======================================================================
+
+Bổ sung hoặc sửa self-test xác minh schema:
+
+PRAGMA table_info(Tests)
+
+phải có:
+
+StartedAt
+TestStartedAt
+ResultAt
+
+và KHÔNG dựa vào column Started.
+
+Kiểm tra index SQL bằng:
+
+SELECT name, sql
+FROM sqlite_master
+WHERE type='index'
+AND tbl_name='Tests';
+
+Assert:
+
+không index nào tham chiếu:
+
+TestStartedAt, Started
+
+sai tên column.
+
+======================================================================
+11. SORT REGRESSION TEST
+======================================================================
+
+Thêm test rõ ràng:
+
+Record OLD:
+StartedAt = 2026-09-12 10:00:00
+TestStartedAt = 2026-09-12 10:00:10
+ResultAt = 2026-09-12 10:05:00
+
+Record NEW:
+StartedAt = 2026-09-12 10:01:00
+TestStartedAt = 2026-09-12 10:01:10
+ResultAt = 2026-09-12 10:01:20
+
+Mặc dù OLD kết thúc muộn hơn,
+History phải hiện:
+
+NEW
+OLD
+
+vì requirement sắp xếp theo thời điểm BẮT ĐẦU TEST.
+
+Test cả:
+
+DateText
+TimeText
+first page
+second page
+cursor.
+
+======================================================================
+12. NULL TestStartedAt COMPATIBILITY
+======================================================================
+
+Thêm record legacy:
+
+StartedAt = 10:02:00
+TestStartedAt = NULL
+
+History timestamp phải fallback:
+
+10:02:00
+
+Không crash.
+
+Thứ tự vẫn đúng.
+
+======================================================================
+13. TEST CÁC FAIL HIỆN TẠI
+======================================================================
+
+Sau sửa, đặc biệt xác minh các test sau PASS lại:
+
+- History SQLite/search/CSV/XLSX native types
+- History exactly-once transaction crash recovery
+- Legacy SQLite without SchemaInfo initializes safely
+- SQLite schema v5 many-to-many migration and query plans
+- History initialization waits for an active SQLite writer
+- Production SQLite writer retries a transient lock
+- SQLite interrupted transaction reopens without deleting database
+- Canonical runtime paths and SQLite PartCnt authority
+- System log master switch preserves History
+- PASS label snapshot/idempotency/traceability
+
+Không sửa từng test để che lỗi chung.
+
+Phải sửa root cause trong production code trước.
+
+======================================================================
+14. KHÔNG ĐƯỢC PHÁ
+======================================================================
+
+Không thay đổi nếu không cần:
+
+- Production Total/PASS/FAIL per Part
+- LOTNO
+- model switching
+- D2XX
+- relay
+- discard 1-pass
+- Master state machine
+- WrongWiring/ShortCircuit classifier
+- Probe
+- IO Mapping
+- label payload
+- CycleId exactly-once semantics
+- DB production data thật.
+
+Không delete database để làm test PASS.
+
+Không bump schema nếu không thật sự cần.
+
+Không đổi Version chỉ vì sửa typo nếu project policy không yêu cầu.
+
+======================================================================
+15. BUILD + SELF TEST
+======================================================================
+
+Sau sửa chạy:
+
+dotnet build -c Release
+
+bắt buộc:
+
+0 warning
+0 error
+
+Sau đó:
+
+dotnet run --project Tests -c Release
+
+Mục tiêu:
+
+SELF-TEST SUMMARY: 51/51 PASS
+
+Nếu chưa 51/51:
+không dừng.
+
+Phân tích từng FAIL còn lại và sửa root cause.
+
+======================================================================
+16. SQLITE VALIDATION
+======================================================================
+
+Sau test chạy hoặc viết self-test tương đương:
+
+PRAGMA integrity_check;
+
+Kết quả phải:
+
+ok
+
+Kiểm tra:
+
+PRAGMA table_info(Tests);
+
+và:
+
+SELECT name, sql
+FROM sqlite_master
+WHERE type='index'
+AND tbl_name='Tests';
+
+Xác minh không còn bất kỳ index/query production nào tham chiếu column
+không tồn tại.
+
+======================================================================
+17. AUDIT DUPLICATE HISTORY QUERY CODE
+======================================================================
+
+TestHistoryStore hiện có dấu hiệu có phần ConfigureHistoryFilter/query
+bị duplicate hoặc code cũ comment lại.
+
+Rà soát:
+
+SearchCore
+EnumerateCore
+ConfigureHistoryFilter
+
+để bảo đảm chỉ có MỘT implementation authoritative.
+
+Không để:
+- một query sort ResultAt
+- query khác sort TestStartedAt
+- export dùng StartedAt
+- filter dùng ResultAt
+
+mà không có lý do rõ ràng.
+
+Chuẩn hóa một helper, ví dụ SQL expression:
+
+private const string HistoryTimeSql =
+    "COALESCE(t.TestStartedAt,t.StartedAt)";
+
+hoặc cách tương đương an toàn.
+
+Dùng cùng expression cho:
+- filter date
+- ORDER BY
+- cursor
+- History query.
+
+======================================================================
+18. PERFORMANCE
+======================================================================
+
+Không vì dùng COALESCE mà làm History 100k/500k row cực chậm.
+
+Nếu expression index hợp lệ với SQLite version hiện tại thì giữ.
+
+Nếu expression index gây compatibility problem:
+đánh giá giải pháp khác nhưng không thêm column/schema phức tạp nếu không cần.
+
+Dùng EXPLAIN QUERY PLAN cho:
+
+SELECT ...
+FROM Tests t
+ORDER BY COALESCE(t.TestStartedAt,t.StartedAt) DESC,t.Id DESC
+LIMIT 200;
+
+Nếu index được dùng thì báo.
+
+Nếu không dùng index:
+báo rõ trước khi thêm schema/index mới.
+
+======================================================================
+19. BÁO CÁO CUỐI
+======================================================================
+
+Báo theo đúng format:
+
+HISTORY SQLITE FIX AUDIT
+
+Root cause:
+-
+
+Why 10 tests failed:
+-
+
+Schema:
+- StartedAt exists:
+- Started exists in Tests:
+- TestStartedAt exists:
+- ResultAt exists:
+
+History timestamp:
+-
+
+History ORDER BY:
+-
+
+History date filter:
+-
+
+Keyset cursor:
+-
+
+Legacy DB compatibility:
+-
+
+Index:
+- name:
+- SQL:
+- EXPLAIN QUERY PLAN:
+
+Build:
+-
+
+Self-tests:
+- passed:
+- failed:
+
+SQLite integrity_check:
+-
+
+Files changed:
+-
+
+Additional bugs found:
+-
+
+Remaining risks:
+-
+
+FINAL ACCEPTANCE:
+
+1. Không còn "no such column: Started".
+2. DB mới tạo được.
+3. DB legacy mở được.
+4. History mới nhất -> cũ nhất.
+5. Date/Time dùng thời điểm bắt đầu test.
+6. Filter dùng cùng timestamp.
+7. Pagination dùng cùng timestamp.
+8. Không duplicate/mất row giữa page.
+9. Exactly-once history vẫn đúng.
+10. Label/production persistence không regression.
+11. Release build 0 warning / 0 error.
+12. SELF-TEST SUMMARY phải 51/51 PASS.
+
+Không kết luận hoàn tất chỉ vì sửa được một string.
+Phải audit schema + query + migration + pagination + test và chứng minh bằng 51/51 PASS.

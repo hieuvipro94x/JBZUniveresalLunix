@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text.Json;
@@ -422,6 +422,12 @@ public sealed class TestHistoryStore
                 ON Tests(PartId, InspectionType, ResultAt DESC, Id DESC);
             CREATE INDEX IF NOT EXISTS IX_Tests_ModelId_ResultAt_Id
                 ON Tests(ModelId, ResultAt DESC, Id DESC);
+            -- History grid hiển thị ngày/giờ bắt đầu test, vì vậy index này phục vụ
+            -- ORDER BY/filter/keyset theo đúng timestamp operator đang nhìn thấy.
+            CREATE INDEX IF NOT EXISTS IX_Tests_HistoryAt_Id
+                ON Tests(COALESCE(TestStartedAt, StartedAt) DESC, Id DESC);
+            CREATE INDEX IF NOT EXISTS IX_Tests_Part_Inspection_HistoryAt_Id
+                ON Tests(PartId, InspectionType, COALESCE(TestStartedAt, StartedAt) DESC, Id DESC);
             CREATE INDEX IF NOT EXISTS IX_Tests_Lot ON Tests(Lot);
             CREATE INDEX IF NOT EXISTS IX_TestFaults_TestId_FaultOrder_Id
                 ON TestFaults(TestId, FaultOrder, Id);
@@ -1921,7 +1927,7 @@ public sealed class TestHistoryStore
             FROM Tests t
             JOIN Models m ON m.Id=t.ModelId
             GROUP BY m.FileName,m.FilePath,m.ModelName
-            ORDER BY MAX(t.ResultAt) DESC,MAX(t.Id) DESC;
+            ORDER BY MAX(COALESCE(t.TestStartedAt,t.StartedAt)) DESC,MAX(t.Id) DESC;
             """;
         using SqliteDataReader reader = command.ExecuteReader();
         var result = new List<HistoryPartOption> { new(string.Empty, "TẤT CẢ MÃ HÀNG") };
@@ -2060,13 +2066,17 @@ public sealed class TestHistoryStore
         */
         int limit = Math.Clamp(criteria.MaxRows, 1, 5_000);
         int offset = Math.Max(0, criteria.Offset);
-        // Lịch sử luôn theo thời điểm kết quả mới nhất -> cũ nhất.
-        // ResultAt cũng là khóa của bộ lọc ngày và keyset cursor, đồng thời đã có index DESC.
-        string order = "ORDER BY t.ResultAt DESC,t.Id DESC" +
-              (!exportAll && applyLimit
-                  ? $" LIMIT {limit}" +
-                    (criteria.BeforeResultAt is null ? $" OFFSET {offset}" : string.Empty)
-                  : string.Empty);
+
+        // HistoryPage hiển thị DateText/TimeText từ EffectiveTestStartedAt
+        // (TestStartedAt ?? Started). Sắp xếp phải dùng CHÍNH timestamp đó,
+        // nếu không test dài/ngắn khác nhau có thể làm giờ đang hiển thị bị đảo.
+        const string historyAtSql = "COALESCE(t.TestStartedAt,t.StartedAt)";
+        string order =
+            $"ORDER BY {historyAtSql} DESC,t.Id DESC" +
+            (!exportAll && applyLimit
+                ? $" LIMIT {limit}" +
+                  (criteria.BeforeResultAt is null ? $" OFFSET {offset}" : string.Empty)
+                : string.Empty);
         string labelPayloadColumn = includeLabelPayload ? "t.LabelPayload" : "''";
         command.CommandText = $"""
             SELECT
@@ -2110,8 +2120,9 @@ public sealed class TestHistoryStore
         bool includeCursor)
     {
         var clauses = new List<string>();
-        if (criteria.From is DateTime from) { clauses.Add("t.ResultAt >= $From"); command.Parameters.AddWithValue("$From", from.ToString("O", CultureInfo.InvariantCulture)); }
-        if (criteria.To is DateTime to) { clauses.Add("t.ResultAt < $To"); command.Parameters.AddWithValue("$To", to.ToString("O", CultureInfo.InvariantCulture)); }
+        const string historyAtSql = "COALESCE(t.TestStartedAt,t.StartedAt)";
+        if (criteria.From is DateTime from) { clauses.Add($"{historyAtSql} >= $From"); command.Parameters.AddWithValue("$From", from.ToString("O", CultureInfo.InvariantCulture)); }
+        if (criteria.To is DateTime to) { clauses.Add($"{historyAtSql} < $To"); command.Parameters.AddWithValue("$To", to.ToString("O", CultureInfo.InvariantCulture)); }
         if (criteria.LotNo is long lot) { clauses.Add("t.Lot=$Lot"); command.Parameters.AddWithValue("$Lot", lot); }
         if (!string.IsNullOrWhiteSpace(criteria.PartKeyword))
         {
@@ -2141,7 +2152,9 @@ public sealed class TestHistoryStore
         if (!string.IsNullOrWhiteSpace(criteria.AppVersion)) { clauses.Add("t.AppVersion LIKE $AppVersion"); command.Parameters.AddWithValue("$AppVersion", $"%{criteria.AppVersion.Trim()}%"); }
         if (includeCursor && criteria.BeforeResultAt is DateTime cursor && criteria.BeforeId is long id)
         {
-            clauses.Add("(t.ResultAt < $BeforeResultAt OR (t.ResultAt=$BeforeResultAt AND t.Id < $BeforeId))");
+            // BeforeResultAt giữ tên cũ để không phá API, nhưng giá trị là
+            // EffectiveTestStartedAt để cursor khớp chính xác ORDER BY phía trên.
+            clauses.Add($"({historyAtSql} < $BeforeResultAt OR ({historyAtSql}=$BeforeResultAt AND t.Id < $BeforeId))");
             command.Parameters.AddWithValue("$BeforeResultAt", cursor.ToString("O", CultureInfo.InvariantCulture));
             command.Parameters.AddWithValue("$BeforeId", id);
         }

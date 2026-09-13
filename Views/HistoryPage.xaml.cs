@@ -1,9 +1,7 @@
-﻿using System.IO;
+using System.IO;
 using System.Collections.ObjectModel;
-using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Data;
 using System.Windows.Input;
 using JBZUniversalTester.Models;
 using JBZUniversalTester.Services;
@@ -36,7 +34,6 @@ public partial class HistoryPage : UserControl
 
         SetDefaultFilters();
         HistoryGrid.ItemsSource = _records;
-        ApplyNewestFirstViewSort();
         Loaded += HistoryPage_Loaded;
     }
 
@@ -66,21 +63,6 @@ public partial class HistoryPage : UserControl
     }
 
     private Window? HostWindow => Window.GetWindow(this) ?? Application.Current?.MainWindow;
-
-    /// <summary>
-    /// Lớp bảo vệ ở UI: luôn hiển thị record mới nhất trước. SQL vẫn là nguồn
-    /// thứ tự chính; sort view này ngăn một thay đổi backend sau này làm đảo bảng.
-    /// </summary>
-    private void ApplyNewestFirstViewSort()
-    {
-        ICollectionView view = CollectionViewSource.GetDefaultView(_records);
-        using (view.DeferRefresh())
-        {
-            view.SortDescriptions.Clear();
-            view.SortDescriptions.Add(new SortDescription(nameof(TestHistoryRecord.EffectiveResultAt), ListSortDirection.Descending));
-            view.SortDescriptions.Add(new SortDescription(nameof(TestHistoryRecord.Id), ListSortDirection.Descending));
-        }
-    }
 
     private void SetDefaultFilters()
     {
@@ -181,7 +163,10 @@ public partial class HistoryPage : UserControl
             {
                 MaxRows = PageSize,
                 Offset = 0,
-                BeforeResultAt = cursor.EffectiveResultAt,
+                // Tên property BeforeResultAt được giữ để tương thích API cũ,
+                // nhưng cursor phải dùng cùng timestamp đang hiển thị/sắp xếp:
+                // EffectiveTestStartedAt = TestStartedAt ?? Started.
+                BeforeResultAt = cursor.EffectiveTestStartedAt,
                 BeforeId = cursor.Id
             };
             IReadOnlyList<TestHistoryRecord> page = await Task.Run(() => GetStore().SearchSummary(pageCriteria));

@@ -3433,7 +3433,7 @@ internal static class Program
                     string.Empty,
                     "ALL",
                     MaxRows: 1,
-                    BeforeResultAt: firstPage[0].EffectiveResultAt,
+                    BeforeResultAt: firstPage[0].EffectiveTestStartedAt,
                     BeforeId: firstPage[0].Id));
             Assert(secondPage.Count == 1 && secondPage[0].Id != firstPage[0].Id,
                 "History keyset cursor returns the next stable page without OFFSET");
@@ -5199,7 +5199,7 @@ internal static class Program
                historyPageXaml.Contains("x:Name=\"CloseButton\"", StringComparison.Ordinal) &&
                historyPageSource.Contains("GetHistorySummary(criteria)", StringComparison.Ordinal) &&
                historyPageSource.Contains("MaxRows = PageSize", StringComparison.Ordinal) &&
-               historyPageSource.Contains("BeforeResultAt = cursor.EffectiveResultAt", StringComparison.Ordinal) &&
+               historyPageSource.Contains("BeforeResultAt = cursor.EffectiveTestStartedAt", StringComparison.Ordinal) &&
                !historyPageSource.Contains("UiRowLimit", StringComparison.Ordinal),
             "History uses full SQL summary plus incremental keyset pages and exposes no legacy import action");
         System.Xml.Linq.XElement[] historyButtons =
@@ -6716,6 +6716,11 @@ internal static class Program
                    found[0].LabelPayload == record.LabelPayload,
                 "SQLite search preserves 14-column values, phase trace and immutable print payload");
 
+            Assert(found[0].DateText == "2026/08/09" &&
+                   found[0].TimeText == "14:07:05" &&
+                   found[0].EffectiveResultAt == finished,
+                "History Ngày/Thời gian must display TEST START time, not later ResultAt time");
+
             string csv = Path.Combine(root, "history.csv");
             HistoryExportService.ExportCsv(csv, found);
             byte[] csvBytes = File.ReadAllBytes(csv);
@@ -7001,13 +7006,81 @@ internal static class Program
             IReadOnlyList<TestHistoryRecord> allExportRows = exportStore.SearchForExport(monthlyCriteria);
             Assert(limitedRows.Count == 1 && allExportRows.Count == 3,
                 "History export is independent from the DataGrid row limit");
-            Assert(allExportRows[0].PartNumber == "PART-A" &&
-                   allExportRows[1].CycleId == "export-part-z-a" &&
-                   allExportRows[2].CycleId == "export-part-z-b",
-                "History export sorts by part number, test start time and stable Id");
-            Assert(allExportRows[1].ExportModelFileName == "A.tht" &&
-                   allExportRows[2].ExportModelFileName == "B.tht",
+            Assert(allExportRows[0].CycleId == "export-part-a" &&
+                   allExportRows[1].CycleId == "export-part-z-b" &&
+                   allExportRows[2].CycleId == "export-part-z-a",
+                "History export sorts newest-to-oldest by displayed test-start time and stable Id");
+            Assert(allExportRows[1].ExportModelFileName == "B.tht" &&
+                   allExportRows[2].ExportModelFileName == "A.tht",
                 "Changing A.tht to B.tht snapshots B.tht only for the new cycle");
+
+            // Regression: row cũ bắt đầu trước nhưng test lâu hơn nên ResultAt muộn hơn.
+            // History phải vẫn sắp theo giờ BẮT ĐẦU TEST đang hiển thị, không theo ResultAt.
+            var orderingStore = new TestHistoryStore(Path.Combine(root, "history-ordering.db"));
+            DateTime orderBase = new(2026, 9, 13, 8, 0, 0, DateTimeKind.Local);
+            orderingStore.Add(new TestHistoryRecord
+            {
+                Started = orderBase,
+                TestStartedAt = orderBase,
+                ResultAt = orderBase.AddMinutes(5),
+                Finished = orderBase.AddMinutes(5),
+                PartNumber = "ORDER-TEST",
+                ModelFile = @"D:\Models\ORDER.tht",
+                Result = "PASS",
+                Passed = true,
+                CycleId = "older-start-later-result"
+            });
+            orderingStore.Add(new TestHistoryRecord
+            {
+                Started = orderBase.AddMinutes(1),
+                TestStartedAt = orderBase.AddMinutes(1),
+                ResultAt = orderBase.AddMinutes(2),
+                Finished = orderBase.AddMinutes(2),
+                PartNumber = "ORDER-TEST",
+                ModelFile = @"D:\Models\ORDER.tht",
+                Result = "PASS",
+                Passed = true,
+                CycleId = "newer-start-earlier-result"
+            });
+
+            IReadOnlyList<TestHistoryRecord> orderedRows = orderingStore.SearchSummary(
+                new HistorySearchCriteria(
+                    orderBase.Date,
+                    orderBase.Date.AddDays(1),
+                    null,
+                    "ORDER-TEST",
+                    "ALL",
+                    MaxRows: 10));
+            Assert(orderedRows.Count == 2 &&
+                   orderedRows[0].CycleId == "newer-start-earlier-result" &&
+                   orderedRows[0].TimeText == "08:01:00" &&
+                   orderedRows[1].CycleId == "older-start-later-result" &&
+                   orderedRows[1].TimeText == "08:00:00",
+                "History grid is strictly newest-to-oldest by displayed TEST START time even when ResultAt order differs");
+
+            IReadOnlyList<TestHistoryRecord> orderPage1 = orderingStore.SearchSummary(
+                new HistorySearchCriteria(
+                    orderBase.Date,
+                    orderBase.Date.AddDays(1),
+                    null,
+                    "ORDER-TEST",
+                    "ALL",
+                    MaxRows: 1));
+            IReadOnlyList<TestHistoryRecord> orderPage2 = orderingStore.SearchSummary(
+                new HistorySearchCriteria(
+                    orderBase.Date,
+                    orderBase.Date.AddDays(1),
+                    null,
+                    "ORDER-TEST",
+                    "ALL",
+                    MaxRows: 1,
+                    BeforeResultAt: orderPage1[0].EffectiveTestStartedAt,
+                    BeforeId: orderPage1[0].Id));
+            Assert(orderPage1.Count == 1 &&
+                   orderPage2.Count == 1 &&
+                   orderPage1[0].CycleId == "newer-start-earlier-result" &&
+                   orderPage2[0].CycleId == "older-start-later-result",
+                "History keyset pagination preserves newest-to-oldest TEST START order across pages");
         }
         finally
         {
