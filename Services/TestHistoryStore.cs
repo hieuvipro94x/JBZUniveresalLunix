@@ -1139,6 +1139,19 @@ public sealed class TestHistoryStore
         long? legacyHistoryId)
     {
         TestHistoryRecord h = request.History;
+        long sequence = h.ProductionCounter;
+        if (sequence <= 0)
+        {
+            using SqliteCommand sequenceCommand = connection.CreateCommand();
+            sequenceCommand.Transaction = transaction;
+            sequenceCommand.CommandText =
+                "SELECT COUNT(*) FROM Tests WHERE PartId=$Part AND InspectionType='PRODUCT' AND Passed=1;";
+            sequenceCommand.Parameters.AddWithValue("$Part", partId);
+            long passedBefore = Convert.ToInt64(sequenceCommand.ExecuteScalar() ?? 0L, CultureInfo.InvariantCulture);
+            sequence = HistoryInspectionType.IsProduct(h.InspectionType) && h.Passed
+                ? checked(passedBefore + 1)
+                : Math.Max(1, passedBefore);
+        }
         using SqliteCommand command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
@@ -1168,7 +1181,7 @@ public sealed class TestHistoryStore
         command.Parameters.AddWithValue("$Config", configId);
         command.Parameters.AddWithValue("$Inspection", h.InspectionType);
         command.Parameters.AddWithValue("$Lot", h.LotNo);
-        command.Parameters.AddWithValue("$Counter", h.ProductionCounter);
+        command.Parameters.AddWithValue("$Counter", sequence);
         command.Parameters.AddWithValue("$Started", h.Started.ToString("O", CultureInfo.InvariantCulture));
         AddNullable(command, "$Install", h.InstallStartedAt?.ToString("O", CultureInfo.InvariantCulture));
         AddNullable(command, "$TestStarted", h.TestStartedAt?.ToString("O", CultureInfo.InvariantCulture));

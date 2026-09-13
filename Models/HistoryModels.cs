@@ -79,7 +79,8 @@ public sealed class TestHistoryRecord
     public string ExportProgressText => Passed ? "1/1" : "0/1";
     public string ExportResultText => Passed ? "합격" : "불량";
     public long? ExportAcceptedLotNo => IsProductionRecord && Passed && LotNo > 0 ? LotNo : null;
-    public long? ExportSequenceNo => ExportAcceptedLotNo;
+    public long? ExportSequenceNo => ExportAcceptedLotNo ??
+        (ProductionCounter > 0 ? ProductionCounter : null);
     public string ExportBarcodeInputText => string.Empty;
     public string ExportBarcodeText =>
         IsProductionRecord &&

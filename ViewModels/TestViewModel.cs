@@ -6813,7 +6813,7 @@ public sealed class TestViewModel : ObservableObject
             Nco = model.Nco,
             Alc = model.Alc,
             LotNo = 0,
-            ProductionCounter = ProbeCycleCount,
+            ProductionCounter = 0,
             Result = inspectionType switch
             {
                 HistoryInspectionType.MasterGood when passed => "MASTER_GOOD_PASS",
