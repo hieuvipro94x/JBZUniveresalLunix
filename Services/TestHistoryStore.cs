@@ -13,7 +13,7 @@ namespace JBZUniversalTester.Services;
 /// </summary>
 public sealed class TestHistoryStore
 {
-    public const int CurrentSchemaVersion = 5;
+    public const int CurrentSchemaVersion = 6;
     private const int LegacyMigrationBatchSize = 500;
     private static readonly object SchemaGate = new();
     private readonly string _path;
@@ -73,6 +73,8 @@ public sealed class TestHistoryStore
 
         using SqliteTransaction transaction = connection.BeginTransaction();
         CreateSchema(connection, transaction);
+        EnsureCurrentTestColumns(connection, transaction);
+        CreateIndexes(connection, transaction);
         int existingVersion = ReadSchemaVersion(connection, transaction);
         if (existingVersion < CurrentSchemaVersion &&
             TableExists(connection, transaction, "TestHistory"))
@@ -413,6 +415,56 @@ public sealed class TestHistoryStore
                 UpdatedAt TEXT NOT NULL
             );
 
+            """;
+        command.ExecuteNonQuery();
+    }
+
+    private static void EnsureCurrentTestColumns(
+        SqliteConnection connection,
+        SqliteTransaction transaction)
+    {
+        (string Name, string Definition)[] columns =
+        [
+            ("InstallStartedAt", "TEXT NULL"),
+            ("TestStartedAt", "TEXT NULL"),
+            ("ContinuityCompletedAt", "TEXT NULL"),
+            ("ResistanceStartedAt", "TEXT NULL"),
+            ("ResistanceCompletedAt", "TEXT NULL"),
+            ("WaterProofStartedAt", "TEXT NULL"),
+            ("WaterProofCompletedAt", "TEXT NULL"),
+            ("ResultAt", "TEXT NULL"),
+            ("RemovalStartedAt", "TEXT NULL"),
+            ("RemovedAt", "TEXT NULL")
+        ];
+
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (SqliteCommand read = connection.CreateCommand())
+        {
+            read.Transaction = transaction;
+            read.CommandText = "PRAGMA table_info(Tests);";
+            using SqliteDataReader reader = read.ExecuteReader();
+            while (reader.Read())
+                existing.Add(reader.GetString(1));
+        }
+
+        foreach ((string name, string definition) in columns)
+        {
+            if (existing.Contains(name))
+                continue;
+            using SqliteCommand alter = connection.CreateCommand();
+            alter.Transaction = transaction;
+            alter.CommandText = $"ALTER TABLE Tests ADD COLUMN {name} {definition};";
+            alter.ExecuteNonQuery();
+        }
+    }
+
+    private static void CreateIndexes(
+        SqliteConnection connection,
+        SqliteTransaction transaction)
+    {
+        using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
             CREATE INDEX IF NOT EXISTS IX_Models_PartId ON Models(PartId);
             CREATE INDEX IF NOT EXISTS IX_Models_FileHash ON Models(FileHash);
             CREATE INDEX IF NOT EXISTS IX_Models_FilePath ON Models(FilePath);
@@ -422,8 +474,6 @@ public sealed class TestHistoryStore
                 ON Tests(PartId, InspectionType, ResultAt DESC, Id DESC);
             CREATE INDEX IF NOT EXISTS IX_Tests_ModelId_ResultAt_Id
                 ON Tests(ModelId, ResultAt DESC, Id DESC);
-            -- History grid hiển thị ngày/giờ bắt đầu test, vì vậy index này phục vụ
-            -- ORDER BY/filter/keyset theo đúng timestamp operator đang nhìn thấy.
             CREATE INDEX IF NOT EXISTS IX_Tests_HistoryAt_Id
                 ON Tests(COALESCE(TestStartedAt, StartedAt) DESC, Id DESC);
             CREATE INDEX IF NOT EXISTS IX_Tests_Part_Inspection_HistoryAt_Id

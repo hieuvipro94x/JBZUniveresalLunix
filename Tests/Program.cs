@@ -59,7 +59,7 @@ internal static class Program
             ("History SQLite/search/CSV/XLSX native types", TestHistory),
             ("History exactly-once transaction crash recovery", TestHistoryTransactionAtomicity),
             ("Legacy SQLite without SchemaInfo initializes safely", TestLegacyDatabaseWithoutSchemaInfo),
-            ("SQLite schema v5 many-to-many migration and query plans", TestDatabaseSchemaV5),
+            ("SQLite schema v6 non-destructive History migration and query plans", TestDatabaseSchemaV5),
             ("History initialization waits for an active SQLite writer", TestHistoryInitializationWaitsForWriter),
             ("Production SQLite writer retries a transient lock", TestProductionPersistenceRetriesTransientLock),
             ("SQLite interrupted transaction reopens without deleting database", TestHistoryInterruptedTransactionRecovery),
@@ -3450,12 +3450,15 @@ internal static class Program
                     DROP INDEX IF EXISTS IX_Tests_ResultAt_Id;
                     DROP INDEX IF EXISTS IX_Tests_Part_Inspection_ResultAt_Id;
                     DROP INDEX IF EXISTS IX_Tests_ModelId_ResultAt_Id;
+                    DROP INDEX IF EXISTS IX_Tests_HistoryAt_Id;
+                    DROP INDEX IF EXISTS IX_Tests_Part_Inspection_HistoryAt_Id;
                     DROP INDEX IF EXISTS IX_TestFaults_TestId_FaultOrder_Id;
                     DROP INDEX IF EXISTS IX_ResistanceMeasurements_TestId;
                     DROP INDEX IF EXISTS IX_WaterProofMeasurements_TestId;
                     CREATE INDEX IF NOT EXISTS IX_Tests_ResultAt ON Tests(ResultAt DESC);
                     CREATE INDEX IF NOT EXISTS IX_Tests_Part_ResultAt ON Tests(PartId,ResultAt DESC);
                     CREATE INDEX IF NOT EXISTS IX_TestFaults_TestId ON TestFaults(TestId);
+                    ALTER TABLE Tests DROP COLUMN TestStartedAt;
                     UPDATE SchemaInfo SET SchemaVersion=4 WHERE Id=1;
                     """;
                 command.ExecuteNonQuery();
@@ -3464,9 +3467,13 @@ internal static class Program
             var migrated = new TestHistoryStore(dbPath);
             var rerun = new TestHistoryStore(dbPath);
             Assert(File.Exists(dbPath + $".pre-schema-v{TestHistoryStore.CurrentSchemaVersion}.backup"),
-                "Schema v4 is backed up before v5 migration");
-            Assert(migrated.SchemaVersion == 5 && rerun.SchemaVersion == 5,
-                "Schema v5 migration is idempotent");
+                "Schema v4 is backed up before v6 migration");
+            Assert(migrated.SchemaVersion == TestHistoryStore.CurrentSchemaVersion &&
+                   rerun.SchemaVersion == TestHistoryStore.CurrentSchemaVersion,
+                "Schema v6 migration is idempotent");
+            Assert(migrated.SearchSummary(new HistorySearchCriteria(
+                       null, null, null, "PART-M2M", "ALL", MaxRows: 10)).Count == 2,
+                "Migration adds TestStartedAt before creating History indexes and preserves legacy rows");
             Assert(migrated.GetModelsForPart("PN:PART-M2M-A").Count == 1 &&
                    migrated.Search(new HistorySearchCriteria(
                        null, null, null, "PART-M2M", "ALL", MaxRows: 10)).Count == 2,
@@ -3479,11 +3486,21 @@ internal static class Program
                 SELECT
                     (SELECT COUNT(*) FROM PartModels),
                     (SELECT COUNT(*) FROM (SELECT PartId,ModelId FROM PartModels GROUP BY PartId,ModelId HAVING COUNT(*)>1)),
+                    (SELECT COUNT(*) FROM Tests),
+                    (SELECT COUNT(*) FROM TestFaults),
+                    (SELECT COUNT(*) FROM ResistanceMeasurements),
+                    (SELECT COUNT(*) FROM WaterProofMeasurements),
+                    (SELECT COUNT(*) FROM TestFaults c LEFT JOIN Tests t ON t.Id=c.TestId WHERE t.Id IS NULL) +
+                    (SELECT COUNT(*) FROM ResistanceMeasurements c LEFT JOIN Tests t ON t.Id=c.TestId WHERE t.Id IS NULL) +
+                    (SELECT COUNT(*) FROM WaterProofMeasurements c LEFT JOIN Tests t ON t.Id=c.TestId WHERE t.Id IS NULL),
                     (SELECT integrity_check FROM pragma_integrity_check LIMIT 1);
                 """;
             using SqliteDataReader reader = probe.ExecuteReader();
-            Assert(reader.Read() && reader.GetInt32(0) == 1 && reader.GetInt32(1) == 0 && reader.GetString(2) == "ok",
-                "v5 relation data is unique and integrity_check remains clean");
+            Assert(reader.Read() && reader.GetInt32(0) == 1 && reader.GetInt32(1) == 0 &&
+                   reader.GetInt32(2) == 2 && reader.GetInt32(3) == 0 &&
+                   reader.GetInt32(4) == 2 && reader.GetInt32(5) == 2 &&
+                   reader.GetInt32(6) == 0 && reader.GetString(7) == "ok",
+                "v6 migration preserves Tests and child rows without orphans and integrity_check remains clean");
             reader.Close();
 
             string latestPlan = ExplainPlan(
