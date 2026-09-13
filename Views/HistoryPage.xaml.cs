@@ -163,11 +163,8 @@ public partial class HistoryPage : UserControl
             {
                 MaxRows = PageSize,
                 Offset = 0,
-                // Tên property BeforeResultAt được giữ để tương thích API cũ,
-                // nhưng cursor phải dùng cùng timestamp đang hiển thị/sắp xếp:
-                // EffectiveTestStartedAt = TestStartedAt ?? Started.
-                BeforeResultAt = cursor.EffectiveTestStartedAt,
-                BeforeId = cursor.Id
+                AfterHistoryAt = cursor.EffectiveTestStartedAt,
+                AfterId = cursor.Id
             };
             IReadOnlyList<TestHistoryRecord> page = await Task.Run(() => GetStore().SearchSummary(pageCriteria));
             if (generation != Volatile.Read(ref _reloadGeneration))

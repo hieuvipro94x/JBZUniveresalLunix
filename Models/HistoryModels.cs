@@ -81,8 +81,9 @@ public sealed class TestHistoryRecord
     public string ExportProgressText => Passed ? "1/1" : "0/1";
     public string ExportResultText => Passed ? "합격" : "불량";
     public long? ExportAcceptedLotNo => IsProductionRecord && Passed && LotNo > 0 ? LotNo : null;
-    public long? ExportSequenceNo => ExportAcceptedLotNo ??
-        (ProductionCounter > 0 ? ProductionCounter : null);
+    public long? ExportSequenceNo => IsProductionRecord && Passed
+        ? ExportAcceptedLotNo ?? (ProductionCounter > 0 ? ProductionCounter : null)
+        : null;
     public string ExportBarcodeInputText => string.Empty;
     public string ExportBarcodeText =>
         IsProductionRecord &&
@@ -251,8 +252,8 @@ public sealed record HistorySearchCriteria(
     string WireName = "",
     string CycleId = "",
     string AppVersion = "",
-    DateTime? BeforeResultAt = null,
-    long? BeforeId = null);
+    DateTime? AfterHistoryAt = null,
+    long? AfterId = null);
 
 public sealed record HistorySummary(
     long Total,

@@ -59,7 +59,7 @@ internal static class Program
             ("History SQLite/search/CSV/XLSX native types", TestHistory),
             ("History exactly-once transaction crash recovery", TestHistoryTransactionAtomicity),
             ("Legacy SQLite without SchemaInfo initializes safely", TestLegacyDatabaseWithoutSchemaInfo),
-            ("SQLite schema v6 non-destructive History migration and query plans", TestDatabaseSchemaV5),
+            ("SQLite schema v7 chronological History migration and query plans", TestDatabaseSchemaV5),
             ("History initialization waits for an active SQLite writer", TestHistoryInitializationWaitsForWriter),
             ("Production SQLite writer retries a transient lock", TestProductionPersistenceRetriesTransientLock),
             ("SQLite interrupted transaction reopens without deleting database", TestHistoryInterruptedTransactionRecovery),
@@ -3433,8 +3433,8 @@ internal static class Program
                     string.Empty,
                     "ALL",
                     MaxRows: 1,
-                    BeforeResultAt: firstPage[0].EffectiveTestStartedAt,
-                    BeforeId: firstPage[0].Id));
+                    AfterHistoryAt: firstPage[0].EffectiveTestStartedAt,
+                    AfterId: firstPage[0].Id));
             Assert(secondPage.Count == 1 && secondPage[0].Id != firstPage[0].Id,
                 "History keyset cursor returns the next stable page without OFFSET");
             Assert(firstPage.Count + secondPage.Count == allSummary.Total,
@@ -3467,10 +3467,10 @@ internal static class Program
             var migrated = new TestHistoryStore(dbPath);
             var rerun = new TestHistoryStore(dbPath);
             Assert(File.Exists(dbPath + $".pre-schema-v{TestHistoryStore.CurrentSchemaVersion}.backup"),
-                "Schema v4 is backed up before v6 migration");
+                "Schema v4 is backed up before v7 migration");
             Assert(migrated.SchemaVersion == TestHistoryStore.CurrentSchemaVersion &&
                    rerun.SchemaVersion == TestHistoryStore.CurrentSchemaVersion,
-                "Schema v6 migration is idempotent");
+                "Schema v7 migration is idempotent");
             Assert(migrated.SearchSummary(new HistorySearchCriteria(
                        null, null, null, "PART-M2M", "ALL", MaxRows: 10)).Count == 2,
                 "Migration adds TestStartedAt before creating History indexes and preserves legacy rows");
@@ -3500,7 +3500,7 @@ internal static class Program
                    reader.GetInt32(2) == 2 && reader.GetInt32(3) == 0 &&
                    reader.GetInt32(4) == 2 && reader.GetInt32(5) == 2 &&
                    reader.GetInt32(6) == 0 && reader.GetString(7) == "ok",
-                "v6 migration preserves Tests and child rows without orphans and integrity_check remains clean");
+                "v7 migration preserves Tests and child rows without orphans and integrity_check remains clean");
             reader.Close();
 
             string latestPlan = ExplainPlan(
@@ -5216,7 +5216,7 @@ internal static class Program
                historyPageXaml.Contains("x:Name=\"CloseButton\"", StringComparison.Ordinal) &&
                historyPageSource.Contains("GetHistorySummary(criteria)", StringComparison.Ordinal) &&
                historyPageSource.Contains("MaxRows = PageSize", StringComparison.Ordinal) &&
-               historyPageSource.Contains("BeforeResultAt = cursor.EffectiveTestStartedAt", StringComparison.Ordinal) &&
+               historyPageSource.Contains("AfterHistoryAt = cursor.EffectiveTestStartedAt", StringComparison.Ordinal) &&
                !historyPageSource.Contains("UiRowLimit", StringComparison.Ordinal),
             "History uses full SQL summary plus incremental keyset pages and exposes no legacy import action");
         System.Xml.Linq.XElement[] historyButtons =
@@ -6805,6 +6805,7 @@ internal static class Program
             {
                 Finished = finished,
                 Passed = false,
+                ProductionCounter = 2001,
                 Result = "FAIL",
                 FaultCode = "OPEN_CIRCUIT",
                 FaultType = "DÂY CHƯA KẾT NỐI",
@@ -6824,10 +6825,11 @@ internal static class Program
             string customerCsv = Path.Combine(root, "customer-fault.csv");
             HistoryExportService.ExportCsv(customerCsv, [failed]);
             string customerText = File.ReadAllText(customerCsv, Encoding.GetEncoding(949));
-            Assert(customerText.Contains(",불량,,", StringComparison.Ordinal) &&
+            Assert(failed.ExportSequenceNo is null &&
+                   customerText.Contains(",불량,,", StringComparison.Ordinal) &&
                    customerText.Contains("단선 CN1-4↔CN3-6", StringComparison.Ordinal) &&
                    !customerText.Contains("OPEN CIRCUIT", StringComparison.Ordinal),
-                "History CSV FAIL uses concise Korean fault detail and blank accepted LOT");
+                "History CSV/UI FAIL uses concise Korean fault detail and blank sequence");
 
             var masterBad = new TestHistoryRecord
             {
@@ -7023,12 +7025,12 @@ internal static class Program
             IReadOnlyList<TestHistoryRecord> allExportRows = exportStore.SearchForExport(monthlyCriteria);
             Assert(limitedRows.Count == 1 && allExportRows.Count == 3,
                 "History export is independent from the DataGrid row limit");
-            Assert(allExportRows[0].CycleId == "export-part-a" &&
+            Assert(allExportRows[0].CycleId == "export-part-z-a" &&
                    allExportRows[1].CycleId == "export-part-z-b" &&
-                   allExportRows[2].CycleId == "export-part-z-a",
-                "History export sorts newest-to-oldest by displayed test-start time and stable Id");
-            Assert(allExportRows[1].ExportModelFileName == "B.tht" &&
-                   allExportRows[2].ExportModelFileName == "A.tht",
+                   allExportRows[2].CycleId == "export-part-a",
+                "History export sorts oldest-to-newest by displayed test-start time and stable Id");
+            Assert(allExportRows[0].ExportModelFileName == "A.tht" &&
+                   allExportRows[1].ExportModelFileName == "B.tht",
                 "Changing A.tht to B.tht snapshots B.tht only for the new cycle");
 
             // Regression: row cũ bắt đầu trước nhưng test lâu hơn nên ResultAt muộn hơn.
@@ -7069,11 +7071,11 @@ internal static class Program
                     "ALL",
                     MaxRows: 10));
             Assert(orderedRows.Count == 2 &&
-                   orderedRows[0].CycleId == "newer-start-earlier-result" &&
-                   orderedRows[0].TimeText == "08:01:00" &&
-                   orderedRows[1].CycleId == "older-start-later-result" &&
-                   orderedRows[1].TimeText == "08:00:00",
-                "History grid is strictly newest-to-oldest by displayed TEST START time even when ResultAt order differs");
+                   orderedRows[0].CycleId == "older-start-later-result" &&
+                   orderedRows[0].TimeText == "08:00:00" &&
+                   orderedRows[1].CycleId == "newer-start-earlier-result" &&
+                   orderedRows[1].TimeText == "08:01:00",
+                "History grid is strictly oldest-to-newest by displayed TEST START time even when ResultAt order differs");
 
             IReadOnlyList<TestHistoryRecord> orderPage1 = orderingStore.SearchSummary(
                 new HistorySearchCriteria(
@@ -7091,13 +7093,13 @@ internal static class Program
                     "ORDER-TEST",
                     "ALL",
                     MaxRows: 1,
-                    BeforeResultAt: orderPage1[0].EffectiveTestStartedAt,
-                    BeforeId: orderPage1[0].Id));
+                    AfterHistoryAt: orderPage1[0].EffectiveTestStartedAt,
+                    AfterId: orderPage1[0].Id));
             Assert(orderPage1.Count == 1 &&
                    orderPage2.Count == 1 &&
-                   orderPage1[0].CycleId == "newer-start-earlier-result" &&
-                   orderPage2[0].CycleId == "older-start-later-result",
-                "History keyset pagination preserves newest-to-oldest TEST START order across pages");
+                   orderPage1[0].CycleId == "older-start-later-result" &&
+                   orderPage2[0].CycleId == "newer-start-earlier-result",
+                "History keyset pagination preserves oldest-to-newest TEST START order across pages");
         }
         finally
         {

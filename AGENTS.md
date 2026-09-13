@@ -153,7 +153,7 @@ For the current SQLite `Tests` table, the authoritative columns are:
 
 The `Tests` table does NOT use a `Started` column.
 
-For History UI date/time and newest-to-oldest ordering, use the test-start timestamp:
+For History UI date/time and oldest-to-newest ordering, use the test-start timestamp:
 
 - C#: `EffectiveTestStartedAt = TestStartedAt ?? Started`
 - SQLite `Tests`: `COALESCE(t.TestStartedAt, t.StartedAt)`
@@ -161,7 +161,7 @@ For History UI date/time and newest-to-oldest ordering, use the test-start times
 Correct ordering:
 
 ```sql
-ORDER BY COALESCE(t.TestStartedAt,t.StartedAt) DESC, t.Id DESC
+ORDER BY COALESCE(t.TestStartedAt,t.StartedAt), t.Id
 ```
 
 Legacy rows with `TestStartedAt IS NULL` must fall back to `StartedAt`; they must not disappear from History.
@@ -172,7 +172,7 @@ If an index is required, only create it after the migration path guarantees ever
 
 ```sql
 CREATE INDEX IF NOT EXISTS IX_Tests_HistoryAt_Id
-ON Tests(COALESCE(TestStartedAt, StartedAt) DESC, Id DESC);
+ON Tests(COALESCE(TestStartedAt, StartedAt), Id);
 ```
 
 Do not use the invalid expression:
@@ -199,7 +199,7 @@ for the `Tests` table.
 
 Any change affecting History/SQLite must preserve or add regression coverage for:
 
-- newest History test-start timestamp appears first;
+- oldest History test-start timestamp appears first;
 - a test that finishes later but started earlier does not jump above a newer-started test;
 - legacy rows with `TestStartedAt = NULL` fall back to `StartedAt`;
 - page 1 -> page 2 has no duplicate or missing rows;

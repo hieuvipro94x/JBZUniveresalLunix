@@ -407,7 +407,7 @@
 
                 <DataGrid.Columns>
                     <!-- Ngày/Thời gian = thời điểm BẮT ĐẦU TEST (EffectiveTestStartedAt).
-                         TestHistoryStore sắp xếp DESC theo đúng timestamp này. -->
+                         TestHistoryStore sắp xếp từ cũ đến mới theo timestamp này. -->
                     <DataGridTextColumn Header="Ngày" Binding="{Binding DateText}" Width="100"/>
                     <DataGridTextColumn Header="Thời gian" Binding="{Binding TimeText}" Width="90"/>
                     <DataGridTextColumn Header="File" Binding="{Binding ExportModelFileName}" Width="180"/>

@@ -13,7 +13,7 @@ namespace JBZUniversalTester.Services;
 /// </summary>
 public sealed class TestHistoryStore
 {
-    public const int CurrentSchemaVersion = 6;
+    public const int CurrentSchemaVersion = 7;
     private const int LegacyMigrationBatchSize = 500;
     private static readonly object SchemaGate = new();
     private readonly string _path;
@@ -74,8 +74,10 @@ public sealed class TestHistoryStore
         using SqliteTransaction transaction = connection.BeginTransaction();
         CreateSchema(connection, transaction);
         EnsureCurrentTestColumns(connection, transaction);
-        CreateIndexes(connection, transaction);
         int existingVersion = ReadSchemaVersion(connection, transaction);
+        if (existingVersion < CurrentSchemaVersion)
+            DropHistoryOrderingIndexes(connection, transaction);
+        CreateIndexes(connection, transaction);
         if (existingVersion < CurrentSchemaVersion &&
             TableExists(connection, transaction, "TestHistory"))
         {
@@ -475,9 +477,9 @@ public sealed class TestHistoryStore
             CREATE INDEX IF NOT EXISTS IX_Tests_ModelId_ResultAt_Id
                 ON Tests(ModelId, ResultAt DESC, Id DESC);
             CREATE INDEX IF NOT EXISTS IX_Tests_HistoryAt_Id
-                ON Tests(COALESCE(TestStartedAt, StartedAt) DESC, Id DESC);
+                ON Tests(COALESCE(TestStartedAt, StartedAt), Id);
             CREATE INDEX IF NOT EXISTS IX_Tests_Part_Inspection_HistoryAt_Id
-                ON Tests(PartId, InspectionType, COALESCE(TestStartedAt, StartedAt) DESC, Id DESC);
+                ON Tests(PartId, InspectionType, COALESCE(TestStartedAt, StartedAt), Id);
             CREATE INDEX IF NOT EXISTS IX_Tests_Lot ON Tests(Lot);
             CREATE INDEX IF NOT EXISTS IX_TestFaults_TestId_FaultOrder_Id
                 ON TestFaults(TestId, FaultOrder, Id);
@@ -485,6 +487,19 @@ public sealed class TestHistoryStore
                 ON ResistanceMeasurements(TestId);
             CREATE INDEX IF NOT EXISTS IX_WaterProofMeasurements_TestId
                 ON WaterProofMeasurements(TestId);
+            """;
+        command.ExecuteNonQuery();
+    }
+
+    private static void DropHistoryOrderingIndexes(
+        SqliteConnection connection,
+        SqliteTransaction transaction)
+    {
+        using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            DROP INDEX IF EXISTS IX_Tests_HistoryAt_Id;
+            DROP INDEX IF EXISTS IX_Tests_Part_Inspection_HistoryAt_Id;
             """;
         command.ExecuteNonQuery();
     }
@@ -2122,10 +2137,10 @@ public sealed class TestHistoryStore
         // nếu không test dài/ngắn khác nhau có thể làm giờ đang hiển thị bị đảo.
         const string historyAtSql = "COALESCE(t.TestStartedAt,t.StartedAt)";
         string order =
-            $"ORDER BY {historyAtSql} DESC,t.Id DESC" +
+            $"ORDER BY {historyAtSql},t.Id" +
             (!exportAll && applyLimit
                 ? $" LIMIT {limit}" +
-                  (criteria.BeforeResultAt is null ? $" OFFSET {offset}" : string.Empty)
+                  (criteria.AfterHistoryAt is null ? $" OFFSET {offset}" : string.Empty)
                 : string.Empty);
         string labelPayloadColumn = includeLabelPayload ? "t.LabelPayload" : "''";
         command.CommandText = $"""
@@ -2200,13 +2215,11 @@ public sealed class TestHistoryStore
         if (!string.IsNullOrWhiteSpace(criteria.WireName)) { clauses.Add("EXISTS(SELECT 1 FROM TestFaults f WHERE f.TestId=t.Id AND f.WireName LIKE $Wire)"); command.Parameters.AddWithValue("$Wire", $"%{criteria.WireName.Trim()}%"); }
         if (!string.IsNullOrWhiteSpace(criteria.CycleId)) { clauses.Add("t.CycleId=$Cycle"); command.Parameters.AddWithValue("$Cycle", criteria.CycleId.Trim()); }
         if (!string.IsNullOrWhiteSpace(criteria.AppVersion)) { clauses.Add("t.AppVersion LIKE $AppVersion"); command.Parameters.AddWithValue("$AppVersion", $"%{criteria.AppVersion.Trim()}%"); }
-        if (includeCursor && criteria.BeforeResultAt is DateTime cursor && criteria.BeforeId is long id)
+        if (includeCursor && criteria.AfterHistoryAt is DateTime cursor && criteria.AfterId is long id)
         {
-            // BeforeResultAt giữ tên cũ để không phá API, nhưng giá trị là
-            // EffectiveTestStartedAt để cursor khớp chính xác ORDER BY phía trên.
-            clauses.Add($"({historyAtSql} < $BeforeResultAt OR ({historyAtSql}=$BeforeResultAt AND t.Id < $BeforeId))");
-            command.Parameters.AddWithValue("$BeforeResultAt", cursor.ToString("O", CultureInfo.InvariantCulture));
-            command.Parameters.AddWithValue("$BeforeId", id);
+            clauses.Add($"({historyAtSql} > $AfterHistoryAt OR ({historyAtSql}=$AfterHistoryAt AND t.Id > $AfterId))");
+            command.Parameters.AddWithValue("$AfterHistoryAt", cursor.ToString("O", CultureInfo.InvariantCulture));
+            command.Parameters.AddWithValue("$AfterId", id);
         }
         return clauses;
     }
