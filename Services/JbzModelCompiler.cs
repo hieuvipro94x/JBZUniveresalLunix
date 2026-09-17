@@ -1,4 +1,4 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.IO;
 using System.Text;
 using JBZUniveresalLunix.Models;
@@ -20,15 +20,11 @@ public static class JbzModelCompiler
         Dictionary<string, string> connectorSection = Require(ini, "Connector");
         Dictionary<string, string> pinSection = Require(ini, "Pin");
         Dictionary<string, string> commonSection = Require(ini, "Common");
-        // Universal Tester New identifies the downloaded profile by the .model
-        // file name, not by [Common]/Model. This is proven by the JBZ_Windows
-        // reference compiler and by board traces such as 321085.model ->
-        // TX :MODEL,321085 even when [Common]/Model contains a vehicle code
-        // such as DL3. Keep one canonical identity so MODELNAME, history and
-        // TestEngine all refer to the same loaded harness profile.
-        string modelName = Path.GetFileNameWithoutExtension(fullPath).Trim();
-        if (modelName.Length == 0)
-            throw Error("Cannot determine firmware model name from .model file name");
+        string fileModelName = Path.GetFileNameWithoutExtension(fullPath);
+        string modelName = commonSection.TryGetValue("Model", out string? declaredModel) &&
+                           !string.IsNullOrWhiteSpace(declaredModel)
+            ? declaredModel.Trim()
+            : fileModelName;
         int connectorCount = Integer(Get(connectorSection, "Count"), "Connector/Count");
         var connectorNames = new List<string>();
         var connectorPinCounts = new List<int>();
@@ -61,9 +57,22 @@ public static class JbzModelCompiler
         }
 
         NormalizeAo(pins);
+        // Legacy Htdrv models also use numeric values in field 8 (for example
+        // 322137 has Special=2 on P321/P323/P325). The original application
+        // accepts these rows. They are model/setup metadata and must not make
+        // the UART compiler reject an otherwise valid production model.
+        // AO/A remains the only special type with a proven firmware flag.
         foreach (Pin pin in pins)
-            if (pin.Parent == "-1" && pin.Special.Length > 0 && !pin.Special.Equals("A", StringComparison.OrdinalIgnoreCase) && !pin.Special.Equals("AO", StringComparison.OrdinalIgnoreCase))
+        {
+            if (pin.Parent != "-1" || pin.Special.Length == 0)
+                continue;
+
+            bool knownAo = pin.Special.Equals("A", StringComparison.OrdinalIgnoreCase) ||
+                           pin.Special.Equals("AO", StringComparison.OrdinalIgnoreCase);
+            bool legacyNumeric = int.TryParse(pin.Special, NumberStyles.Integer, CultureInfo.InvariantCulture, out _);
+            if (!knownAo && !legacyNumeric)
                 throw Error($"Unproven special pin type at P{pin.Row}: {pin.Special}");
+        }
         foreach (Pin pin in pins)
         {
             if (pin.Targets.Any(target => !physical.Contains(target))) throw Error($"P{pin.Row} references a missing target");
@@ -84,14 +93,14 @@ public static class JbzModelCompiler
             offset += p.Targets.Length;
         }
         AddPackets(text, "ARRAY", targets);
-        // Rev 1.42 carries at most 202 CON payload values. The proven
-        // WH322110 trace uses 200 pin mappings + 5000 + 65535; WH321798 has
-        // 201 pin mappings + 5000 and omits 65535. Do not overrun this firmware
-        // table when a model contains 201 physical pins.
+        // Match the legacy JBZ model-loader behavior: CON contains one
+        // connector-index entry for EVERY physical pin, followed by the two
+        // legacy sentinels 5000 and 65535. AddPackets splits the complete map
+        // into 64-value packets, so large models (322137: 349 pins) are not
+        // silently truncated.
         int[] connectorMap = pins
             .Select(p => connectorNames.FindIndex(n => n.Equals(p.Connector, StringComparison.OrdinalIgnoreCase)))
             .Concat([5000, 65535])
-            .Take(202)
             .ToArray();
         AddPackets(text, "CON", connectorMap);
         AddPackets(text, "CONNECTOR", connectorPinCounts.ToArray());
@@ -103,10 +112,15 @@ public static class JbzModelCompiler
 
     private static int FirmwareFlags(Pin pin)
     {
-        // Proven by the captured UniversalTester Rev 1.42 upload of WH321798:
-        // Pin/P196 has Special=A and is sent as ...0,16. Keep every other
-        // unproven special encoding at zero rather than guessing firmware bits.
-        return pin.Special.Equals("A", StringComparison.OrdinalIgnoreCase) ? 16 : 0;
+        // Proven by captured legacy uploads: Special=A uses firmware flag 16.
+        // Numeric legacy types (for example Special=2 in 322137) are accepted
+        // by the original model format, but no captured upload proves that the
+        // numeric value itself is a UART bit-mask. Preserve legacy acceptance
+        // without inventing firmware bits: they use the normal continuity flag 0.
+        return pin.Special.Equals("A", StringComparison.OrdinalIgnoreCase) ||
+               pin.Special.Equals("AO", StringComparison.OrdinalIgnoreCase)
+            ? 16
+            : 0;
     }
 
     private static ProductModel BuildProduct(string path, string modelName,
