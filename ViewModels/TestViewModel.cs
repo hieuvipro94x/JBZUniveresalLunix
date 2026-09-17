@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
@@ -501,7 +501,13 @@ public sealed class TestViewModel : ObservableObject
         // trước khi collection được xóa. Engine/hardware state không bị reset ở đây.
         AdvanceProductionUiCycleEpoch();
         Interlocked.Increment(ref _continuityPreviewUiRevision);
-        Interlocked.Exchange(ref _suppressProductionWireTableUntilNextJbzFrame, 1);
+
+        // Khi ĐÓNG TestView: giữ bảng bị khóa/clear để MainWindow không bị callback cũ dựng lại.
+        // Khi MỞ TestView: không khóa bảng. StartTestAsync sẽ Reset engine rồi dựng ngay
+        // baseline OPEN/CHƯA KẾT NỐI của model hiện tại, không cần chờ chập/sai dây
+        // hoặc chờ một frame UART mới mới thấy bảng.
+        int suppressWireTable = armFreshFrameGate && !removalPending ? 0 : 1;
+        Interlocked.Exchange(ref _suppressProductionWireTableUntilNextJbzFrame, suppressWireTable);
         Interlocked.Exchange(ref _forceProductionWireTableReloadPending, 0);
         Interlocked.Exchange(ref _stalePreCycleFrameLogged, 0);
         _lastLiveTopologySnapshot = LiveTopologySnapshot.Empty();
@@ -6160,7 +6166,14 @@ public sealed class TestViewModel : ObservableObject
 
         Resistance.Clear();
         ResistanceDisplayRows.Clear();
+
+        // Sau _engine.Reset(), BuildRows() chính là baseline sạch của model:
+        // tất cả dây cần kiểm tra xuất hiện ngay khi vào TestWindow.
+        // Không phụ thuộc frame OTHER/SHORT/CIRCUIT mới để mở khóa bảng.
         RefreshFaults();
+        AsyncFileLogService.Current.Performance(
+            $"TEST_VIEW_BASELINE_READY rows={Faults.Count} model={ModelName} " +
+            $"removal_pending={IsProductRemovalPending} presentation={CurrentProductionPresentationMode}");
 
         RaiseTestStatistics();
         SelectedOperationTabIndex = 0;

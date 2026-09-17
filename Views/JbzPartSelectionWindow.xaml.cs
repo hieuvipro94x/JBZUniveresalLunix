@@ -139,9 +139,16 @@ public partial class JbzPartSelectionWindow : Window
         Cursor = Cursors.Wait;
         Title = $"ĐANG NẠP {files.PartNumber}...";
 
+        ProgressPanel.Visibility = Visibility.Visible;
+        UploadProgress.Value = 0;
+        PercentText.Text = "0%";
+
         var progress = new Progress<JbzModelUploadProgress>(value =>
         {
-            Title = $"ĐANG NẠP {files.PartNumber} - {value.Percent}%";
+            int percent = Math.Clamp(value.Percent, 0, 100);
+            UploadProgress.Value = percent;
+            PercentText.Text = $"{percent}%";
+            Title = $"ĐANG NẠP {files.PartNumber} - {percent}%";
         });
 
         bool loaded = false;
@@ -193,6 +200,8 @@ public partial class JbzPartSelectionWindow : Window
 
         if (loaded)
         {
+            UploadProgress.Value = 100;
+            PercentText.Text = "100%";
             DialogResult = true;
             return;
         }
@@ -233,6 +242,9 @@ public partial class JbzPartSelectionWindow : Window
     {
         Title = DefaultTitle;
         Cursor = Cursors.Arrow;
+        ProgressPanel.Visibility = Visibility.Collapsed;
+        UploadProgress.Value = 0;
+        PercentText.Text = "0%";
         PartBox.IsEnabled = true;
         PartBox.Focus();
         PartBox.SelectAll();
