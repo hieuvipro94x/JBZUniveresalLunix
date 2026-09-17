@@ -1,7 +1,7 @@
 using System.Globalization;
-using JBZUniversalTester.Core;
+using JBZUniveresalLunix.Core;
 
-namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 /// <summary>
 /// Cấu hình phần cứng máy leak. Đây là cổng UART/RS232 riêng, hoàn toàn độc lập

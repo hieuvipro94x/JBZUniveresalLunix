@@ -3,11 +3,11 @@ using System.Collections.ObjectModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
-using JBZUniversalTester.Models;
-using JBZUniversalTester.Services;
+using JBZUniveresalLunix.Models;
+using JBZUniveresalLunix.Services;
 using Microsoft.Win32;
 
-namespace JBZUniversalTester.Views;
+namespace JBZUniveresalLunix.Views;
 
 /// <summary>
 /// V12.9: lịch sử là một page trong MainWindow, không phải Window/ShowDialog.

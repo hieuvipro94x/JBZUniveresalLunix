@@ -1,4 +1,4 @@
-<Window x:Class="JBZUniversalTester.Views.ProbeMaintenanceResetWindow"
+<Window x:Class="JBZUniveresalLunix.Views.ProbeMaintenanceResetWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Xác nhận thay Probe Pin"

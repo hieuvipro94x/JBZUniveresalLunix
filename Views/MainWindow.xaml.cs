@@ -4,12 +4,12 @@ using System.Diagnostics;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
-using JBZUniversalTester.ViewModels;
-using JBZUniversalTester.Models;
-using JBZUniversalTester.Services;
-using JBZUniversalTester.Versioning;
+using JBZUniveresalLunix.ViewModels;
+using JBZUniveresalLunix.Models;
+using JBZUniveresalLunix.Services;
+using JBZUniveresalLunix.Versioning;
 
-namespace JBZUniversalTester.Views;
+namespace JBZUniveresalLunix.Views;
 
 public partial class MainWindow : Window
 {
@@ -18,6 +18,7 @@ public partial class MainWindow : Window
     private TestWindow? _testWindow;
     private ProductionSettingsPage? _settingsPage;
     private HistoryPage? _historyPage;
+    private BoardMaintenanceWindow? _maintenanceWindow;
     private bool _shutdownStarted;
     private bool _shutdownComplete;
     private bool _startupStarted;
@@ -57,7 +58,8 @@ public partial class MainWindow : Window
     {
         // File dialog vừa đóng và model đã được parse/SetModel hoàn chỉnh.
         // Tự vào TestView ngay, không yêu cầu click BẮT ĐẦU lần thứ hai.
-        Dispatcher.BeginInvoke(new Action(() => OpenTestWindowCore(allowViewWhenInsufficient: true)));
+        Dispatcher.BeginInvoke(new Action(() => OpenTestWindowCore(allowViewWhenInsufficient: true)),
+            System.Windows.Threading.DispatcherPriority.Background);
     }
 
 
@@ -88,15 +90,12 @@ public partial class MainWindow : Window
 
             if (completed != initialization)
             {
-                // Driver/D2XX giữ lời gọi mở quá lâu được xem là lỗi phần cứng
-                // của phiên. Task muộn chỉ được quan sát để cleanup, không được
-                // mở khóa test hoặc hồi sinh kết nối.
-                _viewModel.Test.ReportStartupBoardTimeout();
+                // UART discovery có thể cần thời gian để thử các COM khả dụng.
+                // Giữ thao tác sản xuất khóa cho đến khi handshake hoàn tất.
                 _viewModel.Status =
-                    "MẤT KẾT NỐI BO - THOÁT VÀ MỞ LẠI ỨNG DỤNG";
-                AsyncFileLogService.Current.Error(
-                    $"STARTUP HARDWARE TIMEOUT after {StartupControlUnlockTimeout.TotalSeconds:0}s; " +
-                    "session latched until application restart.");
+                    "ĐANG DÒ BO UART - CHỜ TÊN FIRMWARE...";
+                AsyncFileLogService.Current.Performance(
+                    $"STARTUP UART discovery still running after {StartupControlUnlockTimeout.TotalSeconds:0}s.");
                 _ = ObserveDeferredStartupAsync(initialization);
                 return;
             }
@@ -272,6 +271,7 @@ public partial class MainWindow : Window
     {
         if (e.PropertyName is nameof(TestViewModel.IsProductRemovalPending) or
             nameof(TestViewModel.IsBoardConnected) or
+            nameof(TestViewModel.IsBoardIdentityVerified) or
             nameof(TestViewModel.IsDeviceFault))
         {
             if (_viewModel.Test.IsDeviceFault)
@@ -286,13 +286,31 @@ public partial class MainWindow : Window
     private void UpdateProductRemovalGate()
     {
         bool blocked = _viewModel.Test.IsProductRemovalPending;
-        bool hardwareReady =
-            _viewModel.Test.IsBoardConnected &&
-            !_viewModel.Test.IsDeviceFault;
+        bool hardwareReady = _viewModel.Test.IsBoardIdentityVerified;
         ProductRemovalNotice.Visibility = blocked ? Visibility.Visible : Visibility.Collapsed;
         StartTestButton.IsEnabled = hardwareReady && _viewModel.Model is not null;
         SelectModelButton.IsEnabled = hardwareReady && !blocked;
         LearnTopologyButton.IsEnabled = hardwareReady;
+        BoardMaintenanceButton.IsEnabled = hardwareReady && !blocked && _testWindow is null;
+    }
+
+    private void OpenBoardMaintenance_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_viewModel.Test.IsBoardConnected || _viewModel.Test.IsDeviceFault ||
+            _viewModel.Test.IsProductRemovalPending || _testWindow is not null)
+        {
+            MessageBox.Show(this,
+                "Chỉ được bảo trì khi bo đã kết nối, không có sản phẩm và cửa sổ kiểm tra đã đóng.",
+                "KHÔNG THỂ BẢO TRÌ", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        _maintenanceWindow = new BoardMaintenanceWindow(_viewModel.BoardTransport) { Owner = this };
+        _maintenanceWindow.Closed += (_, _) =>
+        {
+            _maintenanceWindow = null;
+            UpdateProductRemovalGate();
+        };
+        _maintenanceWindow.ShowDialog();
     }
 
     private async void OpenSettings_Click(

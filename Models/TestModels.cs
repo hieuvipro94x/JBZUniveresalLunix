@@ -1,11 +1,11 @@
-﻿using JBZUniversalTester.Core;
-using JBZUniversalTester.Converters;
+using JBZUniveresalLunix.Core;
+using JBZUniveresalLunix.Converters;
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Globalization;
 using System.Windows.Media;
-namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 public enum FaultKind { Start, Open, MissingConnection, WrongWiring, Short, Resistance, Info, Probe }
 
@@ -67,6 +67,19 @@ public sealed class FaultRow : ObservableObject
             ? Io.ToString(CultureInfo.InvariantCulture)
             : string.Empty;
     public string IoCnPnText => _ioCnPnText ??= BuildIoCnPnText();
+    public string ConnectionPairText
+    {
+        get
+        {
+            int? source = ActualSourceIo ?? ExpectedSourceIo;
+            int? target = ActualTargetIo ?? ExpectedTargetIo;
+            if (source is > 0 && target is > 0)
+                return $"IO{source} ↔ IO{target}";
+            if (RelatedIos.Length >= 2)
+                return $"IO{RelatedIos[0]} ↔ IO{RelatedIos[1]}";
+            return string.Empty;
+        }
+    }
     public string WireColorText => WireColorToBrushConverter.ToDisplayCode(Color);
     public Brush WireColorBrush => WireColorToBrushConverter.ToBrush(Color);
     public bool IsNetworkPassed =>
@@ -284,13 +297,24 @@ public sealed record ScanFrame(
     byte? EndMarkerCode = null,
     int ScanUnitCount = 0,
     bool TerminatorKnown = true,
-    long ScanGeneration = 0)
+    long ScanGeneration = 0,
+    IReadOnlyDictionary<(int SourceIo, int TargetIo), ProductFaultType>? ExplicitFaults = null,
+    int? CircuitResult = null)
 {
     public IReadOnlyDictionary<int, IReadOnlySet<int>> Connections =>
         ConnectionsBySource ?? new Dictionary<int, IReadOnlySet<int>>();
 
     public IReadOnlyDictionary<int, int> TargetHits =>
         TargetHitCounts ?? new Dictionary<int, int>();
+
+    /// <summary>
+    /// Fault type reported explicitly by Universal Tester New firmware.
+    /// OTHER is WrongWiring and SHORT is ShortCircuit. Keeping this metadata
+    /// prevents the WPF layer from re-guessing firmware semantics from topology.
+    /// Keys are normalized as (minIo,maxIo).
+    /// </summary>
+    public IReadOnlyDictionary<(int SourceIo, int TargetIo), ProductFaultType> FaultHints =>
+        ExplicitFaults ?? new Dictionary<(int SourceIo, int TargetIo), ProductFaultType>();
 }
 
 /// <summary>

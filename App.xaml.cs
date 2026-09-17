@@ -1,12 +1,12 @@
 using System;
 using System.Windows;
 using System.Windows.Threading;
-using JBZUniversalTester.Services;
-using JBZUniversalTester.Versioning;
-using JBZUniversalTester.ViewModels;
-using JBZUniversalTester.Views;
+using JBZUniveresalLunix.Services;
+using JBZUniveresalLunix.Versioning;
+using JBZUniveresalLunix.ViewModels;
+using JBZUniveresalLunix.Views;
 
-namespace JBZUniversalTester;
+namespace JBZUniveresalLunix;
 
 public partial class App : Application
 {
@@ -17,7 +17,7 @@ public partial class App : Application
     {
         _singleInstanceMutex = new Mutex(
             initiallyOwned: true,
-            name: @"Local\JBZUniversalTester.Production",
+            name: @"Local\JBZUniveresalLunix.Production",
             createdNew: out _ownsSingleInstanceMutex);
         if (!_ownsSingleInstanceMutex)
         {

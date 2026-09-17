@@ -1,9 +1,9 @@
 using System.IO;
 using System.Reflection;
 using System.Text;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 /// <summary>
 /// Loads the three verified built-in label templates from the application
@@ -45,7 +45,7 @@ public static class BuiltInLabelTemplateStore
         if (!TryReferenceForProfile(profile, out _))
             throw new InvalidDataException($"Unknown built-in label profile: {profile}");
 
-        string resourceName = $"JBZUniversalTester.Labels.{profile.ToUpperInvariant()}.txt";
+        string resourceName = $"JBZUniveresalLunix.Labels.{profile.ToUpperInvariant()}.txt";
         Assembly assembly = typeof(BuiltInLabelTemplateStore).Assembly;
         using Stream stream = assembly.GetManifestResourceStream(resourceName)
             ?? throw new FileNotFoundException(
@@ -76,7 +76,7 @@ public static class BuiltInLabelTemplateStore
         }
         catch (FormatException ex)
         {
-            throw new InvalidDataException("Label template override in JBZUniversalTester.cfg is not valid Base64.", ex);
+            throw new InvalidDataException("Label template override in JBZUniveresalLunix.cfg is not valid Base64.", ex);
         }
     }
 

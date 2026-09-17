@@ -1,11 +1,11 @@
-﻿using JBZUniversalTester.Models;
-using JBZUniversalTester.Versioning;
+using JBZUniveresalLunix.Models;
+using JBZUniveresalLunix.Versioning;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public static class ProgramIdentityService
 {
-    public const string ProgramName = "JBZUniversalTester";
+    public const string ProgramName = "JBZUniveresalLunix";
 
     public static string VersionText => AppVersion.ProductVersion;
 

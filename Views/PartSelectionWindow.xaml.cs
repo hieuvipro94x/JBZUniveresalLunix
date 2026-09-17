@@ -1,8 +1,8 @@
 using System.Windows;
 using System.Windows.Input;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Views;
+namespace JBZUniveresalLunix.Views;
 
 public partial class PartSelectionWindow : Window
 {

@@ -1,4 +1,4 @@
-namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 public sealed record PinRecord(
     string Connector,

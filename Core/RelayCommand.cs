@@ -1,7 +1,7 @@
 using System;
 using System.Windows.Input;
 
-namespace JBZUniversalTester.Core;
+namespace JBZUniveresalLunix.Core;
 
 public sealed class RelayCommand : ICommand
 {

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
@@ -8,7 +8,7 @@ using System.Windows;
 using System.Windows.Data;
 using System.Windows.Media;
 
-namespace JBZUniversalTester.Converters
+namespace JBZUniveresalLunix.Converters
 {
     /// <summary>
     /// Chuyển mã màu dây trong file THT thành Brush hiển thị trên DataGrid.

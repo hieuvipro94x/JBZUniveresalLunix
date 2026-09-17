@@ -1,6 +1,6 @@
 using System.Diagnostics;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public static class StartupPerformanceTrace
 {

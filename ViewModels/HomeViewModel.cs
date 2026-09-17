@@ -1,170 +1,45 @@
-using System.IO;
-using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Interop;
-using JBZUniversalTester.Core;
-using JBZUniversalTester.Services;
-using JBZUniversalTester.Views;
-using WinForms = System.Windows.Forms;
+using JBZUniveresalLunix.Core;
+using JBZUniveresalLunix.Views;
 
-namespace JBZUniversalTester.ViewModels;
+namespace JBZUniveresalLunix.ViewModels;
 
 public sealed class HomeViewModel : ObservableObject
 {
-    private const string ProductFileFilter =
-        "The Files (*.tht)|*.tht|All Files (*.*)|*.*";
-    private const string OriginalItemDirectory = @"C:\Item";
     private readonly MainViewModel _main;
-
-    // Cho HomeView mở màn hình kiểm tra chân pin và cài đặt.
     public MainViewModel Main => _main;
-
     public AsyncRelayCommand LoadModelCommand { get; }
     public RelayCommand StartCommand { get; }
 
-    public string ModelName =>
-        _main.Model?.ModelName ?? "CHƯA CÓ MODEL";
-
-    public string PartNumber =>
-        _main.Model?.PartNumber ?? "—";
-
-    public string ProductName =>
-        _main.Model?.ProductName ?? "—";
-
-    public string VehicleType =>
-        _main.Model?.VehicleType ?? "—";
-
-    public string SourcePath =>
-        _main.Model?.SourcePath ?? string.Empty;
+    public string ModelName => _main.Model?.ModelName ?? "CHƯA CÓ MODEL";
+    public string PartNumber => _main.Model?.PartNumber ?? "—";
+    public string ProductName => _main.Model?.ProductName ?? "—";
+    public string VehicleType => _main.Model?.VehicleType ?? "—";
+    public string SourcePath => _main.Model?.SourcePath ?? string.Empty;
 
     public HomeViewModel(MainViewModel main)
     {
         _main = main;
-
         LoadModelCommand = new AsyncRelayCommand(LoadModelAsync);
-
         StartCommand = new RelayCommand(
             () => _main.CurrentPage = _main.Test,
-            () => _main.Model is not null && _main.HasEnoughCardsForModel
-        );
+            () => _main.Model is not null && _main.HasEnoughCardsForModel);
     }
 
-    private async Task LoadModelAsync()
+    private Task LoadModelAsync()
     {
-        using var dialog = new WinForms.OpenFileDialog
-        {
-            DefaultExt = ".tht",
-            Filter = ProductFileFilter,
-            Multiselect = false,
-            AutoUpgradeEnabled = false,
-            RestoreDirectory = true
-        };
-
-        if (Directory.Exists(OriginalItemDirectory))
-        {
-            dialog.InitialDirectory = OriginalItemDirectory;
-        }
-        else
-        {
-            string? currentModelDirectory = Path.GetDirectoryName(_main.Model?.SourcePath);
-            dialog.InitialDirectory = !string.IsNullOrWhiteSpace(currentModelDirectory) &&
-                                      Directory.Exists(currentModelDirectory)
-                ? currentModelDirectory
-                : AppContext.BaseDirectory;
-        }
-
-        Window? owner = Application.Current?.Windows
-            .OfType<Window>()
-            .FirstOrDefault(window => window.IsActive)
-            ?? Application.Current?.MainWindow;
-        WinForms.DialogResult accepted;
-        if (owner is not null)
-        {
-            using var positionGuard = new FixedPositionOpenFileDialogGuard(owner);
-            accepted = dialog.ShowDialog(new NativeDialogOwner(owner));
-        }
-        else
-        {
-            accepted = dialog.ShowDialog();
-        }
-
-        if (accepted != WinForms.DialogResult.OK)
-            return;
-
-        string selectedFilePath = dialog.FileName;
-        if (!IsSupportedProductFile(selectedFilePath))
-        {
-            MessageBox.Show(
-                owner ?? Application.Current?.MainWindow,
-                "Chỉ có thể chọn file mã hàng .tht.",
-                "File không được hỗ trợ",
-                MessageBoxButton.OK,
-                MessageBoxImage.Warning);
-            return;
-        }
-
-        try
-        {
-            await _main.LoadModelAsync(selectedFilePath);
-        }
-        catch (InvalidDataException ex)
-        {
-            AsyncFileLogService.Current.Error(
-                $"MODEL_LOAD_INVALID path={selectedFilePath}: {ex}");
-            MessageBox.Show(
-                $"Không đọc được mã hàng {Path.GetFileName(selectedFilePath)}. " +
-                "Vui lòng kiểm tra đúng file mã hàng và thử lại.",
-                "KHÔNG ĐỌC ĐƯỢC MÃ HÀNG",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
-        }
-        catch (IOException ex)
-        {
-            AsyncFileLogService.Current.Error(
-                $"MODEL_LOAD_IO path={selectedFilePath}: {ex}");
-            MessageBox.Show(
-                $"Chưa mở được mã hàng {Path.GetFileName(selectedFilePath)}. " +
-                "Vui lòng chờ file sao chép xong rồi thử lại.",
-                "CHƯA MỞ ĐƯỢC MÃ HÀNG",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
-        }
-        catch (Exception ex)
-        {
-            AsyncFileLogService.Current.Error(
-                $"MODEL_LOAD_UNEXPECTED path={selectedFilePath}: {ex}");
-            MessageBox.Show(
-                "Chưa nạp được mã hàng. Vui lòng chọn lại file và thử lại.",
-                "CHƯA NẠP ĐƯỢC MÃ HÀNG",
-                MessageBoxButton.OK,
-                MessageBoxImage.Error);
-        }
-    }
-
-    private sealed class NativeDialogOwner : WinForms.IWin32Window
-    {
-        public NativeDialogOwner(Window owner)
-        {
-            Handle = new WindowInteropHelper(owner).Handle;
-        }
-
-        public IntPtr Handle { get; }
-    }
-
-    private static bool IsSupportedProductFile(string path)
-    {
-        string extension = Path.GetExtension(path);
-        return extension.Equals(".tht", StringComparison.OrdinalIgnoreCase);
+        Window? owner = Application.Current?.Windows.OfType<Window>()
+            .FirstOrDefault(window => window.IsActive) ?? Application.Current?.MainWindow;
+        var dialog = new JbzPartSelectionWindow(_main);
+        if (owner is not null) dialog.Owner = owner;
+        dialog.ShowDialog();
+        return Task.CompletedTask;
     }
 
     public void Refresh()
     {
-        Raise(nameof(ModelName));
-        Raise(nameof(PartNumber));
-        Raise(nameof(ProductName));
-        Raise(nameof(VehicleType));
-        Raise(nameof(SourcePath));
-
+        Raise(nameof(ModelName)); Raise(nameof(PartNumber));
+        Raise(nameof(ProductName)); Raise(nameof(VehicleType)); Raise(nameof(SourcePath));
         StartCommand.RaiseCanExecuteChanged();
     }
 }

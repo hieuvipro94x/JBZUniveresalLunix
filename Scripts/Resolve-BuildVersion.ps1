@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Preview
 )
 
@@ -9,7 +9,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $versionPath = Join-Path $root "Version.props"
 
 if (-not (Test-Path -LiteralPath $versionPath)) {
-    throw "Version.props was not found: $versionPath"
+    throw "Không tìm thấy Version.props: $versionPath"
 }
 
 function Get-VersionGroup {
@@ -17,10 +17,26 @@ function Get-VersionGroup {
 
     $group = @($Document.Project.PropertyGroup)[0]
     if ($null -eq $group) {
-        throw "Version.props does not contain a PropertyGroup."
+        throw "Version.props không có PropertyGroup."
     }
 
     return $group
+}
+
+function Get-AssemblyTitleBase {
+    param(
+        $Group,
+        [string]$Release
+    )
+
+    $title = [string]$Group.AssemblyTitle
+    $suffix = " V" + $Release
+
+    if ([string]::IsNullOrWhiteSpace($title) -or -not $title.EndsWith($suffix, [StringComparison]::Ordinal)) {
+        throw "AssemblyTitle trong Version.props không đồng bộ với V$Release."
+    }
+
+    return $title.Substring(0, $title.Length - $suffix.Length)
 }
 
 function Assert-SynchronizedVersion {
@@ -28,21 +44,20 @@ function Assert-SynchronizedVersion {
 
     $release = [string]$Group.Version
     if ([string]::IsNullOrWhiteSpace($release)) {
-        throw "Version.props: Version is empty."
+        throw "Version.props: Version đang trống."
     }
 
     $parsed = [Version]::Parse($release)
     $expectedAssembly = $release + ".0"
     $expectedTag = $release.Replace('.', '_')
-    $expectedTitle = "JBZUniversalTester V" + $release
+    [void](Get-AssemblyTitleBase -Group $Group -Release $release)
 
     if ([string]$Group.VersionPrefix -ne $release -or
         [string]$Group.AssemblyVersion -ne $expectedAssembly -or
         [string]$Group.FileVersion -ne $expectedAssembly -or
         [string]$Group.InformationalVersion -ne $release -or
-        [string]$Group.VersionFileTag -ne $expectedTag -or
-        [string]$Group.AssemblyTitle -ne $expectedTitle) {
-        throw "Version.props fields are not synchronized for V$release."
+        [string]$Group.VersionFileTag -ne $expectedTag) {
+        throw "Các trường Version.props chưa đồng bộ cho V$release."
     }
 
     return $parsed
@@ -51,10 +66,11 @@ function Assert-SynchronizedVersion {
 [xml]$workingXml = Get-Content -LiteralPath $versionPath -Raw
 $workingGroup = Get-VersionGroup -Document $workingXml
 [Version]$workingVersion = Assert-SynchronizedVersion -Group $workingGroup
+$workingTitleBase = Get-AssemblyTitleBase -Group $workingGroup -Release $workingVersion.ToString()
 
 $headText = @(& git -C $root show "HEAD:Version.props" 2>$null)
 if ($LASTEXITCODE -ne 0 -or $headText.Count -eq 0) {
-    throw "Cannot read Version.props from Git HEAD."
+    throw "Không đọc được Version.props từ Git HEAD."
 }
 
 [xml]$headXml = $headText -join [Environment]::NewLine
@@ -62,12 +78,12 @@ $headGroup = Get-VersionGroup -Document $headXml
 [Version]$headVersion = Assert-SynchronizedVersion -Group $headGroup
 
 if ($workingVersion -lt $headVersion) {
-    throw "Working version V$workingVersion is older than Git HEAD V$headVersion."
+    throw "Version hiện tại V$workingVersion cũ hơn Git HEAD V$headVersion."
 }
 
 $statusLines = @(& git -C $root status --porcelain=v1 --untracked-files=all)
 if ($LASTEXITCODE -ne 0) {
-    throw "Cannot read Git working-tree status."
+    throw "Không đọc được trạng thái Git working tree."
 }
 
 $sourceChanges = @($statusLines | Where-Object {
@@ -100,7 +116,7 @@ if ($workingVersion -eq $headVersion -and $sourceChanges.Count -gt 0) {
     $workingGroup.FileVersion = $release + ".0"
     $workingGroup.InformationalVersion = $release
     $workingGroup.VersionFileTag = $tag
-    $workingGroup.AssemblyTitle = "JBZUniversalTester V" + $release
+    $workingGroup.AssemblyTitle = $workingTitleBase + " V" + $release
 
     if ($Preview) {
         $action = "AUTO_INCREMENT_REQUIRED"

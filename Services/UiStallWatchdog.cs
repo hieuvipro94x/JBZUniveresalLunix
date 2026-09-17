@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Windows.Threading;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public sealed class UiStallWatchdog : IDisposable
 {

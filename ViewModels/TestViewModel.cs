@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
@@ -7,11 +7,11 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
-using JBZUniversalTester.Core;
-using JBZUniversalTester.Models;
-using JBZUniversalTester.Services;
+using JBZUniveresalLunix.Core;
+using JBZUniveresalLunix.Models;
+using JBZUniveresalLunix.Services;
 
-namespace JBZUniversalTester.ViewModels;
+namespace JBZUniveresalLunix.ViewModels;
 
 public enum ProductionRuntimeState
 {
@@ -102,7 +102,7 @@ public sealed class TestViewModel : ObservableObject
     private readonly LabelPrintService _labelPrintService = new();
     private readonly AppSoundService _sound = AppSoundService.Current;
     private readonly DiscardContactInterlock _discardInterlock = new();
-    private readonly ThtModelParser _modelParser = new();
+    private readonly JbzModelParser _modelParser = new();
     private readonly object _initializationGate = new();
     private readonly object _cycleTokenGate = new();
     private readonly object _labelStateGate = new();
@@ -146,6 +146,15 @@ public sealed class TestViewModel : ObservableObject
     private int _removalMonitoringFromMain;
     private bool _waitForFaultProductRemoval;
     private int _faultProductRemoved;
+    // Raw JBZ UART removal evidence. Universal Tester New may emit CLEAR + a full
+    // list of :OPEN rows without ever emitting a final :CIRCUIT/C0 frame when the
+    // jig is completely empty. Therefore ProductRemoved cannot depend only on
+    // TestEngine complete frames.
+    private readonly object _removalUartEvidenceGate = new();
+    private readonly HashSet<int> _removalUartOpenSources = [];
+    private readonly HashSet<(int LowIo, int HighIo)> _removalUartLiveUnexpectedEdges = [];
+    private CancellationTokenSource? _removalOpenSweepConfirmCts;
+    private long _removalUartSweepId;
     private int _discardRequiredForFault;
     private int _discardContactClosed;
     private int _discardStandaloneLocked;
@@ -170,8 +179,6 @@ public sealed class TestViewModel : ObservableObject
     private long _productionUiCycleEpoch;
     private long _inlineProbeUiRevision;
     private long _ioMappingUiRevision;
-    private readonly object _probePreviewGate = new();
-    private ProductionProbePreview? _pendingProductionProbePreview;
     private LiveTopologySnapshot _lastLiveTopologySnapshot = LiveTopologySnapshot.Empty();
     private int _probePresentationState = (int)ProbePresentationState.Inactive;
     private int _productionPresentationMode = (int)ProductionPresentationMode.Waiting;
@@ -191,7 +198,7 @@ public sealed class TestViewModel : ObservableObject
     private int _deviceFaultDialogShown;
     private int _deviceFaultTransitionCount;
     private int _deviceFaultDialogCount;
-    private int _manualActiveRelay;
+    private int _manualActiveRelay = -1;
     private int _firstFrameReceivedLogged;
     private int _firstLogicalStateLogged;
     private int _firstUiUpdateRenderedLogged;
@@ -226,6 +233,15 @@ public sealed class TestViewModel : ObservableObject
     // V12.10.3: TestEngine.Reset() phát Changed đồng bộ. Trong Master state machine,
     // reset nội bộ không được phép tái nhập OnEngineChanged trước khi state hoàn tất.
     private int _suppressEngineChanged;
+    // V4/JBZ_Windows: after a FAIL clean :UNCONNECT boundary the wire table
+    // must remain truly empty until the next firmware cycle begins producing
+    // fresh continuity data.
+    private int _suppressProductionWireTableUntilNextJbzFrame;
+    // V5: when the fresh-cycle gate opens on CLEAR/OPEN, force exactly one
+    // presentation refresh even while _presentationCycleStarted is still false.
+    // Waiting-for-product must show the freshly rebuilt OPEN baseline; it must
+    // not remain blank until a physical pair becomes active.
+    private int _forceProductionWireTableReloadPending;
     // Gate liên luồng: mỗi chu kỳ chỉ một caller được chốt side effects.
     private int _resultRecordedThisCycle;
     private int _probeCycleRecordedThisCycle;
@@ -268,8 +284,6 @@ public sealed class TestViewModel : ObservableObject
     private readonly object _inlineProbeGate = new();
     private int[] _inlineProbeContactIos = Array.Empty<int>();
     private long _inlineProbeLastSeenUtcTicks;
-    private readonly ProbeStateTracker _probeStateTracker = new(confirmFrames: 2, releaseFrames: 1, maxContacts: 64);
-    private readonly ManualProbeSession _manualProbeSession = new(confirmFrames: 2, releaseFrames: 1);
     // V12.9.2: Probe UI tuyệt đối không dùng TTL/quarantine dài.
     // Timestamp chỉ còn phục vụ interlock relay chống rung cực ngắn sau RELEASE,
     // không được phép giữ ProbeContacts trên giao diện.
@@ -307,6 +321,7 @@ public sealed class TestViewModel : ObservableObject
     // vẫn không đổi. Nhờ vậy model cũ không thể hoàn thành muộn rồi ghi đè
     // model mới, vốn là nguyên nhân bảng TestView xuất hiện chậm/đổi model.
     private int _modelLoadGeneration;
+    private int _modelUploadInProgress;
 
     public FaultRowCollection Faults { get; } = new();
 
@@ -428,7 +443,7 @@ public sealed class TestViewModel : ObservableObject
 
     // Sau khi FAIL đã xác nhận và model có _DISCARD, vùng chữ lớn giữa màn hình
     // dành riêng cho hướng dẫn đưa hàng NG qua cảm biến. Ô trạng thái nhỏ vẫn
-    // hiển thị CHỜ XÁC NHẬN THÙNG LỖI qua ResultStatusText.
+    // mọi đường hậu kết quả chỉ hiển thị một trạng thái THÁO SẢN PHẨM.
     private bool IsDiscardFaultConfirmationPresentation =>
         !IsDeviceFault &&
         _waitForFaultProductRemoval &&
@@ -465,15 +480,8 @@ public sealed class TestViewModel : ObservableObject
     private bool IsProbeOwningProductionPresentation()
     {
         ProbePresentationState probeState = CurrentProbePresentationState;
-        if (probeState is ProbePresentationState.Candidate or ProbePresentationState.Touch ||
-            _probeStateTracker.HasTrackedContacts ||
-            Volatile.Read(ref _inlineProbeContactIo) != 0)
-        {
-            return true;
-        }
-
-        lock (_probePreviewGate)
-            return _pendingProductionProbePreview is not null;
+        return probeState is ProbePresentationState.Candidate or ProbePresentationState.Touch ||
+               Volatile.Read(ref _inlineProbeContactIo) != 0;
     }
 
     public string ResultStatusText
@@ -492,25 +500,15 @@ public sealed class TestViewModel : ObservableObject
             if (IsProductRemovalPending ||
                 CurrentProductionPhase == ProductionPhase.WaitingProductRemoval)
             {
-                // FAIL có cấu hình _DISCARD: ô nhỏ chỉ báo trạng thái chờ xác nhận.
-                // Hướng dẫn thao tác lớn được hiển thị ở CenterResultText.
-                if (_waitForFaultProductRemoval &&
-                    Volatile.Read(ref _discardRequiredForFault) != 0)
-                {
-                    return "CHỜ XÁC NHẬN THÙNG LỖI";
-                }
-
-                return value.Contains("VUI LÒNG", StringComparison.OrdinalIgnoreCase)
-                    ? "VUI LÒNG THÁO SẢN PHẨM"
-                    : "THÁO SẢN PHẨM";
+                return "THÁO SẢN PHẨM";
             }
 
             if (IsManualModeActive || value.Equals("MANUAL", StringComparison.OrdinalIgnoreCase))
                 return "MANUAL";
 
             if (!value.StartsWith("PASS", StringComparison.OrdinalIgnoreCase) &&
-                value.Contains("VUI LÒNG THÁO SẢN PHẨM", StringComparison.OrdinalIgnoreCase))
-                return "VUI LÒNG THÁO SẢN PHẨM";
+                value.Contains("THÁO SẢN PHẨM", StringComparison.OrdinalIgnoreCase))
+                return "THÁO SẢN PHẨM";
 
             if (value.Contains("THÁO SẢN PHẨM", StringComparison.OrdinalIgnoreCase))
                 return "THÁO SẢN PHẨM";
@@ -547,7 +545,7 @@ public sealed class TestViewModel : ObservableObject
                 return "KHÔNG ĐẠT";
 
             if (value.Contains("CHỜ THÁO", StringComparison.OrdinalIgnoreCase))
-                return "CHỜ THÁO";
+                return "THÁO SẢN PHẨM";
 
             if (value.Contains("ĐANG", StringComparison.OrdinalIgnoreCase))
                 return "ĐANG TEST";
@@ -579,7 +577,7 @@ public sealed class TestViewModel : ObservableObject
                 return "#FFF3A0";
 
             if (!value.StartsWith("PASS", StringComparison.OrdinalIgnoreCase) &&
-                value.Contains("VUI LÒNG THÁO SẢN PHẨM", StringComparison.OrdinalIgnoreCase))
+                value.Contains("THÁO SẢN PHẨM", StringComparison.OrdinalIgnoreCase))
                 return "#E65100";
 
             if (value.Contains("CHƯA KẾT NỐI", StringComparison.OrdinalIgnoreCase))
@@ -638,7 +636,16 @@ public sealed class TestViewModel : ObservableObject
         set => Set(ref _hardwareStatus, value);
     }
 
+    private string _boardFirmwareName = string.Empty;
+    public string BoardFirmwareName
+    {
+        get => _boardFirmwareName;
+        private set => Set(ref _boardFirmwareName, value);
+    }
+
     public bool IsBoardConnected => _board.IsConnected;
+    public bool IsBoardIdentityVerified => _board.IsConnected &&
+        JbzProtocolParser.IsUniversalTesterIdentity(_board.BoardFirmwareIdentity) && !IsDeviceFault;
 
     public string BoardConnectionMessage
     {
@@ -1142,31 +1149,31 @@ public sealed class TestViewModel : ObservableObject
         Relay1Command =
             new AsyncRelayCommand(async () =>
             {
-                if (!EnsureManualBoardReady("thử Relay 1", requireD2xxRelay: true))
+                if (!EnsureManualBoardReady("thử Relay 1"))
                     return;
 
                 int relay1Ms = _productionSettings.Relay1JigPulseMs;
                 AddLog($"THỬ RELAY 1 vật lý: pulse 1 lần ({relay1Ms} ms)");
-                await _engine.PulsePhysicalRelayAsync(1);
+                await _engine.PulsePhysicalRelayAsync(JbzBoardTransportAdapter.Relay1OutputChannel);
                 AddLog("Relay 1 OFF - đã cưỡng bức về trạng thái chờ.");
             });
 
         Relay2Command =
             new AsyncRelayCommand(async () =>
             {
-                if (!EnsureManualBoardReady("thử Relay 2", requireD2xxRelay: true))
+                if (!EnsureManualBoardReady("thử Relay 5"))
                     return;
 
                 int relay2Ms = _productionSettings.Relay2MarkingPulseMs;
-                AddLog($"THỬ RELAY 2 vật lý: pulse 1 lần ({relay2Ms} ms)");
-                await _engine.PulsePhysicalRelayAsync(2);
-                AddLog("Relay 2 OFF - đã cưỡng bức về trạng thái chờ.");
+                AddLog($"THỬ RELAY 5 vật lý: pulse 1 lần ({relay2Ms} ms)");
+                await _engine.PulsePhysicalRelayAsync(JbzBoardTransportAdapter.Relay5OutputChannel);
+                AddLog("Relay 5 OFF - đã cưỡng bức về trạng thái chờ.");
             });
 
         RelaysOffCommand =
             new AsyncRelayCommand(async () =>
             {
-                if (!EnsureManualBoardReady("tắt relay", requireD2xxRelay: true))
+                if (!EnsureManualBoardReady("tắt relay"))
                     return;
 
                 await _board.AllRelaysOffAsync();
@@ -1178,7 +1185,7 @@ public sealed class TestViewModel : ObservableObject
 
     }
 
-    private bool EnsureManualBoardReady(string action, bool requireD2xxRelay = false)
+    private bool EnsureManualBoardReady(string action)
     {
         if (!_board.IsConnected)
         {
@@ -1199,7 +1206,7 @@ public sealed class TestViewModel : ObservableObject
 
         Interlocked.Exchange(ref _manualModeActive, 1);
         CancelCycleOperations();
-        ResetManualProbeSession("enter-manual-mode");
+        ResetProbePresentation("enter-manual-mode");
         SwitchRuntimeMode(RuntimeMode.Background);
         Interlocked.Exchange(ref _probeSessionActive, 0);
         Interlocked.Exchange(ref _postContinuityStarted, 0);
@@ -1221,11 +1228,11 @@ public sealed class TestViewModel : ObservableObject
             await _board.AllRelaysOffAsync();
         }
 
-        Volatile.Write(ref _manualActiveRelay, 0);
+        Volatile.Write(ref _manualActiveRelay, -1);
         State = "MANUAL";
         Raise(nameof(IsManualModeActive));
         Raise(nameof(CanEnterManualMode));
-        AddLog("MANUAL TỰ ĐỘNG ON - thao tác relay tay, tất cả relay đã OFF an toàn.");
+        AddLog("MANUAL TỰ ĐỘNG ON - chỉ điều khiển Relay 1/OUT0 và Relay 5/OUT4; cả 2 relay đã OFF an toàn.");
     }
 
     public bool IsProductRemovalPending =>
@@ -1233,9 +1240,10 @@ public sealed class TestViewModel : ObservableObject
 
     private void SetProductRemovalPending(bool pending)
     {
-        if (pending && Volatile.Read(ref _resultRecordedThisCycle) != 0)
-            MarkProductRemovalStarted();
-
+        // Entering the post-result removal gate means "please remove", not
+        // "removal has started". The start timestamp is captured only after an
+        // authoritative complete topology proves that at least one expected
+        // product relation has actually disappeared.
         int next = pending ? 1 : 0;
         if (Interlocked.Exchange(ref _productRemovalPending, next) != next)
             Raise(nameof(IsProductRemovalPending));
@@ -1248,7 +1256,7 @@ public sealed class TestViewModel : ObservableObject
         {
             if (_board.IsConnected && !outputsAlreadyOff)
                 await _board.AllRelaysOffAsync();
-            Volatile.Write(ref _manualActiveRelay, 0);
+            Volatile.Write(ref _manualActiveRelay, -1);
             Interlocked.Exchange(ref _manualModeActive, 0);
         }
         finally
@@ -1259,23 +1267,24 @@ public sealed class TestViewModel : ObservableObject
         Raise(nameof(IsManualModeActive));
         Raise(nameof(CanEnterManualMode));
         State = ReadyStateForCurrentModel();
-        AddLog("MANUAL TỰ ĐỘNG OFF - relay OFF, quét Production tiếp tục.");
+        AddLog("MANUAL TỰ ĐỘNG OFF - Relay 1/OUT0 và Relay 5/OUT4 OFF, quét Production tiếp tục.");
 
         if (_board.IsConnected)
             await EnsureContinuousProductionScanAsync();
     }
 
     /// <summary>
-    /// Manual relay tương thích JBZ I/O Monitor V1.9: BẬT giữ đúng một relay,
+    /// Universal Tester New chỉ có hai relay vật lý: Relay 1 = OUT0 và Relay 5 = OUT4.
     /// TẮT cưỡng bức cả hai relay OFF rồi mới khôi phục Production scan.
     /// </summary>
     public async Task<int> SetManualRelayAsync(int relay, bool turnOn)
     {
         if (IsDeviceFault)
             throw new InvalidOperationException("DeviceFault đang khóa lệnh Manual. Hãy thoát và mở lại ứng dụng.");
-        if (relay is not 1 and not 2)
-            throw new ArgumentOutOfRangeException(nameof(relay));
-        if (!EnsureManualBoardReady($"manual Relay {relay}", requireD2xxRelay: true))
+        if (!JbzBoardTransportAdapter.IsPhysicalRelayOutput(relay))
+            throw new ArgumentOutOfRangeException(nameof(relay), relay,
+                "Chỉ Relay 1 (OUT0) và Relay 5 (OUT4) là relay vật lý của Universal Tester New.");
+        if (!EnsureManualBoardReady($"manual Relay {relay}"))
             return Volatile.Read(ref _manualActiveRelay);
         if (!IsManualModeActive)
             await EnterManualModeAsync();
@@ -1302,20 +1311,20 @@ public sealed class TestViewModel : ObservableObject
                 if (turnOn)
                     await _board.SetRelayAsync(relay);
 
-                Volatile.Write(ref _manualActiveRelay, turnOn ? relay : 0);
+                Volatile.Write(ref _manualActiveRelay, turnOn ? relay : -1);
                 double elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
                 AsyncFileLogService.Current.Performance(
                     $"MANUAL_RELAY_LATENCY relay={relay} action={(turnOn ? "ON" : "OFF")} event=ui_update elapsed_ms={elapsedMs:0.###}");
                 AddLog(turnOn
-                    ? $"MANUAL Relay {relay} ON - relay còn lại đã OFF."
-                    : $"MANUAL Relay {relay} OFF - tất cả relay OFF.");
+                    ? $"MANUAL {(relay == 0 ? "RELAY 1 / OUT0" : "RELAY 5 / OUT4")} ON - relay còn lại đã OFF."
+                    : $"MANUAL {(relay == 0 ? "RELAY 1 / OUT0" : "RELAY 5 / OUT4")} OFF - cả hai relay OFF.");
                 activeRelay = Volatile.Read(ref _manualActiveRelay);
             }
             catch (Exception ex)
             {
                 try { await _board.AllRelaysOffAsync(); }
                 catch (Exception offEx) { AddLog($"MANUAL safe OFF sau lỗi relay thất bại: {offEx.Message}"); }
-                Volatile.Write(ref _manualActiveRelay, 0);
+                Volatile.Write(ref _manualActiveRelay, -1);
                 EnterDeviceFault(ex, "ManualRelay");
                 throw;
             }
@@ -1337,7 +1346,7 @@ public sealed class TestViewModel : ObservableObject
     {
         if (IsDeviceFault)
             throw new InvalidOperationException("DeviceFault đang khóa lệnh Manual. Hãy thoát và mở lại ứng dụng.");
-        if (!EnsureManualBoardReady("manual RESET", requireD2xxRelay: true))
+        if (!EnsureManualBoardReady("manual RESET"))
             return;
         if (!IsManualModeActive)
             await EnterManualModeAsync();
@@ -1352,15 +1361,15 @@ public sealed class TestViewModel : ObservableObject
                 await _board.AllRelaysOffAsync();
                 await _board.ResetClearAsync();
                 await _board.AllRelaysOffAsync();
-                Volatile.Write(ref _manualActiveRelay, 0);
+                Volatile.Write(ref _manualActiveRelay, -1);
                 State = "MANUAL";
-                AddLog("MANUAL RESET - reset clear hoàn tất, tất cả relay OFF.");
+                AddLog("MANUAL RESET - reset clear hoàn tất, Relay 1/OUT0 và Relay 5/OUT4 đều OFF.");
             }
             catch (Exception ex)
             {
                 try { await _board.AllRelaysOffAsync(); }
                 catch (Exception offEx) { AddLog($"MANUAL safe OFF sau lỗi reset thất bại: {offEx.Message}"); }
-                Volatile.Write(ref _manualActiveRelay, 0);
+                Volatile.Write(ref _manualActiveRelay, -1);
                 EnterDeviceFault(ex, "ManualReset");
                 throw;
             }
@@ -1383,7 +1392,7 @@ public sealed class TestViewModel : ObservableObject
             throw new InvalidOperationException("Chưa có kênh điện trở hợp lệ để đo.");
         if (IsDeviceFault)
             throw new InvalidOperationException("DeviceFault đang khóa thao tác phần cứng.");
-        if (!EnsureManualBoardReady("đo điện trở bằng tay", requireD2xxRelay: true))
+        if (!EnsureManualBoardReady("đo điện trở bằng tay"))
             return [];
         if (!IsManualModeActive)
             await EnterManualModeAsync();
@@ -1451,7 +1460,7 @@ public sealed class TestViewModel : ObservableObject
                         await StopScanIntentionallyAsync("ManualLeak");
                     await _board.AllRelaysOffAsync();
                 }
-                Volatile.Write(ref _manualActiveRelay, 0);
+                Volatile.Write(ref _manualActiveRelay, -1);
 
                 State = "CHẠY THỬ MÁY LEAK";
                 AddLog(
@@ -1481,7 +1490,7 @@ public sealed class TestViewModel : ObservableObject
     private string ReadyStateForCurrentModel()
     {
         if (IsProductRemovalPending)
-            return "VUI LÒNG THÁO SẢN PHẨM";
+            return "THÁO SẢN PHẨM";
 
         if (IsManualModeActive)
             return "MANUAL";
@@ -1501,26 +1510,19 @@ public sealed class TestViewModel : ObservableObject
     {
         bool jigEnabled = _productionSettings.JigEjectRelayEnabled;
         bool markingEnabled = _productionSettings.PassMarkingRelayEnabled;
-        int jigRelay = _productionSettings.RelayWiringMode == 1 ? 2 : 1;
-        int markingRelay = _productionSettings.RelayWiringMode == 1 ? 1 : 2;
-
         if (!jigEnabled && !markingEnabled)
             return "PASS không kích relay theo cấu hình";
         if (!jigEnabled)
-            return $"Relay {markingRelay} MARKING";
+            return "RELAY 5 / OUT4 MARKING";
         if (!markingEnabled)
-            return $"Relay {jigRelay} mở JIG";
+            return "RELAY 1 / OUT0 mở JIG";
 
-        return $"Relay {markingRelay} MARKING -> Relay {jigRelay} mở JIG";
+        return "RELAY 5 / OUT4 MARKING -> RELAY 1 / OUT0 mở JIG";
     }
 
     private string FaultJigRelayText()
     {
-        int relay = _productionSettings.RelayWiringMode == 1 ? 2 : 1;
-        int pulseMs = relay == 2
-            ? _productionSettings.Relay2MarkingPulseMs
-            : _productionSettings.Relay1JigPulseMs;
-        return $"Relay {relay} mở JIG ({pulseMs} ms)";
+        return $"RELAY 1 / OUT0 mở JIG ({Math.Clamp(_productionSettings.Relay1JigPulseMs, 50, 5_000)} ms)";
     }
 
     private void ReportDeviceFaultForTest(Exception exception, int desiredRowsCount = -1) =>
@@ -1568,7 +1570,7 @@ public sealed class TestViewModel : ObservableObject
         _deviceFaultMessage = "Mất kết nối với máy test. Vui lòng khởi động lại.";
         BoardConnectionMessage = _deviceFaultMessage;
         HardwareStatus = "Máy test: MẤT KẾT NỐI";
-        ResetManualProbeSession("device-fault");
+        ResetProbePresentation("device-fault");
         _cycleActive = false;
         _waitForProductRelease = false;
         _waitForFaultProductRemoval = false;
@@ -1579,7 +1581,7 @@ public sealed class TestViewModel : ObservableObject
         Interlocked.Exchange(ref _masterEjectStarted, 0);
         Interlocked.Exchange(ref _resultRecordedThisCycle, 0);
         Interlocked.Exchange(ref _manualModeActive, 0);
-        Volatile.Write(ref _manualActiveRelay, 0);
+        Volatile.Write(ref _manualActiveRelay, -1);
         SwitchRuntimeMode(RuntimeMode.Background);
         CancelCycleOperations();
         _sound.SetWiringFaultAlarm(false);
@@ -1596,6 +1598,17 @@ public sealed class TestViewModel : ObservableObject
     {
         try
         {
+            // Never inject STOP/OUTPUT commands into an active bootloader
+            // transaction. Firmware maintenance is already responsible for the
+            // hardware state and COM ownership.
+            if (_board is JbzBoardTransportAdapter maintenanceBoard &&
+                maintenanceBoard.IsFirmwareMaintenanceActive)
+            {
+                AsyncFileLogService.Current.Performance(
+                    "DEVICE_FAULT_HARDWARE_LOCK_SUPPRESSED reason=firmware-maintenance");
+                return;
+            }
+
             if (_board.IsConnected)
             {
                 _scanSupervisor.MarkFaulted("device-fault-hardware-lock");
@@ -1622,7 +1635,7 @@ public sealed class TestViewModel : ObservableObject
 
         dispatcher.BeginInvoke(new Action(async () =>
         {
-            var dialog = new JBZUniversalTester.Views.FaultConfirmationWindow(
+            var dialog = new JBZUniveresalLunix.Views.FaultConfirmationWindow(
                 [new FaultDetail
                 {
                     Type = ProductFaultType.SystemDeviceError,
@@ -1662,6 +1675,7 @@ public sealed class TestViewModel : ObservableObject
     {
         Raise(nameof(IsDeviceFault));
         Raise(nameof(IsBoardConnected));
+        Raise(nameof(IsBoardIdentityVerified));
         Raise(nameof(BoardConnectionMessage));
         Raise(nameof(HasBoardConnectionError));
         Raise(nameof(IsManualModeActive));
@@ -1787,6 +1801,15 @@ public sealed class TestViewModel : ObservableObject
         {
             return;
         }
+        if (Volatile.Read(ref _modelUploadInProgress) != 0)
+            return;
+
+        if (_model is null)
+        {
+            _scanSupervisor.Suspend("WaitingForModel");
+            State = "CHỜ CHỌN MÃ HÀNG";
+            return;
+        }
 
         // Không return chỉ vì firmware đang scan. Model có thể vừa đổi từ
         // active=1 sang active=8 trong khi stream cũ vẫn đang chạy. ScanSupervisor
@@ -1845,6 +1868,58 @@ public sealed class TestViewModel : ObservableObject
         }
     }
 
+    private async Task StartProductRemovalMonitorAsync(
+        CancellationToken ct,
+        string reason)
+    {
+        if (!_board.IsConnected)
+            throw new IOException("Bo JBZ UART không kết nối khi bắt đầu giám sát tháo sản phẩm.");
+
+        // Post-result removal is not a new production cycle.
+        Interlocked.Exchange(ref _postContinuityStarted, 0);
+        Interlocked.Exchange(ref _wiringFaultHandlingStarted, 0);
+        _engine.SetFrameProcessingEnabled(true);
+
+        if (_waitForFaultProductRemoval && _board is JbzBoardTransportAdapter jbzBoard)
+        {
+            // Exact JBZ_Windows behavior after FAIL:
+            //   TX :UNCONNECT,500,<physical_pin_count>
+            //   RX :REMOVAL
+            //   RX :UNCONNECT   <-- only clean boundary
+            // Never START a new scan merely to detect removal.  Doing that starts a
+            // new electrical cycle and can legitimately produce another :OTHER,
+            // which is exactly what kept the previous implementation stuck.
+            _scanSupervisor.Suspend("WaitingProductRemoval");
+            int physicalPinCount = _model is null
+                ? 0
+                : Math.Max(_model.Pins.Count, _model.MaxIo);
+            if (physicalPinCount <= 0)
+                throw new InvalidDataException("Không xác định được physical pin count để gửi :UNCONNECT.");
+
+            AsyncFileLogService.Current.Performance(
+                $"REMOVAL_HANDSHAKE_BEGIN reason={reason} delay_ms={JbzRemovalUnconnectDelayMilliseconds} " +
+                $"physical_pin_count={physicalPinCount} scanning={_board.IsScanning}");
+            await jbzBoard.RequestProductRemovalAsync(
+                JbzRemovalUnconnectDelayMilliseconds,
+                physicalPinCount,
+                ct);
+            AddLog(
+                $"THÁO SẢN PHẨM - đã gửi :UNCONNECT,{JbzRemovalUnconnectDelayMilliseconds},{physicalPinCount}; " +
+                "chờ firmware trả :REMOVAL rồi :UNCONNECT.");
+            return;
+        }
+
+        // Fallback for transports that do not implement the JBZ UART removal
+        // handshake: keep the existing continuous-scan removal monitor.
+        bool started = await _scanSupervisor.EnsureProductionScanAsync(
+            _model?.MaxIo ?? 0,
+            ct);
+        _scanSupervisor.Suspend("WaitingProductRemoval");
+        AsyncFileLogService.Current.Performance(
+            $"REMOVAL_MONITOR_START reason={reason} started={started} scanning={_board.IsScanning}");
+        AddLog("THÁO SẢN PHẨM - scan chỉ giám sát tháo; watchdog/recovery production tạm dừng.");
+    }
+
     private async Task StopScanIntentionallyAsync(
         string reason,
         CancellationToken ct = default)
@@ -1857,6 +1932,18 @@ public sealed class TestViewModel : ObservableObject
 
     private async Task<bool> RecoverProductionScanAsync(string reason)
     {
+        // V6: firmware maintenance owns the UART exclusively. Recovery during a
+        // flash can reopen the COM and upload a model in the middle of PROGRAM,
+        // corrupting the maintenance transaction. Treat maintenance as an
+        // intentional suspension, never as a production scan failure.
+        if (_board is JbzBoardTransportAdapter maintenanceBoard &&
+            maintenanceBoard.IsFirmwareMaintenanceActive)
+        {
+            AsyncFileLogService.Current.Performance(
+                $"SCAN_RECOVERY_SUPPRESSED reason=firmware-maintenance source={reason}");
+            return true;
+        }
+
         bool recoveryGateEntered = false;
         try
         {
@@ -1888,7 +1975,9 @@ public sealed class TestViewModel : ObservableObject
             {
                 BoardConnectionMessage = string.Empty;
                 HardwareStatus = "Bo: đã tự phục hồi kết nối";
+                BoardFirmwareName = _board.BoardFirmwareIdentity;
                 Raise(nameof(IsBoardConnected));
+                Raise(nameof(IsBoardIdentityVerified));
                 InvokeUi(UpdateCardScanningState);
                 AddLog($"SCAN_RECOVERY hoàn tất sau {reason}; giữ nguyên lifecycle sản phẩm hiện tại.");
             }
@@ -1914,6 +2003,18 @@ public sealed class TestViewModel : ObservableObject
                 if (IsDeviceFault)
                     break;
 
+                // V6: while BoardMaintenanceWindow is flashing firmware, STOP,
+                // bootloader disconnect/reconnect and missing scan frames are all
+                // expected. Do not let the production watchdog become a second
+                // UART owner.
+                if (_board is JbzBoardTransportAdapter maintenanceBoard &&
+                    maintenanceBoard.IsFirmwareMaintenanceActive)
+                {
+                    _scanSupervisor.Suspend("FirmwareMaintenance");
+                    await Task.Delay(250, ct);
+                    continue;
+                }
+
                 if (!_board.IsConnected)
                 {
                     if (_scanSupervisor.TryBeginDisconnectedRecovery(out ScanHealthSnapshot disconnected))
@@ -1923,7 +2024,7 @@ public sealed class TestViewModel : ObservableObject
                         if (!await RecoverProductionScanAsync("HardwareMonitor.Disconnected"))
                         {
                             EnterDeviceFault(
-                                new IOException("Bo D2XX mất kết nối và cả soft/reopen recovery đều thất bại."),
+                                new IOException("Bo JBZ UART mất kết nối và cả soft/reopen recovery đều thất bại."),
                                 "HardwareMonitor.Disconnected");
                             break;
                         }
@@ -1931,7 +2032,10 @@ public sealed class TestViewModel : ObservableObject
                 }
 
                 ScanHealthSnapshot health = _scanSupervisor.HealthSnapshot;
-                if (health.State is ScanHealthState.Starting or ScanHealthState.Monitoring)
+                bool removalMonitorActive = IsProductRemovalPending ||
+                                            CurrentProductionPhase == ProductionPhase.WaitingProductRemoval;
+                if (!removalMonitorActive &&
+                    (health.State is ScanHealthState.Starting or ScanHealthState.Monitoring))
                 {
                     int firstFrameTimeoutMs =
                         ScanSupervisor.ResolveFirstFrameTimeoutMs(_board.Capacity);
@@ -1991,7 +2095,7 @@ public sealed class TestViewModel : ObservableObject
     {
         AddLog("Khởi tạo ứng dụng: kết nối bo trước, sau đó mới nạp mã gần nhất.");
 
-        // SetModel mở gate kiểm tra IO nền. Vì vậy phải chờ D2XX Connect/handshake
+        // SetModel mở gate kiểm tra IO nền. Vì vậy phải chờ JBZ UART Connect/handshake
         // hoàn tất trước khi nạp THT, tránh kích hoạt gate bằng frame trong giai
         // đoạn transport còn đang khởi tạo.
         await InitializeHardwareAsync();
@@ -2037,16 +2141,71 @@ public sealed class TestViewModel : ObservableObject
 
         fullPath = ResolveModelPath(path);
         if (!File.Exists(fullPath))
-            throw new FileNotFoundException("Không tìm thấy file model .tht.", fullPath);
+            throw new FileNotFoundException("Không tìm thấy file model .model.", fullPath);
+    }
+
+    /// <summary>
+    /// Operator-selected model must always be physically transferred to the JBZ
+    /// board, even when MODELNAME/PINCOUNT matches the previous selection. The
+    /// adapter caches a synchronized model inside one UART session; reconnecting
+    /// intentionally invalidates that session cache before ConfigureModelAsync.
+    /// Startup auto-load does not use this path.
+    /// </summary>
+    private async Task ForceFreshBoardSessionForOperatorModelUploadAsync(CancellationToken uploadCancellation)
+    {
+        if (!_board.IsConnected)
+            throw new IOException("Bo JBZ UART chưa kết nối để nạp model.");
+
+        AddLog("MODEL_UPLOAD_FORCE: người vận hành chọn mã hàng - bắt buộc tạo phiên UART mới và nạp lại toàn bộ .model xuống bo.");
+        AsyncFileLogService.Current.Performance(
+            $"MODEL_UPLOAD_FORCE_BEGIN current={ModelName} scanning={_board.IsScanning}");
+
+        if (_board.IsScanning)
+            await _board.StopScanAsync(uploadCancellation);
+
+        try
+        {
+            await _board.AllRelaysOffAsync();
+        }
+        catch (Exception ex)
+        {
+            // Relay-off is best-effort here; the disconnect below is still required
+            // to invalidate the model synchronization cache.
+            AddLog($"MODEL_UPLOAD_FORCE relay-off warning: {ex.Message}");
+        }
+
+        await _board.DisconnectAsync();
+
+        BoardConnectionMessage = "Đang kết nối lại bo để nạp mới model...";
+        HardwareStatus = "Bo: đang kết nối lại để nạp model";
+        Raise(nameof(IsBoardConnected));
+        Raise(nameof(IsBoardIdentityVerified));
+
+        // A user pressing HỦY must not leave the tester deliberately disconnected.
+        // Reconnect is therefore owned by the application lifetime; cancellation is
+        // honored immediately after a healthy board session has been restored.
+        var info = await _board.ConnectAsync(_lifetimeCts.Token);
+        BoardConnectionMessage = string.Empty;
+        BoardFirmwareName = info.Description.Trim();
+        HardwareStatus = $"Bo: {info.Description} [{info.SerialNumber}] - ĐÃ KẾT NỐI";
+        Raise(nameof(IsBoardConnected));
+        Raise(nameof(IsBoardIdentityVerified));
+
+        AsyncFileLogService.Current.Performance(
+            $"MODEL_UPLOAD_FORCE_SESSION_READY firmware=\"{info.Description}\" serial=\"{info.SerialNumber}\"");
+        uploadCancellation.ThrowIfCancellationRequested();
     }
 
     /// <summary>
     /// Nạp model do NGƯỜI VẬN HÀNH chọn. Lựa chọn này luôn ưu tiên hơn
-    /// auto-load model startup. Parse chạy background, SetModel trở lại UI
-    /// continuation nên bảng TestView được dựng ngay khi task hoàn tất.
+    /// auto-load model startup. Khi có progress (đường JbzPartSelectionWindow),
+    /// luôn ép một phiên UART mới để file .model thực sự được gửi lại xuống bo.
     /// </summary>
-    public async Task<ProductModel?> LoadSelectedModelFromPathAsync(string path)
+    public async Task<ProductModel?> LoadSelectedModelFromPathAsync(string path,
+        IProgress<JbzModelUploadProgress>? progress = null, CancellationToken ct = default)
     {
+        if (progress is not null && !_board.IsConnected)
+            throw new IOException("Bo JBZ UART chưa kết nối để nạp model.");
         ValidateModelPath(path, out string fullPath);
 
         int generation = Interlocked.Increment(ref _modelLoadGeneration);
@@ -2072,7 +2231,7 @@ public sealed class TestViewModel : ObservableObject
 
             if (candidates.Count > 1)
             {
-                var dialog = new JBZUniversalTester.Views.PartSelectionWindow(
+                var dialog = new JBZUniveresalLunix.Views.PartSelectionWindow(
                     candidates,
                     _productionSettings.LastThtPartKey)
                 {
@@ -2107,7 +2266,61 @@ public sealed class TestViewModel : ObservableObject
         if (generation != Volatile.Read(ref _modelLoadGeneration))
             return null;
 
-        _productionSettings.LastThtPartKey = JBZUniversalTester.Views.PartSelectionWindow.PartKey(model);
+        ct.ThrowIfCancellationRequested();
+        if (progress is not null && !_board.IsConnected)
+            throw new IOException("Bo JBZ UART mất kết nối trước khi nạp model.");
+        bool recoveryGateHeld = false;
+        bool modelTransferStarted = false;
+        Interlocked.Exchange(ref _modelUploadInProgress, 1);
+        try
+        {
+            if (_board.IsConnected)
+            {
+                await _scanRecoveryGate.WaitAsync(ct);
+                recoveryGateHeld = true;
+                _scanSupervisor.Suspend("ModelUpload");
+            }
+            ct.ThrowIfCancellationRequested();
+
+            // A non-null progress reporter is the explicit JbzPartSelectionWindow
+            // operator path. Every click must perform a real transfer, never reuse
+            // MODEL_UPLOAD already-synchronized from the previous selection.
+            if (progress is not null)
+                await ForceFreshBoardSessionForOperatorModelUploadAsync(ct);
+
+            ct.ThrowIfCancellationRequested();
+            modelTransferStarted = true;
+            try { await _board.ConfigureModelAsync(model, progress, ct); }
+            catch (TimeoutException ex) when (ex.Message.Contains("STOP transition", StringComparison.Ordinal))
+            {
+                BoardConnectionMessage = ex.Message;
+                State = "STOP CHƯA ĐƯỢC XÁC NHẬN";
+                AddLog($"MODEL_UPLOAD blocked: {ex.Message}");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                if (_board.IsConnected) EnterDeviceFault(ex, "ModelUpload");
+                throw;
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested && !modelTransferStarted)
+        {
+            if (recoveryGateHeld)
+            {
+                _scanRecoveryGate.Release();
+                recoveryGateHeld = false;
+            }
+            if (_board.IsConnected) await EnsureContinuousProductionScanAsync();
+            throw;
+        }
+        finally
+        {
+            if (recoveryGateHeld)
+                _scanRecoveryGate.Release();
+            Interlocked.Exchange(ref _modelUploadInProgress, 0);
+        }
+        _productionSettings.LastThtPartKey = JBZUniveresalLunix.Views.PartSelectionWindow.PartKey(model);
         SetModel(model, preparedEngineModel);
         // SetModel chỉ đổi requested active range. Nếu firmware đang chạy dải của
         // model trước, reconcile ngay tại đường load async trước khi MainWindow tự
@@ -2176,7 +2389,7 @@ public sealed class TestViewModel : ObservableObject
                 long parseStarted = Stopwatch.GetTimestamp();
                 IReadOnlyList<ProductModel> candidates = _modelParser.LoadAll(fullPath);
                 ProductModel parsed = candidates.FirstOrDefault(candidate =>
-                        JBZUniversalTester.Views.PartSelectionWindow.PartKey(candidate)
+                        JBZUniveresalLunix.Views.PartSelectionWindow.PartKey(candidate)
                             .Equals(_productionSettings.LastThtPartKey, StringComparison.OrdinalIgnoreCase))
                     ?? candidates[0];
                 ModelFileIdentityService.Capture(parsed, fullPath);
@@ -2195,7 +2408,7 @@ public sealed class TestViewModel : ObservableObject
             if (generation == Volatile.Read(ref _modelLoadGeneration) && _model is null)
             {
                 _productionSettings.LastThtPartKey =
-                    JBZUniversalTester.Views.PartSelectionWindow.PartKey(startup.Model);
+                    JBZUniveresalLunix.Views.PartSelectionWindow.PartKey(startup.Model);
                 SetModel(startup.Model, startup.Prepared);
                 StartupPerformanceTrace.Mark("T10 MODEL_UI_READY");
                 AddLog($"Đã tự tải model gần nhất: {Path.GetFileName(fullPath)}");
@@ -2299,7 +2512,7 @@ public sealed class TestViewModel : ObservableObject
         RaiseCenterPresentation();
         AsyncFileLogService.Current.Performance(
             $"PROBE_STATE old={(ProbePresentationState)previous} new={state} " +
-            $"ios={string.Join(',', ios.OrderBy(io => io).Select(io => $"IO{io}"))} seq={frameSequence}");
+            $"ios={string.Join(",", ios.OrderBy(io => io).Select(io => $"IO{io}"))} seq={frameSequence}");
     }
 
     private void SetProductionPresentationMode(
@@ -2322,13 +2535,16 @@ public sealed class TestViewModel : ObservableObject
 
     /// <summary>
     /// Chỉ Production thật mới được phép tạo lỗi dây/popup.
-    /// Probe phải bị loại kể cả khi callback Production cũ đã được xếp hàng
-    /// trước lúc chuyển cửa sổ.
+    ///
+    /// QUAN TRỌNG - Universal Tester New:
+    /// TESTPIN là event quan sát độc lập do firmware tự phát trong cùng phiên
+    /// Production. Nó có thể xuất hiện đồng thời với :SHORT/:OTHER và tuyệt đối
+    /// không được chặn fault lifecycle. Chỉ một Probe session chẩn đoán explicit
+    /// mới được quyền loại callback Production.
     /// </summary>
     private bool IsProductionFaultContext(long generation) =>
         IsRuntimeContext(RuntimeMode.Production, generation) &&
         Volatile.Read(ref _probeSessionActive) == 0 &&
-        Volatile.Read(ref _inlineProbeContactIo) == 0 &&
         MasterApproved;
 
     /// <summary>
@@ -2506,21 +2722,15 @@ public sealed class TestViewModel : ObservableObject
 
     private TestEnginePresentationSnapshot? BuildEngineFaultRowsSnapshot()
     {
-        bool removal = _waitForProductRelease || _waitForFaultProductRemoval;
-        // Frame rỗng đã là nguồn authoritative cho ProductRemoved. Không dựng
-        // lại bảng removal hàng trăm dòng trước khi Dispatcher được quyền reset
-        // cycle và hiện CHỜ LẮP SẢN PHẨM.
-        if (removal && _engine.IsProductReleased)
-        {
-            ProductionElectricalSnapshot electrical = _engine.GetProductionElectricalSnapshot();
-            return new TestEnginePresentationSnapshot(
-                electrical,
-                Removal: true,
-                Array.Empty<FaultRow>(),
-                RowBuildMilliseconds: 0);
-        }
-
-        return _engine.CapturePresentationSnapshot(removal);
+        // Universal Tester New / JBZ UART uses OPEN as the list of missing
+        // expected endpoints. The operator table therefore always presents the
+        // normal pending-wire view: all missing rows are visible and a network
+        // disappears as soon as it becomes electrically complete.
+        //
+        // Do NOT switch to the old-board removal presentation (which showed
+        // connections still left on the jig). Product-removal completion remains
+        // authoritative in TestEngine.IsProductReleased; this is presentation only.
+        return _engine.CapturePresentationSnapshot(removal: false);
     }
 
     private sealed record EngineUiUpdateRequest(
@@ -2681,6 +2891,10 @@ public sealed class TestViewModel : ObservableObject
         // reset engine và chuyển về CHỜ LẮP SẢN PHẨM cho lượt tiếp theo.
         if (_waitForProductRelease)
         {
+            // Universal Tester New has one post-result state only: THÁO SẢN PHẨM.
+            // Partial unplugging never changes state and never arms a new cycle.
+            // Completion requires zero product connectivity (or authoritative
+            // firmware UNCONNECT/REMOVAL translated to an empty complete frame).
             if (_engine.IsProductReleased)
             {
                 MarkProductRemoved();
@@ -2728,7 +2942,7 @@ public sealed class TestViewModel : ObservableObject
         ProductionPhase phase = CurrentProductionPhase;
 
         // Khi Leak chạy trước continuity, kết quả FAIL chỉ là trạng thái chờ
-        // sửa tiếp xúc connector. Chỉ chốt lỗi sản phẩm khi snapshot D2XX đã
+        // sửa tiếp xúc connector. Chỉ chốt lỗi sản phẩm khi snapshot UART đã
         // PASS toàn bộ topology và Leak là điều kiện duy nhất còn FAIL.
         if (_cycleActive &&
             phase == ProductionPhase.WaterProof &&
@@ -3061,13 +3275,25 @@ public sealed class TestViewModel : ObservableObject
         }
     }
 
-    private void ResetFullCycleAfterProductRemoved()
+    private void ResetFullCycleAfterProductRemoved(bool clearWireTableBeforeNextCycle = false)
     {
+        if (!clearWireTableBeforeNextCycle)
+        {
+            Interlocked.Exchange(ref _suppressProductionWireTableUntilNextJbzFrame, 0);
+            Interlocked.Exchange(ref _forceProductionWireTableReloadPending, 0);
+        }
+        ResetRemovalUartEvidence("product-removed");
         // Invalidate every queued presentation callback from the product that
         // has just been removed before Reset() emits its synchronous Changed.
         AdvanceProductionUiCycleEpoch();
-        ResetManualProbeSession("product-removed");
+        ResetProbePresentation("product-removed");
         _engine.ResetProductCycle();
+        // ProductRemoved is the hard lifecycle boundary: no fault/removal latch from
+        // the previous unit may survive into the next LẮP SẢN PHẨM cycle.
+        _waitForProductRelease = false;
+        _waitForFaultProductRemoval = false;
+        Interlocked.Exchange(ref _faultProductRemoved, 0);
+        SetProductRemovalPending(false);
         Interlocked.Exchange(ref _wiringFaultHandlingStarted, 0);
         Interlocked.Exchange(ref _postContinuityStarted, 0);
         Interlocked.Exchange(ref _waterProofRunning, 0);
@@ -3104,8 +3330,55 @@ public sealed class TestViewModel : ObservableObject
         SelectedOperationTabIndex = 0;
         ClearInlineProbeContactsState(clearLastSeen: true);
         InvokeUi(ClearInlineProbeDisplay);
-        RefreshFaults();
-        RaiseActiveFault();
+
+        if (clearWireTableBeforeNextCycle)
+        {
+            Interlocked.Exchange(ref _suppressProductionWireTableUntilNextJbzFrame, 1);
+            // JBZ_Windows clean-boundary behavior: :UNCONNECT clears the old
+            // product table completely.  Do not immediately rebuild the model
+            // baseline here; the next :START -> :CLEAR/:OPEN stream owns the
+            // fresh table.  This gives the UI a real empty boundary instead of
+            // replacing old fault rows with another 35-row snapshot in the same
+            // dispatcher turn.
+            SynchronizeFaultRows(Array.Empty<FaultRow>());
+            RaiseActiveFault();
+            AsyncFileLogService.Current.Performance(
+                $"FAIL_UI_TABLE_CLEARED cycle={_activeCycleId} rows={Faults.Count} reason=UNCONNECT_CLEAN_BOUNDARY");
+        }
+        else
+        {
+            RefreshFaults();
+            RaiseActiveFault();
+        }
+
+        AsyncFileLogService.Current.Performance(
+            $"PRODUCT_REMOVAL_RESET_COMPLETE cycle={_activeCycleId} state=WaitingForProduct faults={Faults.Count} " +
+            $"tableCleared={clearWireTableBeforeNextCycle}");
+    }
+
+    private async Task ResumeJbzProductionAfterRemovalAsync(string reason)
+    {
+        if (_board is not JbzBoardTransportAdapter ||
+            !_board.IsConnected ||
+            _lifetimeCts.IsCancellationRequested)
+        {
+            return;
+        }
+
+        try
+        {
+            await Task.Delay(JbzNextCycleStartDelayMilliseconds, _lifetimeCts.Token);
+            await EnsureContinuousProductionScanAsync();
+            AsyncFileLogService.Current.Performance(
+                $"REMOVAL_NEXT_CYCLE_START reason={reason} scanning={_board.IsScanning}");
+        }
+        catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            EnterDeviceFault(ex, $"RemovalRestart:{reason}");
+        }
     }
 
     private Task InvokeUiAsync(Action action)
@@ -3118,6 +3391,258 @@ public sealed class TestViewModel : ObservableObject
         return Application.Current.Dispatcher.InvokeAsync(action).Task;
     }
 
+    private const int RemovalOpenSweepQuietConfirmMilliseconds = 2000;
+    private const int RemovalEdgeReleaseQuietConfirmMilliseconds = 150;
+    // Verified JBZ_Windows / original-trace removal contract.
+    private const int JbzRemovalUnconnectDelayMilliseconds = 500;
+    private const int JbzNextCycleStartDelayMilliseconds = 20;
+
+    private bool IsRemovalMonitoringActive() =>
+        _waitForFaultProductRemoval ||
+        _waitForProductRelease ||
+        IsProductRemovalPending ||
+        CurrentProductionPhase == ProductionPhase.WaitingProductRemoval;
+
+    private void ResetRemovalUartEvidence(string reason)
+    {
+        CancellationTokenSource? previous;
+        long sweep;
+        lock (_removalUartEvidenceGate)
+        {
+            previous = _removalOpenSweepConfirmCts;
+            _removalOpenSweepConfirmCts = null;
+            _removalUartOpenSources.Clear();
+            _removalUartLiveUnexpectedEdges.Clear();
+            sweep = ++_removalUartSweepId;
+        }
+
+        if (previous is not null)
+        {
+            try { previous.Cancel(); } catch { }
+            previous.Dispose();
+        }
+
+        if (AsyncFileLogService.Current.FileLoggingEnabled)
+            AsyncFileLogService.Current.Performance(
+                $"REMOVAL_UART_EVIDENCE_RESET sweep={sweep} reason={reason}");
+    }
+
+    private void BeginRemovalUartSweep()
+    {
+        CancellationTokenSource? previous;
+        long sweep;
+        lock (_removalUartEvidenceGate)
+        {
+            previous = _removalOpenSweepConfirmCts;
+            _removalOpenSweepConfirmCts = null;
+            _removalUartOpenSources.Clear();
+            _removalUartLiveUnexpectedEdges.Clear();
+            sweep = ++_removalUartSweepId;
+        }
+
+        if (previous is not null)
+        {
+            try { previous.Cancel(); } catch { }
+            previous.Dispose();
+        }
+
+        AsyncFileLogService.Current.Performance(
+            $"REMOVAL_UART_SWEEP_BEGIN sweep={sweep}");
+    }
+
+    private static bool TryParseJbzUartIntegers(
+        string text,
+        string prefix,
+        int minimumCount,
+        out int[] values)
+    {
+        values = [];
+        if (!text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        string payload = text[prefix.Length..];
+        int[] parsed = payload
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(token => int.TryParse(token, out int value) ? value : int.MinValue)
+            .Take(Math.Max(minimumCount, 4))
+            .ToArray();
+
+        if (parsed.Length < minimumCount || parsed.Take(minimumCount).Any(value => value <= 0))
+            return false;
+
+        values = parsed;
+        return true;
+    }
+
+    private void ObserveRemovalUartLog(string text)
+    {
+        if (!IsRemovalMonitoringActive() || !text.StartsWith("RX :", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        // JBZ_Windows and the verified original traces use an explicit firmware
+        // handshake for FAIL removal.  CLEAR/OPEN/OTHER remain live scan data and
+        // must never decide ProductRemoved for this transport.  This also prevents
+        // a late :OTHER (for example IO4<->IO8 after an all-OPEN sweep) from
+        // keeping the UI permanently in THÁO SẢN PHẨM.
+        if (_waitForFaultProductRemoval && _board is JbzBoardTransportAdapter)
+            return;
+
+        if (text.Equals("RX :CLEAR", StringComparison.OrdinalIgnoreCase))
+        {
+            BeginRemovalUartSweep();
+            return;
+        }
+
+        int[] unexpectedRelation;
+        bool hasUnexpectedRelation =
+            TryParseJbzUartIntegers(text, "RX :OTHER,", 2, out unexpectedRelation);
+        if (!hasUnexpectedRelation)
+        {
+            hasUnexpectedRelation =
+                TryParseJbzUartIntegers(text, "RX :SHORT,", 2, out unexpectedRelation);
+        }
+
+        if (hasUnexpectedRelation)
+        {
+            int low = Math.Min(unexpectedRelation[0], unexpectedRelation[1]);
+            int high = Math.Max(unexpectedRelation[0], unexpectedRelation[1]);
+            CancellationTokenSource? previous;
+            lock (_removalUartEvidenceGate)
+            {
+                _removalUartLiveUnexpectedEdges.Add((low, high));
+                previous = _removalOpenSweepConfirmCts;
+                _removalOpenSweepConfirmCts = null;
+            }
+
+            if (previous is not null)
+            {
+                try { previous.Cancel(); } catch { }
+                previous.Dispose();
+            }
+
+            AsyncFileLogService.Current.Performance(
+                $"REMOVAL_UART_EDGE_PRESENT edge=IO{low}-IO{high}");
+            return;
+        }
+
+        if (!TryParseJbzUartIntegers(text, "RX :OPEN,", 1, out int[] open))
+            return;
+
+        int sourceIo = open[0];
+        int[] requiredSources = _engine.GetRequiredRemovalSourceIos();
+        if (requiredSources.Length == 0 || !requiredSources.Contains(sourceIo))
+            return;
+
+        bool removedUnexpectedEdge;
+        bool allRequiredOpen;
+        bool hasLiveUnexpected;
+        long sweep;
+        int[] openSnapshot;
+        lock (_removalUartEvidenceGate)
+        {
+            _removalUartOpenSources.Add(sourceIo);
+            removedUnexpectedEdge = _removalUartLiveUnexpectedEdges.RemoveWhere(
+                edge => edge.LowIo == sourceIo || edge.HighIo == sourceIo) > 0;
+            allRequiredOpen = requiredSources.All(io => _removalUartOpenSources.Contains(io));
+            hasLiveUnexpected = _removalUartLiveUnexpectedEdges.Count > 0;
+            sweep = _removalUartSweepId;
+            openSnapshot = _removalUartOpenSources.OrderBy(io => io).ToArray();
+        }
+
+        AsyncFileLogService.Current.Performance(
+            $"REMOVAL_UART_OPEN source=IO{sourceIo} sweep={sweep} " +
+            $"open={openSnapshot.Length}/{requiredSources.Length} unexpected={hasLiveUnexpected}");
+
+        if (!allRequiredOpen || hasLiveUnexpected)
+            return;
+
+        ScheduleRemovalOpenSweepConfirmation(
+            sweep,
+            requiredSources,
+            removedUnexpectedEdge
+                ? RemovalEdgeReleaseQuietConfirmMilliseconds
+                : RemovalOpenSweepQuietConfirmMilliseconds);
+    }
+
+    private void ScheduleRemovalOpenSweepConfirmation(
+        long sweep,
+        int[] requiredSources,
+        int quietMilliseconds)
+    {
+        CancellationTokenSource next = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCts.Token);
+        CancellationTokenSource? previous;
+        lock (_removalUartEvidenceGate)
+        {
+            if (sweep != _removalUartSweepId)
+            {
+                next.Dispose();
+                return;
+            }
+
+            previous = _removalOpenSweepConfirmCts;
+            _removalOpenSweepConfirmCts = next;
+        }
+
+        if (previous is not null && !ReferenceEquals(previous, next))
+        {
+            try { previous.Cancel(); } catch { }
+            previous.Dispose();
+        }
+
+        AsyncFileLogService.Current.Performance(
+            $"REMOVAL_UART_CONFIRM_ARM sweep={sweep} quiet_ms={quietMilliseconds} " +
+            $"required={requiredSources.Length}");
+
+        _ = ConfirmRemovalOpenSweepAfterQuietAsync(sweep, requiredSources, quietMilliseconds, next);
+    }
+
+    private async Task ConfirmRemovalOpenSweepAfterQuietAsync(
+        long sweep,
+        int[] requiredSources,
+        int quietMilliseconds,
+        CancellationTokenSource owner)
+    {
+        try
+        {
+            await Task.Delay(quietMilliseconds, owner.Token);
+
+            int[] openSnapshot;
+            lock (_removalUartEvidenceGate)
+            {
+                if (sweep != _removalUartSweepId ||
+                    !ReferenceEquals(_removalOpenSweepConfirmCts, owner) ||
+                    _removalUartLiveUnexpectedEdges.Count > 0 ||
+                    requiredSources.Any(io => !_removalUartOpenSources.Contains(io)))
+                {
+                    return;
+                }
+
+                openSnapshot = _removalUartOpenSources.OrderBy(io => io).ToArray();
+                _removalOpenSweepConfirmCts = null;
+            }
+
+            if (!IsRemovalMonitoringActive())
+                return;
+
+            bool confirmed = _engine.ConfirmProductReleasedFromOpenSweep(openSnapshot, sweep);
+            AsyncFileLogService.Current.Performance(
+                $"REMOVAL_UART_CONFIRM sweep={sweep} confirmed={confirmed} " +
+                $"open={openSnapshot.Length}/{requiredSources.Length}");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            AsyncFileLogService.Current.Error(
+                $"REMOVAL_UART_CONFIRM_FAIL sweep={sweep}: {ex}");
+        }
+        finally
+        {
+            owner.Dispose();
+        }
+    }
+
     private void OnBoardLog(object? sender, string text)
     {
         AppLogLevel level = text.StartsWith("RX frame", StringComparison.OrdinalIgnoreCase) ||
@@ -3125,6 +3650,7 @@ public sealed class TestViewModel : ObservableObject
             ? AppLogLevel.Diagnostic
             : AppLogLevel.Normal;
         AsyncFileLogService.Current.Board(text, level);
+        ObserveRemovalUartLog(text);
     }
 
     private void OnWaterProofLog(object? sender, string text)
@@ -3147,8 +3673,9 @@ public sealed class TestViewModel : ObservableObject
         if (!IsContinuityPreviewFrame(frame))
             return false;
 
-        // The sentinel frame is presentation-only. Always consume it here so it
-        // can never reach discard/startup/probe/PASS/FAIL/relay logic below.
+        // The sentinel frame is consumed here so it can never leak into the normal
+        // complete-frame PASS/FAIL path. Continuity and product-removal intentionally
+        // use different semantics below.
         if (!_board.IsScanning ||
             !IsRuntimeMode(RuntimeMode.Production) ||
             Volatile.Read(ref _probeSessionActive) != 0 ||
@@ -3173,18 +3700,109 @@ public sealed class TestViewModel : ObservableObject
                 .ToArray();
         }
 
-        if (!_engine.ApplyContinuityPreviewSource(sourceIo, targets, frame.Sequence))
-            return true;
-
         long generation = Volatile.Read(ref _runtimeGeneration);
+        long scanGeneration = Volatile.Read(ref _lastObservedProductionScanGeneration);
+        bool removalMode =
+            CurrentProductionPhase == ProductionPhase.WaitingProductRemoval ||
+            IsProductRemovalPending ||
+            _waitForFaultProductRemoval;
+
+        bool forceWireTableReload = false;
+        if (!removalMode &&
+            _board is JbzBoardTransportAdapter &&
+            Interlocked.Exchange(ref _suppressProductionWireTableUntilNextJbzFrame, 0) != 0)
+        {
+            forceWireTableReload = true;
+            Interlocked.Exchange(ref _forceProductionWireTableReloadPending, 1);
+            AsyncFileLogService.Current.Performance(
+                $"FAIL_UI_TABLE_RELOAD_BEGIN source=IO{sourceIo} seq={frame.Sequence}");
+        }
+
+        bool previewChanged = _engine.ApplyContinuityPreviewSource(
+            sourceIo,
+            targets,
+            frame.Sequence,
+            frame.FaultHints);
+
+        if (removalMode)
+        {
+            // CRITICAL: after a committed PASS/FAIL, partial OPEN/OTHER source
+            // updates are removal evidence, NOT new product faults. Update the
+            // authoritative graph source-by-source so IsProductReleased can become
+            // true even before the next complete C0 frame. Do not promote :OTHER/
+            // :SHORT again while the old product is being removed.
+            bool removalChanged = _engine.ApplyRemovalPreviewSource(
+                sourceIo,
+                targets,
+                frame.Sequence,
+                scanGeneration);
+
+            if (!previewChanged && !removalChanged)
+                return true;
+
+            bool releasedNow = _engine.IsProductReleased;
+            long removalEpoch = Volatile.Read(ref _productionUiCycleEpoch);
+
+            // ApplyRemovalPreviewSource raises Engine.Changed synchronously. That
+            // callback may already have completed ProductRemoved and reset the whole
+            // cycle. Never write THÁO SẢN PHẨM back over the freshly-reset state.
+            if (!releasedNow)
+            {
+                InvokeUi(() =>
+                {
+                    if (!IsRuntimeContext(RuntimeMode.Production, generation) ||
+                        removalEpoch != Volatile.Read(ref _productionUiCycleEpoch) ||
+                        (!IsProductRemovalPending &&
+                         CurrentProductionPhase != ProductionPhase.WaitingProductRemoval &&
+                         !_waitForFaultProductRemoval))
+                    {
+                        return;
+                    }
+
+                    SetProductionRuntimeState(
+                        ProductionRuntimeState.WaitingForRemoval,
+                        frame.Sequence,
+                        "JBZ_UART_PRODUCT_STILL_CONNECTED");
+                    State = "THÁO SẢN PHẨM";
+                });
+            }
+
+            QueueContinuityPreviewUi(generation);
+            return true;
+        }
+
+        // Continuity phase only: :OTHER/:SHORT may arrive before C0. Promote an
+        // explicit firmware fault immediately so NG remains realtime. This path is
+        // deliberately disabled above during product removal.
+        bool realtimeFaultChanged = _engine.PromoteAuthoritativeContinuityPreviewFaults(
+            sourceIo,
+            frame.Sequence,
+            scanGeneration,
+            frame.FaultHints);
+
+        if (!previewChanged && !realtimeFaultChanged)
+        {
+            // V5: CLEAR/first OPEN can reopen the post-UNCONNECT UI gate without
+            // changing electrical topology (everything is still OPEN). Queue one
+            // forced presentation refresh anyway so the model OPEN rows are loaded
+            // back immediately while the state remains LẮP SẢN PHẨM.
+            if (forceWireTableReload)
+                QueueContinuityPreviewUi(generation);
+            return true;
+        }
+
+        bool realtimeProductPresent = _engine.HasContinuityPreviewProductActivity ||
+                                      realtimeFaultChanged;
+
         if (!_presentationCycleStarted &&
             CurrentProductionPhase == ProductionPhase.Continuity &&
             !IsProbeOwningProductionPresentation() &&
-            _engine.HasContinuityPreviewProductActivity)
+            realtimeProductPresent)
         {
-            // Lần lắp đầu tiên không được chờ C0 của toàn bộ dải 4/10 card.
-            // Preview đã được TestEngine lọc về đúng expected product edge và
-            // chỉ được phép đổi presentation, không PASS/FAIL/counter/relay.
+            // Universal Tester New reports live topology with OPEN/OTHER/SHORT.
+            // The first real expected pair OR an explicit wrong/short pair means
+            // the harness is physically present. UI must leave LẮP SẢN PHẨM
+            // immediately; PASS/FAIL remains authoritative elsewhere.
             long cycleEpoch = Volatile.Read(ref _productionUiCycleEpoch);
             InvokeUi(() =>
             {
@@ -3199,10 +3817,52 @@ public sealed class TestViewModel : ObservableObject
                 }
 
                 _presentationCycleStarted = true;
+                SetProductionRuntimeState(
+                    ProductionRuntimeState.TestingRealtime,
+                    frame.Sequence,
+                    "JBZ_UART_PAIR_ACTIVITY");
+                SetProductionPresentationMode(
+                    ProductionPresentationMode.LiveTopology,
+                    frame.Sequence,
+                    "JBZ_UART_PAIR_ACTIVITY");
                 RaiseCenterPresentation();
                 State = "ĐANG TEST";
             });
         }
+        else if (_presentationCycleStarted &&
+                 CurrentProductionPhase == ProductionPhase.Continuity &&
+                 !IsProductRemovalPending &&
+                 !IsProbeOwningProductionPresentation() &&
+                 !realtimeProductPresent)
+        {
+            // The last live pair disappeared again. Do not wait for CIRCUIT or
+            // a synthetic complete-frame marker to return to install state.
+            long cycleEpoch = Volatile.Read(ref _productionUiCycleEpoch);
+            InvokeUi(() =>
+            {
+                if (!IsRuntimeContext(RuntimeMode.Production, generation) ||
+                    cycleEpoch != Volatile.Read(ref _productionUiCycleEpoch) ||
+                    CurrentProductionPhase != ProductionPhase.Continuity ||
+                    IsProductRemovalPending ||
+                    IsProbeOwningProductionPresentation())
+                {
+                    return;
+                }
+
+                _presentationCycleStarted = false;
+                SetProductionRuntimeState(
+                    ProductionRuntimeState.WaitingForProduct,
+                    frame.Sequence,
+                    "JBZ_UART_ALL_PAIRS_OPEN");
+                SetProductionPresentationMode(
+                    ProductionPresentationMode.Waiting,
+                    frame.Sequence,
+                    "JBZ_UART_ALL_PAIRS_OPEN");
+                RaiseCenterPresentation();
+                State = "LẮP SẢN PHẨM";
+            });
+        }
+
         QueueContinuityPreviewUi(generation);
         return true;
     }
@@ -3231,18 +3891,30 @@ public sealed class TestViewModel : ObservableObject
         long sequence = Volatile.Read(ref _continuityPreviewUiSequence);
         try
         {
+            bool forceWireTableReload =
+                Volatile.Read(ref _forceProductionWireTableReloadPending) != 0;
+
             if (IsRuntimeContext(RuntimeMode.Production, generation) &&
                 cycleEpoch == Volatile.Read(ref _productionUiCycleEpoch) &&
                 (sequence <= 0 || _engine.LastFrameSequence <= 0 ||
                  sequence >= _engine.LastFrameSequence) &&
                 Volatile.Read(ref _probeSessionActive) == 0 &&
                 !IsIoMappingMode &&
-                _presentationCycleStarted &&
+                (forceWireTableReload || _presentationCycleStarted) &&
                 CurrentProductionPhase is ProductionPhase.Continuity or ProductionPhase.WaitingProductRemoval)
             {
                 // RefreshFaults only synchronizes presentation rows. It does not
                 // evaluate TestEngine state or trigger result/relay side effects.
+                // V5 force path is presentation-only: it rebuilds the OPEN baseline
+                // after UNCONNECT while keeping WaitingForProduct/LẮP SẢN PHẨM.
                 RefreshFaults();
+
+                if (forceWireTableReload)
+                {
+                    Interlocked.Exchange(ref _forceProductionWireTableReloadPending, 0);
+                    AsyncFileLogService.Current.Performance(
+                        $"FAIL_UI_TABLE_RELOAD_COMPLETE seq={sequence} rows={Faults.Count} state={CurrentProductionRuntimeState}");
+                }
             }
         }
         finally
@@ -3328,7 +4000,7 @@ public sealed class TestViewModel : ObservableObject
             if (discardBlocksProduction)
                 return;
 
-            // MainWindow vẫn giữ scan D2XX chạy nền. Dùng snapshot hoàn chỉnh này
+            // MainWindow vẫn giữ scan JBZ UART chạy nền. Dùng snapshot hoàn chỉnh này
             // để khóa chọn mã/START nếu còn bất kỳ tiếp điểm sản phẩm hoặc pin kẹt,
             // nhưng tuyệt đối không đưa frame nền vào fault engine hay relay flow.
             if (mode == RuntimeMode.Background && frame.Mode == BoardScanMode.Production)
@@ -3336,7 +4008,7 @@ public sealed class TestViewModel : ObservableObject
                 // Cửa sổ QUÉT/HỌC MÃ là observer riêng của cùng stream. Không
                 // diễn giải frame chạm GND ở đây lần thứ hai thành các cặp sản phẩm.
                 if (Volatile.Read(ref _topologyLearningActive) == 0)
-                    HandleBackgroundProductRemovalInterlock(frame, generation);
+                    HandleBackgroundIoOccupancyInterlock(frame, generation);
                 return;
             }
 
@@ -3354,7 +4026,7 @@ public sealed class TestViewModel : ObservableObject
                         .OrderBy(value => value)
                         .ToArray();
 
-                    bool hadTrackedContacts = _probeStateTracker.HasTrackedContacts;
+                    bool hadTrackedContacts = SnapshotInlineProbeContacts().Length > 0;
                     bool changed = probeIos.Length > 0
                         ? UpdateInlineProbeContacts(probeIos)
                         : ClearInlineProbeContactsState();
@@ -3426,146 +4098,25 @@ public sealed class TestViewModel : ObservableObject
                         $"generation={frame.ScanGeneration}/{cycleStartGeneration}");
                 }
 
-                // Probe classification phải hoàn tất trước mọi ProductEvidence,
-                // startup product interlock và wiring evaluator. Preview candidate
-                // cùng sequence/generation cũng được quarantine tại đây.
-                bool frameClassifiedAsProbe =
-                    TryDetectInlineProbeContacts(frame, out int[] touchedIos);
-                bool probeTransitionPendingAtFrameStart =
-                    _probeStateTracker.HasTrackedContacts;
-
-                // Không có eligible expected network là LiveTopology mode, không
-                // phụ thuộc tên file/kích thước hay cờ parser của một biến thể THT.
+                // Universal Tester New sends TESTPIN as an independent UART event.
+                // Continuity frames must never be re-classified as a probe frame.
+                // This removes the old binary/fan-in heuristic that could hide a
+                // real WRONG/SHORT pair from the product evaluator.
                 if (IsIoMappingMode)
                 {
-                    ProcessIoMappingFrame(
-                        frame,
-                        generation,
-                        frameClassifiedAsProbe ? touchedIos : Array.Empty<int>());
+                    ProcessIoMappingFrame(frame, generation, Array.Empty<int>());
                     Interlocked.Increment(ref _productionFramesProcessed);
                     LogContinuousScanMetricsIfDue();
                     return;
                 }
 
-                if (!frameClassifiedAsProbe &&
-                    !probeTransitionPendingAtFrameStart &&
-                    !HandleStartupIoInterlock(frame, generation))
+                if (!HandleStartupIoInterlock(frame, generation))
                 {
                     LogContinuousScanMetricsIfDue();
                     return;
                 }
 
-                // Probe là lớp quan sát SONG SONG. Snapshot có chữ ký fan-in
-                // mạnh được cô lập khỏi TestEngine; fault Production đã có
-                // vẫn giữ nguyên. UI chỉ đổi khi tracker đổi state.
-                bool probeChanged;
                 bool preserveProductionFaultsForProbe = false;
-                int[] displayedProbeIos;
-                if (_manualProbeSession.IsActive)
-                {
-                    preserveProductionFaultsForProbe = ProcessManualProbeFrame(frame, generation);
-                }
-                else if (frameClassifiedAsProbe)
-                {
-                    Interlocked.Increment(ref _productionFramesRoutedToProbe);
-                    preserveProductionFaultsForProbe = true;
-                    bool hadTrackedContacts = _probeStateTracker.HasTrackedContacts;
-                    probeChanged = UpdateInlineProbeContacts(touchedIos);
-                    displayedProbeIos = SnapshotInlineProbeContacts();
-                    bool probeTrackingStarted =
-                        !hadTrackedContacts && _probeStateTracker.HasTrackedContacts;
-                    if (probeTrackingStarted && !probeChanged)
-                        SetProbePresentationState(ProbePresentationState.Candidate, touchedIos, frame.Sequence);
-                    if (probeChanged && displayedProbeIos.Length > 0)
-                        SetProbePresentationState(ProbePresentationState.Touch, displayedProbeIos, frame.Sequence);
-                    long probeRevision = (probeTrackingStarted || probeChanged)
-                        ? Interlocked.Increment(ref _inlineProbeUiRevision)
-                        : Volatile.Read(ref _inlineProbeUiRevision);
-
-                    // Nếu một frame đầu của cùng thao tác chạm đã kịp tạo candidate
-                    // WRONG/SHORT trước khi đủ chữ ký classifier, xóa đúng các fault
-                    // liên quan Pin đầu dò. Fault thật ở I/O khác vẫn được giữ nguyên.
-                    _engine.SuppressProbeRelatedWiringFaults(touchedIos);
-                    if (!_engine.HasWiringFault)
-                    {
-                        Interlocked.Exchange(ref _wiringFaultHandlingStarted, 0);
-                        _sound.SetWiringFaultAlarm(false);
-                    }
-
-                    TestEnginePresentationSnapshot probeSnapshot =
-                        _engine.CapturePresentationSnapshot(removal: false);
-                    if (probeChanged)
-                    {
-                        DateTime requestedAt = DateTime.Now;
-                        InvokeUi(() =>
-                        {
-                            if (!IsRuntimeContext(RuntimeMode.Production, generation) ||
-                                Volatile.Read(ref _probeSessionActive) != 0 ||
-                                probeRevision != Volatile.Read(ref _inlineProbeUiRevision))
-                            {
-                                return;
-                            }
-
-                            ApplyProbePresentationSnapshot(
-                                probeSnapshot,
-                                displayedProbeIos,
-                                released: false,
-                                frame.Sequence);
-                            LogProbeLatency(frame, requestedAt, displayedProbeIos);
-                        });
-                    }
-                }
-                else
-                {
-                    // Một frame chuyển tiếp có thể tụt dưới ngưỡng fan-in trước
-                    // khi contact biến mất hoàn toàn. Giữ cách ly cho tới khi
-                    // tracker nhận đủ RELEASE frame, nếu không frame đuôi này sẽ
-                    // lọt sang ProductDetect/WRONG_CANDIDATE.
-                    bool probeTransitionPending = _probeStateTracker.HasTrackedContacts;
-                    bool directConnectionEvidence =
-                        ProbeContactClassifier.HasDirectConnectionEvidence(frame);
-                    bool discardContactClosed =
-                        Volatile.Read(ref _discardContactClosed) != 0 &&
-                        _model is { HasDiscardInterlock: true };
-                    probeChanged = discardContactClosed
-                        ? false
-                        : UpdateInlineProbeContacts(Array.Empty<int>());
-                    // Trace Htdrv: sau khi nhấc đầu dò, dây chập còn lại xuất hiện
-                    // ngay thành cạnh low-fan-in (hit=1). Không được để debounce
-                    // RELEASE nuốt các frame điện thật đầu tiên của thao tác ngắn.
-                    preserveProductionFaultsForProbe =
-                        probeTransitionPending && !directConnectionEvidence;
-                    if (preserveProductionFaultsForProbe)
-                        Interlocked.Increment(ref _productionFramesRoutedToProbe);
-
-                    if (probeChanged)
-                    {
-                        SetProbePresentationState(
-                            ProbePresentationState.Released,
-                            Array.Empty<int>(),
-                            frame.Sequence);
-                        long probeRevision = Interlocked.Increment(ref _inlineProbeUiRevision);
-                        TestEnginePresentationSnapshot probeSnapshot =
-                            _engine.CapturePresentationSnapshot(removal: false);
-                        DateTime requestedAt = DateTime.Now;
-                        InvokeUi(() =>
-                        {
-                            if (!IsRuntimeContext(RuntimeMode.Production, generation) ||
-                                Volatile.Read(ref _probeSessionActive) != 0 ||
-                                probeRevision != Volatile.Read(ref _inlineProbeUiRevision))
-                            {
-                                return;
-                            }
-
-                            ApplyProbePresentationSnapshot(
-                                probeSnapshot,
-                                Array.Empty<int>(),
-                                released: true,
-                                frame.Sequence);
-                            LogProbeLatency(frame, requestedAt, Array.Empty<int>());
-                        });
-                    }
-                }
 
                 long processStarted = Stopwatch.GetTimestamp();
                 // Drop only the presentation overlay immediately before the
@@ -3582,7 +4133,11 @@ public sealed class TestViewModel : ObservableObject
                 {
                     _engine.ClearProbeEvidenceExclusions();
                     continuityPreviewCleared = _engine.ClearContinuityPreview();
-                    engineChanged = _engine.ProcessFrame(frame, false);
+                    // Once a wiring fault is confirmed it must survive subsequent
+                    // clean/partial snapshots until the fault lifecycle owns it.
+                    // Otherwise UI coalescing can miss a short that existed for
+                    // only one scan and the operator sees an apparent "treo".
+                    engineChanged = _engine.ProcessFrame(frame, _engine.HasWiringFault);
                 }
                 Interlocked.Increment(ref _productionFramesProcessed);
                 if (continuityPreviewCleared && !engineChanged)
@@ -3624,52 +4179,85 @@ public sealed class TestViewModel : ObservableObject
         object? sender,
         ProductionProbePreview preview)
     {
-        if (IsDeviceFault ||
-            !_board.IsScanning ||
-            !IsRuntimeMode(RuntimeMode.Production) ||
-            Volatile.Read(ref _probeSessionActive) != 0)
-        {
+        // Universal Tester New owns probe detection. Production never infers
+        // probe contacts from continuity frames; firmware sends TESTPIN ON/OFF.
+        if (IsDeviceFault || !_board.IsScanning || !IsRuntimeMode(RuntimeMode.Production))
             return;
+
+        int[] pins = preview.ActiveIo
+            .Where(io => io > 0)
+            .Distinct()
+            .ToArray();
+
+        long generation = Volatile.Read(ref _runtimeGeneration);
+        if (pins.Length > 0)
+        {
+            // A normal inline probe contact must not become WRONG/SHORT. Remove
+            // unconfirmed candidates touching the probe I/O first. Confirmed
+            // product faults are intentionally never cleared by this operation.
+            _engine.SuppressProbeRelatedWiringFaults(pins);
+
+            // Trace 2026-09-16 shows a real bridge can be emitted by firmware as
+            // two TESTPIN ON contacts instead of :SHORT. When those contacts are
+            // from different expected THT components, treat that electrical bridge
+            // as a real SHORT. Contacts inside the same expected network remain
+            // normal probe presentation and do not affect PASS/FAIL.
+            if (_cycleActive &&
+                CurrentProductionPhase == ProductionPhase.Continuity &&
+                !_waitForProductRelease &&
+                !_waitForFaultProductRemoval &&
+                !IsProductRemovalPending &&
+                IsProductionFaultContext(generation) &&
+                pins.Length >= 2)
+            {
+                _engine.PromoteCrossNetworkTestPinShort(
+                    pins,
+                    preview.Sequence,
+                    Volatile.Read(ref _lastObservedProductionScanGeneration));
+            }
+        }
+        else
+        {
+            _engine.ClearProbeEvidenceExclusions();
         }
 
-        int[] probeIos = preview.ActiveIo
-            .Where(_board.Capacity.ContainsGlobalIo)
-            .Distinct()
-            .Take(2)
-            .OrderBy(value => value)
-            .ToArray();
-        if (probeIos.Length == 0)
-            return;
+        lock (_inlineProbeGate)
+            _inlineProbeContactIos = pins;
+        Volatile.Write(ref _inlineProbeContactIo, pins.FirstOrDefault());
+        Interlocked.Exchange(
+            ref _inlineProbeLastSeenUtcTicks,
+            pins.Length > 0 ? DateTime.UtcNow.Ticks : 0);
+        _sound.SetTestPointContactSound(pins.Length > 0);
 
-        // Preview trước C0 vừa quarantine complete frame sắp tới, vừa sở hữu
-        // presentation ngay. Đây chỉ là UI; Product state/engine/sound giữ nguyên.
-        lock (_probePreviewGate)
-            _pendingProductionProbePreview = preview with { ActiveIo = probeIos };
-        long probeRevision = Interlocked.Increment(ref _inlineProbeUiRevision);
         SetProbePresentationState(
-            ProbePresentationState.Candidate,
-            probeIos,
+            pins.Length > 0 ? ProbePresentationState.Touch : ProbePresentationState.Released,
+            pins,
             preview.Sequence);
-        long generation = Volatile.Read(ref _runtimeGeneration);
+
+        long revision = Interlocked.Increment(ref _inlineProbeUiRevision);
         InvokeUi(() =>
         {
             if (!IsRuntimeContext(RuntimeMode.Production, generation) ||
-                Volatile.Read(ref _probeSessionActive) != 0 ||
-                probeRevision != Volatile.Read(ref _inlineProbeUiRevision))
+                revision != Volatile.Read(ref _inlineProbeUiRevision))
             {
                 return;
             }
 
-            ShowProductionProbePreview(probeIos, preview.Sequence);
+            ProbeContacts.Clear();
+            foreach (FaultRow row in BuildProbeDisplayRows(pins))
+                ProbeContacts.Add(row);
+
+            Raise(nameof(HasInlineProbeContacts));
+            Raise(nameof(ProbeModeText));
+            Raise(nameof(ProbeBarText));
+            Raise(nameof(ProbeBarBackground));
+            RaiseCenterPresentation();
         });
-        AsyncFileLogService.Current.Performance(
-            $"PROBE_PREVIEW candidate={string.Join(",", probeIos.Select(io => $"IO{io}"))} " +
-            $"seq={preview.Sequence} hits={preview.PeakHitCount}/{preview.RequiredHitCount}",
-            AppLogLevel.Diagnostic);
     }
 
     private void ArmFaultProductRemoval(ProductModel model)
     {
+        ResetRemovalUartEvidence("arm-fault-removal");
         _waitForFaultProductRemoval = true;
         Interlocked.Exchange(ref _faultProductRemoved, 0);
         SetProductRemovalPending(true);
@@ -3699,11 +4287,12 @@ public sealed class TestViewModel : ObservableObject
         ProductModel model,
         Window? owner = null)
     {
-        var dialog = new JBZUniversalTester.Views.FaultConfirmationWindow(
+        string instruction = _board is JbzBoardTransportAdapter
+            ? "Bấm XÁC NHẬN để xác nhận hàng lỗi và chuyển sang THÁO SẢN PHẨM."
+            : "Bấm XÁC NHẬN để đóng relay nhả JIG. Khi JIG đã nhả, tháo sản phẩm.";
+        var dialog = new JBZUniveresalLunix.Views.FaultConfirmationWindow(
             faults,
-            model.HasDiscardInterlock
-                ? "Bấm XÁC NHẬN để mở JIG. Sau đó đưa hàng lỗi qua cảm biến thùng NG 1 lần."
-                : "Bấm XÁC NHẬN để mở đầu gá và tháo sản phẩm.",
+            instruction,
             FindPinByIo);
         Window? resolvedOwner = owner ?? ResolveOperatorDialogOwner();
         if (resolvedOwner is not null)
@@ -3711,10 +4300,7 @@ public sealed class TestViewModel : ObservableObject
         dialog.ShowDialog();
     }
 
-    private static string FaultRemovalWaitingText(ProductModel model) =>
-        model.HasDiscardInterlock
-            ? "CHỜ XÁC NHẬN THÙNG LỖI"
-            : "CHỜ THÁO SẢN PHẨM";
+    private static string FaultRemovalWaitingText(ProductModel model) => "THÁO SẢN PHẨM";
 
     private void TryCompleteFaultProductRemoval()
     {
@@ -3727,7 +4313,7 @@ public sealed class TestViewModel : ObservableObject
         bool discardRequired = Volatile.Read(ref _discardRequiredForFault) != 0;
         if (discardRequired && !_discardInterlock.IsCompleted)
         {
-            State = "CHỜ XÁC NHẬN THÙNG LỖI";
+            State = "THÁO SẢN PHẨM";
             return;
         }
 
@@ -3737,13 +4323,20 @@ public sealed class TestViewModel : ObservableObject
             Interlocked.Exchange(ref _removalMonitoringFromMain, 0) != 0;
         _discardInterlock.Arm(Volatile.Read(ref _discardContactClosed) != 0);
         Interlocked.Exchange(ref _discardRequiredForFault, 0);
-        ResetFullCycleAfterProductRemoved();
+        ResetFullCycleAfterProductRemoved(
+            clearWireTableBeforeNextCycle: _board is JbzBoardTransportAdapter);
         if (returnedToMain)
         {
             _cycleActive = false;
             SetProductionPhase(ProductionPhase.WaitingProduct);
             SwitchRuntimeMode(RuntimeMode.Background);
             _engine.SetFrameProcessingEnabled(false);
+        }
+        else if (_board is JbzBoardTransportAdapter)
+        {
+            // :UNCONNECT leaves the firmware idle.  The original JBZ Windows
+            // starts the next cycle only after that clean boundary.
+            _ = ResumeJbzProductionAfterRemovalAsync("FAIL_UNCONNECT");
         }
 
         State = "CHỜ LẮP SẢN PHẨM";
@@ -3796,7 +4389,7 @@ public sealed class TestViewModel : ObservableObject
             AddLog("[DISCARD] Đã nhận hàng qua cảm biến - chờ cảm biến nhả để hoàn tất 1/1.");
             if (_waitForFaultProductRemoval)
             {
-                InvokeUi(() => State = "CHỜ XÁC NHẬN THÙNG LỖI");
+                InvokeUi(() => State = "THÁO SẢN PHẨM");
             }
             else if (mode is RuntimeMode.Production or RuntimeMode.Background)
             {
@@ -3810,7 +4403,7 @@ public sealed class TestViewModel : ObservableObject
             {
                 if (_waitForFaultProductRemoval)
                 {
-                    State = "CHỜ XÁC NHẬN THÙNG LỖI";
+                    State = "THÁO SẢN PHẨM";
                     TryCompleteFaultProductRemoval();
                     if (closed)
                         ShowDiscardContacts(model.DiscardContactIo);
@@ -3839,7 +4432,7 @@ public sealed class TestViewModel : ObservableObject
         ResetEngineWithoutChangedReentry();
         InvokeUi(() =>
         {
-            State = "THÙNG LỖI ĐÃ KHÓA - CHỜ NHẢ CẢM BIẾN";
+            State = "THÁO SẢN PHẨM";
             RefreshFaults();
         });
         AddLog($"[DISCARD] Khóa Production độc lập khi đang ở chế độ {mode}.");
@@ -4020,7 +4613,7 @@ public sealed class TestViewModel : ObservableObject
         });
 
         string components = string.Join(';', topology.Components.Select(component =>
-            $"[{string.Join(',', component.Select(io => $"IO{io}"))}]"));
+            $"[{string.Join(",", component.Select(io => $"IO{io}"))}]"));
         AsyncFileLogService.Current.Performance(
             $"LIVE_TOPOLOGY seq={frame.Sequence} pairs={topology.Pairs.Count} " +
             $"components={components} stable=1 added={addedPairs} removed={removedPairs}");
@@ -4059,7 +4652,9 @@ public sealed class TestViewModel : ObservableObject
             _board.Capacity);
         if (pairs.Count > 0)
         {
-            SetProductRemovalPending(true);
+            // Startup occupancy is NOT the post-result removal state. It only
+            // blocks arming/changing model until the jig is electrically clear.
+            SetProductRemovalPending(false);
             string signature = string.Join('|', pairs.Select(pair => $"{pair.FirstIo}-{pair.SecondIo}"));
             if (!string.Equals(signature, _startupIoWarningSignature, StringComparison.Ordinal))
             {
@@ -4093,33 +4688,13 @@ public sealed class TestViewModel : ObservableObject
 
         _cycleActive = false;
         SetProductionPhase(ProductionPhase.WaitingProduct);
+        SetProductRemovalPending(false);
         SelectedOperationTabIndex = 0;
-        var rows = new List<FaultRow>(pairs.Count);
-        foreach (StartupIoContactPair pair in pairs)
-        {
-            PinRecord? first = FindPinByIo(pair.FirstIo);
+        State = "SẢN PHẨM CÒN TRÊN JIG";
 
-            rows.Add(new FaultRow
-            {
-                Kind = FaultKind.Info,
-                ProductFaultType = ProductFaultType.None,
-                FaultType = "CHỜ THÁO SẢN PHẨM",
-                Io = pair.FirstIo,
-                ActualSourceIo = pair.FirstIo,
-                ActualTargetIo = pair.SecondIo,
-                RelatedIos = [pair.FirstIo, pair.SecondIo],
-                Connector = first?.Connector ?? string.Empty,
-                Pin = first?.PinNumber ?? string.Empty,
-                WireName = first?.WireName ?? string.Empty,
-                Section = first?.Section ?? string.Empty,
-                Color = first?.Color ?? string.Empty,
-                Status = "SẢN PHẨM VẪN ĐANG LẮP — VUI LÒNG THÁO SẢN PHẨM"
-            });
-        }
-
-        SynchronizeFaultRows(rows);
-
-        State = "VUI LÒNG THÁO SẢN PHẨM";
+        // Keep the normal Universal Tester New inverse-open table. Do not create
+        // connected-edge CHỜ THÁO rows at startup.
+        RefreshFaults();
     }
 
     private void CompleteStartupIoInterlock(long generation)
@@ -4163,7 +4738,7 @@ public sealed class TestViewModel : ObservableObject
 
     }
 
-    private void HandleBackgroundProductRemovalInterlock(ScanFrame frame, long generation)
+    private void HandleBackgroundIoOccupancyInterlock(ScanFrame frame, long generation)
     {
         if (!IsRuntimeContext(RuntimeMode.Background, generation) ||
             !frame.Complete ||
@@ -4181,8 +4756,6 @@ public sealed class TestViewModel : ObservableObject
         if (pairs.Count > 0)
         {
             Interlocked.Exchange(ref _startupIoInterlockState, 0);
-            SetProductRemovalPending(true);
-
             string signature = string.Join('|', pairs.Select(pair => $"{pair.FirstIo}-{pair.SecondIo}"));
             if (!string.Equals(signature, _startupIoWarningSignature, StringComparison.Ordinal))
             {
@@ -4192,15 +4765,13 @@ public sealed class TestViewModel : ObservableObject
                     string.Join(", ", pairs.Select(pair => $"IO{pair.FirstIo}<->IO{pair.SecondIo}")));
             }
 
-            State = "VUI LÒNG THÁO SẢN PHẨM";
+            State = "SẢN PHẨM CÒN TRÊN JIG";
             return;
         }
 
-        bool wasBlocked = IsProductRemovalPending ||
-                          Volatile.Read(ref _startupIoInterlockState) != 2;
+        bool wasBlocked = Volatile.Read(ref _startupIoInterlockState) != 2;
         Interlocked.Exchange(ref _startupIoInterlockState, 2);
         _startupIoWarningSignature = string.Empty;
-        SetProductRemovalPending(false);
 
         if (wasBlocked)
         {
@@ -4472,12 +5043,16 @@ public sealed class TestViewModel : ObservableObject
             return "CYCLE_INACTIVE";
         if (!MasterApproved)
             return "MASTER_LOCKED";
-        if (Volatile.Read(ref _probeSessionActive) != 0 || IsProbeRelayInterlockActive())
-            return "PROBE_INTERLOCK";
+
+        // Firmware :OTHER/:SHORT is authoritative. A simultaneous TESTPIN touch
+        // must never hide a real product fault. Probe interlock only blocks the
+        // PASS/relay-PASS path after all confirmed faults have been ruled out.
         if (gate.WrongConfirmedCount > 0)
             return "WRONG_CONFIRMED";
         if (gate.ShortConfirmedCount > 0)
             return "SHORT_CONFIRMED";
+        if (Volatile.Read(ref _probeSessionActive) != 0 || IsProbeRelayInterlockActive())
+            return "PROBE_INTERLOCK";
         if (gate.WrongCandidateCount > 0)
             return "WRONG_CANDIDATE";
         if (gate.ShortCandidateCount > 0)
@@ -4522,163 +5097,18 @@ public sealed class TestViewModel : ObservableObject
                 model.Clip.Branches.Any(branch => branch.TargetIo == io));
     }
 
-    private bool TryDetectInlineProbeContacts(ScanFrame frame, out int[] ios)
-    {
-        ios = Array.Empty<int>();
-        if (frame.Mode != BoardScanMode.Production)
-        {
-            return false;
-        }
-
-        int[] previewIos = TakeProbePreviewForFrame(frame);
-        IReadOnlyList<int> classifiedIos = ProbeContactClassifier
-            .DetectMany(
-                frame,
-                _model,
-                maxContacts: _probeStateTracker.MaxContacts,
-                boardCapacity: _board.Capacity)
-            .Select(detection => detection.Io)
-            .ToArray();
-        int[] observedIos = previewIos
-            .Concat(classifiedIos)
-            .Where(_board.Capacity.ContainsGlobalIo)
-            .Distinct()
-            .OrderBy(value => value)
-            .ToArray();
-
-        if (observedIos.Length > 0)
-        {
-            ios = observedIos
-                .Where(value => value > 0)
-                .Distinct()
-                .OrderBy(value => value)
-                .ToArray();
-
-            if (ios.Length > 0)
-            {
-                Interlocked.Exchange(ref _inlineProbeLastSeenUtcTicks, DateTime.UtcNow.Ticks);
-                return true;
-            }
-        }
-
-        // V12.9.2: không giữ contact cũ bằng TTL/quarantine. Frame hiện tại
-        // không còn chữ ký Probe thì RELEASE được áp dụng ngay ở OnBoardFrameReceived.
-        // Production có thể giữ stable-frame riêng trong TestEngine, nhưng Probe UI
-        // không được chờ RequiredStableFrames hoặc timer 500-2000 ms.
-        return false;
-    }
-
-    private int[] TakeProbePreviewForFrame(ScanFrame frame)
-    {
-        lock (_probePreviewGate)
-        {
-            ProductionProbePreview? preview = _pendingProductionProbePreview;
-            if (preview is null)
-                return [];
-
-            bool sameGeneration = preview.ScanGeneration == 0 ||
-                                  frame.ScanGeneration == 0 ||
-                                  preview.ScanGeneration == frame.ScanGeneration;
-            if (sameGeneration && preview.Sequence == frame.Sequence)
-            {
-                _pendingProductionProbePreview = null;
-                return preview.ActiveIo.ToArray();
-            }
-
-            if (!sameGeneration || frame.Sequence >= preview.Sequence)
-                _pendingProductionProbePreview = null;
-            return [];
-        }
-    }
-
-    private bool ProcessManualProbeFrame(ScanFrame frame, long generation)
-    {
-        bool hadTransientEvidence = _manualProbeSession.HasTransientContactEvidence;
-        IReadOnlyList<ProbeContactClassifier.Detection> detections =
-            ProbeContactClassifier.DetectMany(
-                frame,
-                _model,
-                maxContacts: 4,
-                boardCapacity: _board.Capacity);
-
-        ManualProbeUpdate update = _manualProbeSession.Update(
-            frame.Sequence,
-            detections,
-            _model,
-            _board.Capacity);
-
-        if (update.Transition == ManualProbeTransition.None)
-        {
-            return detections.Count > 0 ||
-                   hadTransientEvidence ||
-                   _manualProbeSession.HasTransientContactEvidence;
-        }
-
-        AsyncFileLogService.Current.Performance(
-            $"MANUAL_PROBE transition={update.Transition} phase={update.Phase} " +
-            $"tp=IO{update.ProbeIo} contact=IO{update.ContactIo} " +
-            $"candidate=IO{update.CandidateIo} stable={update.StableFrames} seq={frame.Sequence}");
-
-        if (update.Transition == ManualProbeTransition.PointerConfirmed)
-        {
-            AddLog($"TEST POINTER: đã khóa IO{update.ProbeIo}; bắt đầu CONNECTOR CHECK.");
-            return true;
-        }
-
-        if (update.Transition is not (ManualProbeTransition.ConnectorChanged or
-            ManualProbeTransition.ConnectorReleased))
-        {
-            return detections.Count > 0;
-        }
-
-        int contactIo = update.ContactIo;
-        long probeRevision = Interlocked.Increment(ref _inlineProbeUiRevision);
-        lock (_inlineProbeGate)
-        {
-            _inlineProbeContactIos = contactIo > 0 ? [contactIo] : Array.Empty<int>();
-        }
-        Volatile.Write(ref _inlineProbeContactIo, contactIo);
-        _sound.SetTestPointContactSound(contactIo > 0);
-        if (contactIo > 0)
-            Interlocked.Exchange(ref _inlineProbeLastSeenUtcTicks, DateTime.UtcNow.Ticks);
-
-        InvokeUi(() =>
-        {
-            if (!IsRuntimeContext(RuntimeMode.Production, generation) ||
-                !_manualProbeSession.IsActive ||
-                probeRevision != Volatile.Read(ref _inlineProbeUiRevision))
-            {
-                return;
-            }
-
-            if (contactIo > 0)
-                ShowInlineProbeContacts([contactIo]);
-            else
-                ClearInlineProbeDisplay();
-        });
-
-        return detections.Count > 0;
-    }
-
-    private void StartManualProbeSession(string reason)
+    private void StartProbePresentation(string reason)
     {
         ClearInlineProbeContactsState(clearLastSeen: true);
         InvokeUi(ClearInlineProbeDisplay);
-        ManualProbeUpdate update = _manualProbeSession.Start();
         AsyncFileLogService.Current.Performance(
-            $"MANUAL_PROBE transition={update.Transition} phase={update.Phase} reason={reason}");
+            $"MANUAL_PROBE source=TESTPIN reason={reason}");
     }
 
-    private void ResetManualProbeSession(string reason)
+    private void ResetProbePresentation(string reason)
     {
-        ManualProbeUpdate update = _manualProbeSession.Reset();
         ClearInlineProbeContactsState(clearLastSeen: true);
         InvokeUi(ClearInlineProbeDisplay);
-        if (update.Transition != ManualProbeTransition.None)
-        {
-            AsyncFileLogService.Current.Performance(
-                $"MANUAL_PROBE transition={update.Transition} phase={update.Phase} reason={reason}");
-        }
     }
 
     private int[] SnapshotInlineProbeContacts()
@@ -4689,22 +5119,21 @@ public sealed class TestViewModel : ObservableObject
 
     private bool UpdateInlineProbeContacts(IReadOnlyList<int> ios)
     {
-        BoardCapacity capacity = _board.Capacity;
         int[] normalized = ios
-            .Where(value => capacity.ContainsGlobalIo(value))
+            .Where(value => value > 0)
             .Distinct()
-            .OrderBy(value => value)
             .ToArray();
 
-        bool changed = _probeStateTracker.Update(normalized);
-        int[] active = _probeStateTracker.ActiveIos.ToArray();
+        int[] previous;
         lock (_inlineProbeGate)
         {
-            _inlineProbeContactIos = active;
+            previous = _inlineProbeContactIos;
+            _inlineProbeContactIos = normalized;
         }
 
-        Volatile.Write(ref _inlineProbeContactIo, active.FirstOrDefault());
-        if (active.Length > 0)
+        bool changed = !previous.SequenceEqual(normalized);
+        Volatile.Write(ref _inlineProbeContactIo, normalized.FirstOrDefault());
+        if (normalized.Length > 0)
         {
             Interlocked.Exchange(ref _inlineProbeLastSeenUtcTicks, DateTime.UtcNow.Ticks);
             if (changed)
@@ -4714,24 +5143,24 @@ public sealed class TestViewModel : ObservableObject
         {
             _sound.SetTestPointContactSound(false);
         }
+
         return changed;
     }
 
     private bool ClearInlineProbeContactsState(bool clearLastSeen = false)
     {
-        bool changed = _probeStateTracker.Clear();
-        if (clearLastSeen)
-            Interlocked.Increment(ref _inlineProbeUiRevision);
-        _sound.SetTestPointContactSound(false);
+        bool changed;
         lock (_inlineProbeGate)
         {
+            changed = _inlineProbeContactIos.Length > 0;
             _inlineProbeContactIos = Array.Empty<int>();
         }
 
-        Volatile.Write(ref _inlineProbeContactIo, 0);
+        if (clearLastSeen)
+            Interlocked.Increment(ref _inlineProbeUiRevision);
 
-        // RELEASE xóa UI ngay; lastSeen chỉ được giữ cho interlock relay 40 ms
-        // chống rung rất ngắn. Reset timestamp hoàn toàn khi đổi phiên/chu kỳ.
+        _sound.SetTestPointContactSound(false);
+        Volatile.Write(ref _inlineProbeContactIo, 0);
         if (clearLastSeen)
             Interlocked.Exchange(ref _inlineProbeLastSeenUtcTicks, 0);
 
@@ -4747,10 +5176,13 @@ public sealed class TestViewModel : ObservableObject
         IReadOnlyList<FaultRow> desiredRows;
         if (!released && probeIos.Count > 0)
         {
-            desiredRows = BuildProbeDisplayRows(probeIos);
+            // Probe has its own compact table. Keep the production wire table
+            // untouched so every still-open network remains visible underneath.
+            IReadOnlyList<FaultRow> probeRows = BuildProbeDisplayRows(probeIos);
             ProbeContacts.Clear();
-            foreach (FaultRow row in desiredRows)
+            foreach (FaultRow row in probeRows)
                 ProbeContacts.Add(row);
+            desiredRows = productSnapshot.Rows;
             SetProductionPresentationMode(
                 ProductionPresentationMode.Probe,
                 frameSequence,
@@ -4773,9 +5205,11 @@ public sealed class TestViewModel : ObservableObject
                 _presentationCycleStarted = presentationCycleStarted;
                 RaiseCenterPresentation();
             }
-            desiredRows = waitingForProduct
-                ? Array.Empty<FaultRow>()
-                : productSnapshot.Rows;
+            // New-board presentation is inverse of the old-board screen:
+            // pending wire rows remain visible even while WaitingForProduct.
+            // TESTPIN is rendered in ProbeContacts above the wire table and must
+            // never replace/hide the production wiring rows.
+            desiredRows = productSnapshot.Rows;
 
             if (waitingForProduct &&
                 CurrentProductionPhase == ProductionPhase.Continuity)
@@ -4882,8 +5316,7 @@ public sealed class TestViewModel : ObservableObject
         // Htdrv hiển thị đúng row TP của chính I/O đang chạm, không bung các
         // endpoint còn lại cùng network. Giữ đủ duplicate mapping nếu một
         // Global IO được khai báo tại nhiều connector/pin trong THT.
-        PinRecord[] pins = model.Pins
-            .Where(pin => pin.IoNumber == io)
+        PinRecord[] pins = _pinsByIoLookup[io]
             .Distinct()
             .OrderBy(pin => pin.OriginalOrder > 0 ? pin.OriginalOrder : int.MaxValue)
             .ThenBy(pin => pin.Connector, StringComparer.OrdinalIgnoreCase)
@@ -4971,9 +5404,9 @@ public sealed class TestViewModel : ObservableObject
         ProbeContacts.Clear();
         foreach (FaultRow row in rows)
             ProbeContacts.Add(row);
-        // Probe Pin luôn hiển thị độc lập với latch sản phẩm. Nó không bật
-        // production cycle và không đưa metadata dây vào fault presentation.
-        SynchronizeInlineProbeFaultRows(rows);
+        // Probe Pin hiển thị độc lập ở ProbeContacts. Production wire rows
+        // remain visible and continue to follow OPEN/OTHER/SHORT.
+        RefreshFaults();
 
         UpdateProbeCardActivity(ios);
         Raise(nameof(HasInlineProbeContacts));
@@ -4996,7 +5429,7 @@ public sealed class TestViewModel : ObservableObject
             ProductionPresentationMode.Probe,
             frameSequence,
             "PROBE_PREVIEW");
-        SynchronizeFaultRows(rows);
+        RefreshFaults();
         UpdateProbeCardActivity(ios);
         Raise(nameof(HasInlineProbeContacts));
         Raise(nameof(ProbeModeText));
@@ -5010,24 +5443,13 @@ public sealed class TestViewModel : ObservableObject
         _sound.SetTestPointContactSound(false);
         if (ProbeContacts.Count > 0)
             ProbeContacts.Clear();
-        SynchronizeFaultRows(Faults.Where(row => row.Kind != FaultKind.Probe).ToArray());
+        RefreshFaults();
 
         UpdateProbeCardActivity(Array.Empty<int>());
         Raise(nameof(HasInlineProbeContacts));
         Raise(nameof(ProbeModeText));
         Raise(nameof(ProbeBarText));
         Raise(nameof(ProbeBarBackground));
-    }
-
-    private void SynchronizeInlineProbeFaultRows(IReadOnlyList<FaultRow> rows)
-    {
-        SynchronizeFaultRows(rows);
-        RaiseTestStatistics();
-    }
-
-    private void RemoveInlineProbeFaultRows()
-    {
-        SynchronizeFaultRows(Faults.Where(row => row.Kind != FaultKind.Probe).ToArray());
     }
 
     private void RebuildActiveCards()
@@ -5093,18 +5515,20 @@ public sealed class TestViewModel : ObservableObject
             if (_board.IsConnected)
             {
                 BoardConnectionMessage = string.Empty;
+                BoardFirmwareName = _board.BoardFirmwareIdentity;
                 HardwareStatus = "Bo: đã kết nối";
                 State = ReadyStateForCurrentModel();
                 Raise(nameof(IsBoardConnected));
+                Raise(nameof(IsBoardIdentityVerified));
                 await EnsureContinuousProductionScanAsync();
                 return;
             }
 
             State = "ĐANG KẾT NỐI BO";
-            StartupPerformanceTrace.Mark("T4 D2XX open started");
+            StartupPerformanceTrace.Mark("T4 JBZ UART open started");
 
             var info = await _board.ConnectAsync(_lifetimeCts.Token);
-            StartupPerformanceTrace.Mark("T5 D2XX open completed");
+            StartupPerformanceTrace.Mark("T5 JBZ UART open completed");
             StartupPerformanceTrace.Mark("T6 Handshake completed");
 
             if (_lifetimeCts.IsCancellationRequested)
@@ -5119,6 +5543,7 @@ public sealed class TestViewModel : ObservableObject
             }
 
             BoardConnectionMessage = string.Empty;
+            BoardFirmwareName = info.Description.Trim();
             HardwareStatus =
                 $"Bo: {info.Description} [{info.SerialNumber}] - ĐÃ KẾT NỐI";
 
@@ -5127,6 +5552,7 @@ public sealed class TestViewModel : ObservableObject
 
             State = ReadyStateForCurrentModel();
             Raise(nameof(IsBoardConnected));
+            Raise(nameof(IsBoardIdentityVerified));
 
             // Kết nối thành công là START SCAN ngay. Không chờ mở TestView.
             await EnsureContinuousProductionScanAsync();
@@ -5135,6 +5561,27 @@ public sealed class TestViewModel : ObservableObject
         catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
         {
             // Ứng dụng đang thoát; không cập nhật UI và không báo lỗi kết nối.
+            return;
+        }
+        catch (IOException ex) when (
+            ex.Message.Contains("JBZ_RECOVERY_REQUIRED", StringComparison.OrdinalIgnoreCase))
+        {
+            // V8: Windows still exposes the previously validated board COM, but
+            // application firmware is not answering *IDN?. This is a recoverable
+            // maintenance state, not a production hardware fault. Do not lock the
+            // whole application; keep Board Maintenance available for a recovery flash.
+            BoardFirmwareName = string.Empty;
+            HardwareStatus = "Bo: thấy cổng COM nhưng firmware chưa phản hồi";
+            BoardConnectionMessage =
+                "Đã thấy cổng BO nhưng không nhận được *IDN?. Có thể BO đang kẹt sau reset hoặc ở BootLoader. " +
+                "Hãy dùng Bảo trì BO để phục hồi firmware, hoặc thử KẾT NỐI BO lại.";
+            State = "BO CẦN PHỤC HỒI";
+            AddLog($"BOARD_STARTUP_RECOVERABLE {ex.Message}");
+            Raise(nameof(IsBoardConnected));
+            Raise(nameof(IsBoardIdentityVerified));
+
+            lock (_initializationGate)
+                _hardwareInitializationTask = null;
             return;
         }
         catch (Exception ex)
@@ -5185,11 +5632,17 @@ public sealed class TestViewModel : ObservableObject
     /// thể quay về MainWindow rồi test lại ngay. Cửa sổ phải await hàm này
     /// trước khi đóng để không để worker scan chạy ngầm.
     /// </summary>
-    public Task StopViewAsync() => StopTestAsync();
+    public async Task StopViewAsync()
+    {
+        if (!_board.ProducesPassiveScanFrames)
+            await _board.ResetClearAsync();
+        InvokeUi(ClearInlineProbeDisplay);
+        await StopTestAsync();
+    }
 
     /// <summary>
     /// Shutdown cuối cùng của ứng dụng. Idempotent: chỉ chạy một lần.
-    /// Dừng scan -> relay OFF -> reset -> disconnect FTDI -> đóng VISA ->
+    /// Dừng scan -> relay OFF -> reset -> disconnect JBZ UART -> đóng VISA ->
     /// bỏ toàn bộ event subscription.
     /// </summary>
     public async Task ShutdownAsync()
@@ -5202,7 +5655,7 @@ public sealed class TestViewModel : ObservableObject
         Interlocked.Increment(ref _statisticsLoadGeneration);
         _lifetimeCts.Cancel();
         CancelCycleOperations();
-        ResetManualProbeSession("shutdown");
+        ResetProbePresentation("shutdown");
 
         if (_hardwareMonitorTask is not null)
         {
@@ -5347,7 +5800,7 @@ public sealed class TestViewModel : ObservableObject
                 InvokeUi(UpdateCardScanningState);
             }
 
-            StartManualProbeSession("manual-start");
+            StartProbePresentation("manual-start");
             AddLog("TESTPIN/Probe observer ON - dùng stream Production, không reset chu kỳ/engine/relay.");
         }
         catch (Exception ex)
@@ -5364,7 +5817,7 @@ public sealed class TestViewModel : ObservableObject
         await EnsureContinuousProductionScanAsync();
         if (IsDeviceFault)
             return;
-        ResetManualProbeSession("manual-stop");
+        ResetProbePresentation("manual-stop");
         ClearInlineProbeContactsState(clearLastSeen: true);
         InvokeUi(ClearInlineProbeDisplay);
         AddLog("TESTPIN/Probe session OFF; stream Production vẫn tiếp tục.");
@@ -5444,9 +5897,7 @@ public sealed class TestViewModel : ObservableObject
         if (IsProductRemovalPending && !resumeCurrentStartupModel)
         {
             bool discardLocked = Volatile.Read(ref _discardStandaloneLocked) != 0;
-            State = discardLocked
-                ? "THÙNG LỖI ĐÃ KHÓA - CHỜ NHẢ CẢM BIẾN"
-                : "VUI LÒNG THÁO SẢN PHẨM";
+            State = "THÁO SẢN PHẨM";
             AddLog(discardLocked
                 ? "BLOCKED: _DISCARD đã nhận hàng; chờ cảm biến nhả để hoàn tất xác nhận 1/1."
                 : "BLOCKED: chưa thể bắt đầu kiểm tra vì sản phẩm chưa được tháo hoàn toàn khỏi JIG.");
@@ -5478,7 +5929,7 @@ public sealed class TestViewModel : ObservableObject
         if (_model is null)
         {
             throw new InvalidOperationException(
-                "Chưa tải model .tht.");
+                "Chưa tải model .model.");
         }
 
         bool ioMappingMode = IsIoMappingMode;
@@ -5500,7 +5951,7 @@ public sealed class TestViewModel : ObservableObject
         // ARM engine để callback Probe/Background cũ không thể lọt sang test.
         Interlocked.Exchange(ref _probeSessionActive, 0);
         SwitchRuntimeMode(RuntimeMode.Production);
-        ResetManualProbeSession("new-test");
+        ResetProbePresentation("new-test");
         AsyncFileLogService.Current.Performance("TEST_ARM_BEGIN");
 
         // Chu kỳ mới có CancellationToken riêng. Khi đóng TestView/thoát app,
@@ -5541,8 +5992,6 @@ public sealed class TestViewModel : ObservableObject
         _lastProductEvidenceSignature = string.Empty;
         _lastIoMappingSignature = string.Empty;
         _lastLiveTopologySnapshot = LiveTopologySnapshot.Empty();
-        lock (_probePreviewGate)
-            _pendingProductionProbePreview = null;
         Interlocked.Exchange(ref _probePresentationState, (int)ProbePresentationState.Inactive);
         Interlocked.Exchange(ref _productionPresentationMode, (int)ProductionPresentationMode.Waiting);
         Interlocked.Increment(ref _ioMappingUiRevision);
@@ -5591,8 +6040,18 @@ public sealed class TestViewModel : ObservableObject
         AsyncFileLogService.Current.Performance(
             $"FRESH_FRAME_GATE_ARMED active={cycleStartSequence > 0} cycleStartSeq={cycleStartSequence} " +
             $"generation={cycleStartGeneration}");
-        AddLog("Tái sử dụng scan nền Production đang chạy; ARM không gửi lệnh phần cứng.");
+        AddLog("Tái sử dụng scan nền Production đang chạy; không gửi :START lại.");
         InvokeUi(UpdateCardScanningState);
+
+        // Universal Tester New production protocol is START-driven. The proven
+        // JBZ_Windows trace has no TX :TESTON command: after START/MEASURE/MAXEXT
+        // the firmware owns CLEAR/OPEN/OTHER/SHORT/CIRCUIT streaming. Sending
+        // TESTON here can force an immediate evaluation of the all-open baseline
+        // (CIRCUIT,1) before the operator installs the product, which leaves the
+        // UI at LẮP SẢN PHẨM with no useful assembly updates. Reuse the running
+        // START session and only arm the software production cycle here.
+        if (!ioMappingMode)
+            AddLog("JBZ UART: ARM Production trên phiên :START đang chạy; không gửi :TESTON.");
 
         if (ioMappingMode)
         {
@@ -5632,7 +6091,7 @@ public sealed class TestViewModel : ObservableObject
 
     private async Task StopTestAsync()
     {
-        ResetManualProbeSession("leave-test-view");
+        ResetProbePresentation("leave-test-view");
         if (Volatile.Read(ref _discardStandaloneLocked) != 0)
         {
             CancelCycleOperations();
@@ -5641,7 +6100,7 @@ public sealed class TestViewModel : ObservableObject
             SetProductionPhase(ProductionPhase.WaitingProductRemoval);
             SwitchRuntimeMode(RuntimeMode.Background);
             _engine.SetFrameProcessingEnabled(false);
-            State = "THÙNG LỖI ĐÃ KHÓA - CHỜ NHẢ CẢM BIẾN";
+            State = "THÁO SẢN PHẨM";
 
             if (_board.IsConnected && !_board.IsScanning)
                 await EnsureContinuousProductionScanAsync();
@@ -5650,19 +6109,43 @@ public sealed class TestViewModel : ObservableObject
             return;
         }
 
-        // Nếu người vận hành quay về Main khi sản phẩm đang lắp dở, chuyển sang
-        // cùng removal gate với PASS/FAIL. Reset snapshot để frame mới xác nhận
-        // việc tháo hoàn toàn; không suy diễn một cạnh vừa mất là ProductRemoved.
-        if (!IsProductRemovalPending && _engine.HasProductActivity)
+        // Lắp dở rồi rời TestView không phải post-result removal. Không dùng
+        // ProductRemovalPending/WaitingProductRemoval cho trường hợp này. Scan nền
+        // vẫn có thể dùng startup IO occupancy để khóa đổi mã mà không hiển thị
+        // trạng thái THÁO SẢN PHẨM.
+        bool committedResultRemoval =
+            _waitForProductRelease ||
+            _waitForFaultProductRemoval ||
+            Volatile.Read(ref _resultRecordedThisCycle) != 0;
+
+        if (MasterApproved && !committedResultRemoval && _engine.HasProductActivity)
         {
-            ResetEngineWithoutChangedReentry();
-            _engine.SetFrameProcessingEnabled(true);
-            _waitForProductRelease = true;
-            SetProductRemovalPending(true);
+            CancelCycleOperations();
+            _cycleActive = false;
+            _waitForProductRelease = false;
+            _waitForFaultProductRemoval = false;
+            Interlocked.Exchange(ref _removalMonitoringFromMain, 0);
+            SetProductRemovalPending(false);
+            SetProductionPhase(ProductionPhase.WaitingProduct);
+            SwitchRuntimeMode(RuntimeMode.Background);
+            _engine.SetFrameProcessingEnabled(false);
+            _engine.Reset();
+            Interlocked.Exchange(ref _postContinuityStarted, 0);
+            Interlocked.Exchange(ref _wiringFaultHandlingStarted, 0);
+            _sound.SetTestPointContactSound(false);
+            _sound.SetWiringFaultAlarm(false);
+            State = "SẢN PHẨM CÒN TRÊN JIG";
+
+            if (_board.IsConnected && !_board.IsScanning)
+                await EnsureContinuousProductionScanAsync();
+
+            AddLog("Rời TestView khi đang lắp dở: giữ occupancy interlock, không ARM trạng thái tháo sản phẩm.");
+            return;
         }
 
-        // Khóa/cancel workflow TRƯỚC khi gửi lệnh board. Mọi trạng thái đang
-        // chờ tháo phải tiếp tục được giám sát sau khi TestWindow đã đóng.
+        // Chỉ kết quả PASS/FAIL/Master đã ARM removal mới đi vào post-result
+        // removal gate. Mọi trạng thái chờ tháo này tiếp tục được giám sát sau
+        // khi TestWindow đóng.
         if (IsProductRemovalPending)
         {
             if (!_waitForProductRelease && !_waitForFaultProductRemoval)
@@ -5681,7 +6164,7 @@ public sealed class TestViewModel : ObservableObject
             Interlocked.Exchange(ref _wiringFaultHandlingStarted, 0);
             _sound.SetTestPointContactSound(false);
             _sound.SetWiringFaultAlarm(false);
-            State = "VUI LÒNG THÁO SẢN PHẨM";
+            State = "THÁO SẢN PHẨM";
 
             if (_board.IsConnected && !_board.IsScanning)
                 await EnsureContinuousProductionScanAsync();
@@ -5743,8 +6226,8 @@ public sealed class TestViewModel : ObservableObject
 
     private async Task HandleWiringFaultAsync(long generation)
     {
-        // Callback production cũ có thể đã được schedule ngay trước khi mở
-        // TestPin. Probe mode tuyệt đối không được hiện popup chập/đấu sai.
+        // Chỉ Probe session chẩn đoán explicit mới chặn callback Production.
+        // TESTPIN inline của Universal Tester New không được chặn :SHORT/:OTHER.
         if (!IsProductionFaultContext(generation))
         {
             AbortProductionFaultForProbe();
@@ -5770,8 +6253,20 @@ public sealed class TestViewModel : ObservableObject
         {
             if (_board.IsConnected)
             {
-                await StopScanIntentionallyAsync("WiringFaultConfirmation");
-                await _board.AllRelaysOffAsync();
+                if (_board is JbzBoardTransportAdapter)
+                {
+                    // V4 / JBZ_Windows reference: a Production FAIL must not
+                    // send :STOP and must not touch OUTPUTTEST at all.  The
+                    // original reject path only preserves the firmware result
+                    // state until the operator confirms, then sends UNCONNECT.
+                    _scanSupervisor.Suspend("WiringFaultConfirmation");
+                    AddLog("JBZ UART FAIL V4: giữ phiên firmware; không gửi :STOP và không gửi :OUTPUTTEST trước UNCONNECT.");
+                }
+                else
+                {
+                    await StopScanIntentionallyAsync("WiringFaultConfirmation");
+                    await _board.AllRelaysOffAsync();
+                }
             }
         }
         catch (Exception ex)
@@ -5780,9 +6275,8 @@ public sealed class TestViewModel : ObservableObject
             return;
         }
 
-        // TestPin có thể được mở trong lúc handler production đang await
-        // StopScan. Phải kiểm tra LẠI sau await; nếu không callback cũ vẫn
-        // có thể bật popup chập dù transport đã chuyển sang Probe.
+        // Kiểm tra lại sau await để chặn đúng trường hợp transport thực sự
+        // đã chuyển sang Probe session chẩn đoán. TESTPIN inline vẫn là Production.
         if (!IsProductionFaultContext(generation))
         {
             AbortProductionFaultForProbe();
@@ -5837,8 +6331,8 @@ public sealed class TestViewModel : ObservableObject
             string.Join(", ", dialogFaults.Select(fault =>
                 $"{fault.Code} {fault.ExpectedText} {fault.ActualText}".Trim())));
 
-        // Chốt cuối ngay trước UI modal. Từ thời điểm Probe bật, tuyệt đối
-        // không được phép hiện popup production.
+        // Chốt cuối ngay trước UI modal. Chỉ Probe session chẩn đoán explicit
+        // mới được chặn popup; TESTPIN inline không làm mất NG Production.
         if (!IsProductionFaultContext(generation))
         {
             AbortProductionFaultForProbe();
@@ -5869,23 +6363,35 @@ public sealed class TestViewModel : ObservableObject
         ShowFaultConfirmationDialog(dialogFaults, cycleModel);
         SelectedOperationTabIndex = 0;
 
-        // Sau xác nhận FAIL chỉ relay đã được người cài đặt thử và chọn là
-        // relay mở JIG được pulse. Không chạy chuỗi MARKING của PASS.
+        // V4: JBZ_Windows reject path has no OUTPUTTEST/relay operation.
+        // Other transports keep their existing eject behavior.
         _sound.SetWiringFaultAlarm(false);
 
         try
         {
-            State = "ĐANG MỞ JIG HÀNG LỖI";
-            await _engine.EjectFaultProductAsync();
-            AddLog($"Lỗi đã xác nhận: {FaultJigRelayText()} pulse đúng 1 lần rồi OFF; không chạy MARKING PASS.");
+            if (_board is JbzBoardTransportAdapter)
+            {
+                AddLog("JBZ UART FAIL V4: XÁC NHẬN lỗi - không chạy relay; chuyển trực tiếp sang UNCONNECT.");
+                ArmFaultProductRemoval(cycleModel);
+                State = "THÁO SẢN PHẨM";
+                await StartProductRemovalMonitorAsync(
+                    CurrentCycleToken(),
+                    "FAIL_CONFIRM");
+                State = "THÁO SẢN PHẨM";
+            }
+            else
+            {
+                State = "ĐANG MỞ JIG HÀNG LỖI";
+                await _engine.EjectFaultProductAsync();
+                AddLog($"Lỗi đã xác nhận: {FaultJigRelayText()} pulse đúng 1 lần rồi OFF; không chạy MARKING PASS.");
 
-            ArmFaultProductRemoval(cycleModel);
-            await StartProductionScanAndVerifyFrameAsync(
-                CurrentCycleToken(),
-                "FAIL_CONFIRM_RELAY");
-            State = _waitForFaultProductRemoval
-                ? FaultRemovalWaitingText(cycleModel)
-                : "LẮP SẢN PHẨM";
+                ArmFaultProductRemoval(cycleModel);
+                State = "THÁO SẢN PHẨM";
+                await StartProductRemovalMonitorAsync(
+                    CurrentCycleToken(),
+                    "FAIL_CONFIRM");
+                State = "THÁO SẢN PHẨM";
+            }
         }
         catch (Exception ex)
         {
@@ -7359,7 +7865,7 @@ public sealed class TestViewModel : ObservableObject
         if (_board.IsConnected && _board.IsScanning)
             await StopScanIntentionallyAsync("WaterProof", ct);
 
-        AddLog("[WATERPROOF] D2XX scan đã dừng trong công đoạn Leak; giữ snapshot continuity hiện tại.");
+        AddLog("[WATERPROOF] JBZ UART scan đã dừng trong công đoạn Leak; giữ snapshot continuity hiện tại.");
     }
 
     private async Task PauseProductionScanForFinalPassAsync(CancellationToken ct)
@@ -7367,11 +7873,12 @@ public sealed class TestViewModel : ObservableObject
         if (_board.IsConnected && _board.IsScanning)
             await StopScanIntentionallyAsync("PassRelaySequence", ct);
 
-        AddLog("[PASS] D2XX scan đã dừng trước chuỗi PASS; khóa snapshot continuity đã xác nhận.");
+        AddLog("[PASS] JBZ UART scan đã dừng trước chuỗi PASS; khóa snapshot continuity đã xác nhận.");
     }
 
     private void ArmPassProductRemovalWait()
     {
+        ResetRemovalUartEvidence("arm-pass-removal");
         // Kết quả PASS đã commit là bất biến. Chỉ reset snapshot PC và ARM
         // ProductRemoved; không gửi RESET_CLEAR lần hai sau chuỗi relay PASS.
         ResetEngineWithoutChangedReentry();
@@ -7382,11 +7889,11 @@ public sealed class TestViewModel : ObservableObject
         Interlocked.Exchange(ref _removalMonitoringFromMain, 0);
         _cycleActive = true;
         SetProductionPhase(ProductionPhase.WaitingProductRemoval);
-        StartManualProbeSession("post-pass");
+        StartProbePresentation("post-pass");
         // Không ẩn bảng kết quả ngay khi PASS. Người vận hành phải còn nhìn
-        // thấy kết quả cho tới khi D2XX xác nhận toàn bộ continuity đã mất.
+        // thấy kết quả cho tới khi bo JBZ UART xác nhận toàn bộ continuity đã mất.
         // ResetFullCycleAfterProductRemoved() sẽ chuyển tab về 0.
-        State = "PASS - THÁO SẢN PHẨM";
+        State = "THÁO SẢN PHẨM";
     }
 
     private bool TryValidateWaterProofConnectorGate(
@@ -7643,7 +8150,7 @@ public sealed class TestViewModel : ObservableObject
                 }
                 catch (Exception scanEx)
                 {
-                    AddLog($"[WATERPROOF-RETEST] Không thể restart D2XX chờ tháo/lắp: {scanEx.Message}");
+                    AddLog($"[WATERPROOF-RETEST] Không thể restart JBZ UART chờ tháo/lắp: {scanEx.Message}");
                 }
             }
         }
@@ -7895,13 +8402,11 @@ public sealed class TestViewModel : ObservableObject
             State = "ĐANG MỞ JIG HÀNG LỖI";
             await _engine.EjectFaultProductAsync();
             ArmWaterProofFaultRemovalWait();
-            await StartProductionScanAndVerifyFrameAsync(
+            State = "THÁO SẢN PHẨM";
+            await StartProductRemovalMonitorAsync(
                 CurrentCycleToken(),
-                "WATERPROOF_FAIL_CONFIRM_RELAY");
-            if (_waitForFaultProductRemoval)
-                State = FaultRemovalWaitingText(cycleModel);
-            else
-                AddLog("Sản phẩm Leak FAIL đã tháo hoàn toàn; chu kỳ mới đã ARM.");
+                "WATERPROOF_FAIL_CONFIRM");
+            State = "THÁO SẢN PHẨM";
         }
         catch (Exception ex)
         {
@@ -7967,7 +8472,7 @@ public sealed class TestViewModel : ObservableObject
                 if (!_board.IsConnected)
                 {
                     EnterDeviceFault(
-                        new IOException("Bo D2XX mất kết nối trong công đoạn Leak.", ex),
+                        new IOException("Bo JBZ UART mất kết nối trong công đoạn Leak.", ex),
                         "WaterProof.BoardDisconnected");
                     return false;
                 }
@@ -7980,7 +8485,7 @@ public sealed class TestViewModel : ObservableObject
                 try
                 {
                     await _waterProof.DisconnectAsync();
-                    AddLog("[WATERPROOF] Leak COM đã disconnect riêng; D2XX/scan production giữ nguyên.");
+                    AddLog("[WATERPROOF] Leak COM đã disconnect riêng; JBZ UART/scan production giữ nguyên.");
                 }
                 catch (Exception disconnectEx)
                 {
@@ -8001,11 +8506,11 @@ public sealed class TestViewModel : ObservableObject
                         CurrentCycleToken(),
                         "WATERPROOF_DEVICE_ERROR");
                     if (_waitForProductRelease)
-                        State = "LỖI THIẾT BỊ LEAK - CHỜ THÁO SẢN PHẨM";
+                        State = "THÁO SẢN PHẨM";
                 }
                 catch (Exception scanEx)
                 {
-                    AddLog($"[WATERPROOF] Không thể restart D2XX sau lỗi Leak: {scanEx.Message}");
+                    AddLog($"[WATERPROOF] Không thể restart JBZ UART sau lỗi Leak: {scanEx.Message}");
                 }
                 return false;
             }
@@ -8160,15 +8665,11 @@ public sealed class TestViewModel : ObservableObject
                         AddLog($"Resistance FAIL đã xác nhận: {FaultJigRelayText()} pulse rồi OFF; không chạy MARKING PASS.");
 
                         ArmFaultProductRemoval(cycleModel);
-                        await StartProductionScanAndVerifyFrameAsync(
+                        State = "THÁO SẢN PHẨM";
+                        await StartProductRemovalMonitorAsync(
                             CurrentCycleToken(),
-                            "RESISTANCE_FAIL_CONFIRM_RELAY");
-                        // Callback frame đầu tiên có thể đã xác nhận ProductRemoved
-                        // và đưa chu kỳ về READY. Không được ghi đè READY bằng trạng
-                        // thái FAIL sau khi hộp thoại đã được người vận hành xác nhận.
-                        State = _waitForFaultProductRemoval
-                            ? FaultRemovalWaitingText(cycleModel)
-                            : "LẮP SẢN PHẨM";
+                            "RESISTANCE_FAIL_CONFIRM");
+                        State = "THÁO SẢN PHẨM";
                     }
                     catch (Exception ex)
                     {
@@ -8270,7 +8771,7 @@ public sealed class TestViewModel : ObservableObject
                 return;
             }
 
-            AddLog("Chuỗi PASS hoàn tất: " + PassRelaySequenceText() + " -> tất cả relay OFF.");
+            AddLog("Chuỗi PASS hoàn tất: " + PassRelaySequenceText() + " -> cả 2 relay vật lý OFF.");
             RaiseTestStatistics();
 
             bool rearmAfterRemoval = ShouldRestartAfterPass(
@@ -8295,8 +8796,9 @@ public sealed class TestViewModel : ObservableObject
 
             try
             {
-                await StartProductionScanAndVerifyFrameAsync(ct, "PASS_RELAY_SEQUENCE");
-                AddLog("Đã restart scan. Chờ nhả sản phẩm/jig trước chu kỳ tiếp theo.");
+                await StartProductRemovalMonitorAsync(ct, "PASS_RELAY_SEQUENCE");
+                State = "THÁO SẢN PHẨM";
+                AddLog("Đã bật scan giám sát tháo sản phẩm sau PASS.");
             }
             catch (Exception ex)
             {
@@ -8380,12 +8882,11 @@ public sealed class TestViewModel : ObservableObject
             AddLog($"Final PASS rejection đã xác nhận: {FaultJigRelayText()} pulse rồi OFF; không chạy MARKING PASS.");
 
             ArmFaultProductRemoval(cycleModel);
-            await StartProductionScanAndVerifyFrameAsync(
+            State = "THÁO SẢN PHẨM";
+            await StartProductRemovalMonitorAsync(
                 CurrentCycleToken(),
-                "FINAL_PASS_REJECT_CONFIRM_RELAY");
-            State = _waitForFaultProductRemoval
-                ? FaultRemovalWaitingText(cycleModel)
-                : "LẮP SẢN PHẨM";
+                "FINAL_PASS_REJECT");
+            State = "THÁO SẢN PHẨM";
         }
         catch (Exception ex)
         {
@@ -8418,21 +8919,21 @@ public sealed class TestViewModel : ObservableObject
         if (!currentProductionContext)
             return;
 
-        // Không được cộng FAIL lần hai hoặc mở popup lặp. Tuy nhiên chu kỳ cũng
-        // không được nằm vĩnh viễn ở KHÔNG ĐẠT: scan lại và bắt buộc xác nhận
-        // tháo toàn bộ sản phẩm trước khi ResetFullCycleAfterProductRemoved().
-        _waitForProductRelease = true;
-        SetProductRemovalPending(true);
+        // A rejected/uncommitted FAIL is not a finished product result, so it must
+        // never enter THÁO SẢN PHẨM. That obsolete behavior could lock the operator into a false removal gate.
+        _waitForProductRelease = false;
+        _waitForFaultProductRemoval = false;
+        SetProductRemovalPending(false);
         Interlocked.Exchange(ref _removalMonitoringFromMain, 0);
         _cycleActive = true;
-        SetProductionPhase(ProductionPhase.WaitingProductRemoval);
-        State = "CHỜ THÁO SẢN PHẨM";
+        SetProductionPhase(ProductionPhase.Continuity);
+        State = "ĐANG KIỂM TRA...";
 
         try
         {
-            await StartProductionScanAndVerifyFrameAsync(
-                CurrentCycleToken(),
-                reason + "_UNCOMMITTED_RECOVERY");
+            await EnsureContinuousProductionScanAsync();
+            RefreshFaults();
+            AddLog($"[FAIL-RECOVERY] {reason}: tiếp tục kiểm tra; không ARM tháo sản phẩm vì kết quả chưa commit.");
         }
         catch (Exception ex)
         {
@@ -8508,14 +9009,14 @@ public sealed class TestViewModel : ObservableObject
         LoadWaterProofProfileForCurrentModel();
         RefreshProductionUiSettings();
         State = ReadyStateForCurrentModel();
-        AddLog("Đã áp dụng cấu hình mềm; không restart scan và không reconnect FTDI.");
+        AddLog("Đã áp dụng cấu hình mềm; không restart scan và không reconnect JBZ UART.");
     }
 
     /// <summary>
     /// V12.9: áp dụng thay đổi card xuống tận runtime. Scan cũ bị dừng,
-    /// generation transport bị invalidate, RX được purge bởi command D2XX,
+    /// generation transport bị invalidate, RX được purge bởi UART command,
     /// decoder/card UI được dựng lại rồi scan nền được khởi động lại.
-    /// Không đóng/mở FTDI.
+    /// Không đóng/mở UART.
     /// </summary>
     public async Task RefreshProductionConfigurationAsync(bool forceNativeRestart = false)
     {
@@ -8589,7 +9090,7 @@ public sealed class TestViewModel : ObservableObject
                 (MasterApproved || IsMasterSequenceActive));
 
             AddLog(
-                $"Đã reconfigure card runtime không đóng/mở FTDI: {_board.Capacity}; " +
+                $"Đã reconfigure card runtime không đóng/mở UART: {_board.Capacity}; " +
                 $"resume={resumeMode}, wasScanning={wasScanning}, restart={restartRequired}.");
         }
         catch (OperationCanceledException) when (_lifetimeCts.IsCancellationRequested)
@@ -8630,13 +9131,13 @@ public sealed class TestViewModel : ObservableObject
     private void SetModel(ProductModel model, TestEngine.PreparedModelState? preparedEngineModel)
     {
         if (IsProductRemovalPending)
-            throw new InvalidOperationException("VUI LÒNG THÁO SẢN PHẨM");
+            throw new InvalidOperationException("THÁO SẢN PHẨM");
 
         // Đổi mã hàng phải hủy sạch chu trình cũ trước khi thay _model; nếu
         // không một task PASS/FAIL cũ hoàn thành muộn có thể cộng sản lượng
         // nhầm sang mã hàng vừa chọn.
         CancelCycleOperations();
-        ResetManualProbeSession("model-change");
+        ResetProbePresentation("model-change");
         _cycleActive = false;
         SetProductionPhase(ProductionPhase.WaitingProduct);
         _waitForProductRelease = false;
@@ -8651,8 +9152,6 @@ public sealed class TestViewModel : ObservableObject
         _startupIoWarningSignature = string.Empty;
         _lastIoMappingSignature = string.Empty;
         _lastLiveTopologySnapshot = LiveTopologySnapshot.Empty();
-        lock (_probePreviewGate)
-            _pendingProductionProbePreview = null;
         Interlocked.Exchange(ref _probePresentationState, (int)ProbePresentationState.Inactive);
         Interlocked.Exchange(ref _productionPresentationMode, (int)ProductionPresentationMode.Waiting);
         Interlocked.Increment(ref _ioMappingUiRevision);
@@ -8662,12 +9161,15 @@ public sealed class TestViewModel : ObservableObject
         Interlocked.Exchange(ref _discardStandaloneLocked, 0);
         Interlocked.Exchange(ref _faultProductRemoved, 0);
         Interlocked.Exchange(ref _discardRequiredForFault, 0);
+        Interlocked.Exchange(ref _suppressProductionWireTableUntilNextJbzFrame, 0);
+        Interlocked.Exchange(ref _forceProductionWireTableReloadPending, 0);
 
         bool migrateLegacyLot = !_productionSettings.LotSettingsByProduct.Keys.Any(key =>
             !string.Equals(key, "DEFAULT", StringComparison.OrdinalIgnoreCase));
 
         _model = model ??
             throw new ArgumentNullException(nameof(model));
+        _board.ConfigureModel(_model);
         if (_model.HasDiscardInterlock)
             _discardInterlock.Arm(contactClosed: false);
         _lotSequence.SelectProduct(
@@ -8991,7 +9493,6 @@ public sealed class TestViewModel : ObservableObject
             !ReferenceEquals(_model, cycleModel) ||
             !IsRuntimeContext(RuntimeMode.Production, runtimeGeneration) ||
             Volatile.Read(ref _probeSessionActive) != 0 ||
-            Volatile.Read(ref _inlineProbeContactIo) != 0 ||
             !MasterApproved ||
             Interlocked.CompareExchange(ref _resultRecordedThisCycle, 1, 0) != 0)
             return false;
@@ -9752,11 +10253,18 @@ public sealed class TestViewModel : ObservableObject
             return;
         }
 
+        if (Volatile.Read(ref _suppressProductionWireTableUntilNextJbzFrame) != 0)
+        {
+            SynchronizeFaultRows(Array.Empty<FaultRow>());
+            RaiseTestStatistics();
+            return;
+        }
+
         IReadOnlyList<FaultRow> desiredRows;
         if (!MasterApproved && IsMasterBadPhase)
         {
-            // Master lỗi dùng cùng bảng lỗi sản xuất, nhưng trước khi có mẫu
-            // thật trên JIG bảng phải hoàn toàn trống.
+            // Master lỗi vẫn giữ presentation riêng. Production thường bên
+            // dưới không dùng nhánh này và luôn hiển thị các dây còn thiếu.
             desiredRows = _presentationCycleStarted
                 ? BuildMasterFaultGridRows()
                 : Array.Empty<FaultRow>();
@@ -9795,28 +10303,18 @@ public sealed class TestViewModel : ObservableObject
                 // trống. Kết quả Leak chỉ hiển thị ở thẻ TEST LEAK phía trên.
                 desiredRows = Array.Empty<FaultRow>();
             }
-            else if (_waitForProductRelease || _waitForFaultProductRemoval)
-            {
-                // HTDRV_REMOVAL_DISPLAY_2026-09-05: sau PASS/FAIL, đảo ý
-                // nghĩa bảng sang "connection còn trên jig". Engine chỉ đọc
-                // snapshot quan hệ hiện tại, không sửa detection/PASS latch.
-                desiredRows = rowsSnapshot is { Removal: true }
-                    ? rowsSnapshot.Rows
-                    : _engine.BuildRemovalRows();
-            }
             else
             {
-                desiredRows = _presentationCycleStarted
-                    ? rowsSnapshot is { Removal: false }
-                        ? rowsSnapshot.Rows
-                        : _engine.BuildRows()
-                    : Array.Empty<FaultRow>();
+                // Universal Tester New always uses one table rule in every phase:
+                // OPEN/missing pairs are visible; each connected pair disappears;
+                // if it opens again the row reappears. Removal never inverts the table.
+                desiredRows = rowsSnapshot?.Rows ?? _engine.BuildRows();
             }
         }
 
-        FaultRow[] probeRows = ProbeContacts.ToArray();
-        if (probeRows.Length > 0 && IsRuntimeMode(RuntimeMode.Production))
-            desiredRows = probeRows.Concat(desiredRows).ToArray();
+        // ProbeContacts is bound to its own DataGrid above FaultGrid. Never
+        // prepend probe rows to the production wire list; doing so made the wire
+        // table jump/vanish while touching the TESTPIN probe.
 
         long synchronizeStarted = Stopwatch.GetTimestamp();
         SynchronizeFaultRows(desiredRows);

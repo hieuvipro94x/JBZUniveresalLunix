@@ -1,6 +1,6 @@
-﻿using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 using System.IO;
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public enum BoardConnectionState
 {
@@ -21,6 +21,8 @@ public interface IBoardTransport : IAsyncDisposable
         ? BoardConnectionState.Scanning
         : IsConnected ? BoardConnectionState.Ready : BoardConnectionState.Disconnected;
     bool IsConnected { get; }
+    string BoardFirmwareIdentity => string.Empty;
+    bool ProducesPassiveScanFrames => true;
     bool IsScanning { get; }
     BoardScanMode CurrentScanMode { get; }
     BoardCapacity InstalledCapacity { get; }
@@ -48,6 +50,14 @@ public interface IBoardTransport : IAsyncDisposable
     /// Transport/Decoder/TestView lấy cùng BoardCapacity, không tự tính card.
     /// </summary>
     void ConfigureActiveScanRange(int maxIo);
+    void ConfigureModel(ProductModel model) { }
+    Task ConfigureModelAsync(ProductModel model, CancellationToken ct = default)
+    {
+        ConfigureModel(model);
+        return Task.CompletedTask;
+    }
+    Task ConfigureModelAsync(ProductModel model, IProgress<JbzModelUploadProgress>? progress,
+        CancellationToken ct = default) => ConfigureModelAsync(model, ct);
 
     Task StartScanAsync(BoardScanMode mode = BoardScanMode.Production, CancellationToken ct = default);
     Task StopScanAsync(CancellationToken ct = default);

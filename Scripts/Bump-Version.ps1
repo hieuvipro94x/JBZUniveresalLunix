@@ -43,7 +43,7 @@ $group.AssemblyVersion = $assemblyVersion
 $group.FileVersion = $assemblyVersion
 $group.InformationalVersion = $release
 $group.VersionFileTag = $fileTag
-$group.AssemblyTitle = "JBZUniversalTester V" + $release
+$group.AssemblyTitle = "JBZUniveresalLunix V" + $release
 
 $settings = New-Object System.Xml.XmlWriterSettings
 $settings.Indent = $true
@@ -72,5 +72,5 @@ Write-Host "============================================================" -Foreg
 Write-Host ("VERSION UPDATED: V" + $currentText + " -> V" + $release) -ForegroundColor Green
 Write-Host ("AssemblyVersion : " + $assemblyVersion) -ForegroundColor Green
 Write-Host ("FileVersion     : " + $assemblyVersion) -ForegroundColor Green
-Write-Host ("EXE name        : JBZUniversalTester_V" + $fileTag + ".exe") -ForegroundColor Green
+Write-Host ("EXE name        : JBZUniveresalLunix_V" + $fileTag + ".exe") -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Green

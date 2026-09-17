@@ -2,10 +2,10 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text.Json;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 using Microsoft.Data.Sqlite;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 /// <summary>
 /// SQLite production repository. The old TestHistory table is retained as a

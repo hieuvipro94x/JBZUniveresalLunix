@@ -1,10 +1,10 @@
-﻿using System.IO;
+using System.IO;
 using System.Windows;
-using JBZUniversalTester.Core;
-using JBZUniversalTester.Models;
-using JBZUniversalTester.Services;
+using JBZUniveresalLunix.Core;
+using JBZUniveresalLunix.Models;
+using JBZUniveresalLunix.Services;
 
-namespace JBZUniversalTester.ViewModels;
+namespace JBZUniveresalLunix.ViewModels;
 
 public sealed class MainViewModel : ObservableObject
 {
@@ -14,7 +14,7 @@ public sealed class MainViewModel : ObservableObject
 
     private readonly AppSettings _settings;
     private readonly ProductionSettings _productionSettings;
-    private readonly IBoardTransport _board;
+    private readonly JbzBoardTransportAdapter _board;
     private readonly KeysightVisaService _visa = new();
     private readonly WaterProofSerialService _waterProof = new();
     private readonly TestEngine _engine;
@@ -47,8 +47,7 @@ public sealed class MainViewModel : ObservableObject
     }
 
     // V12.9: MainWindow/Transport/Decoder/TestView cùng đọc một BoardCapacity.
-    public BoardMode ActiveBoardMode => _board is UnifiedBoardTransport unified ? unified.ActiveMode : _productionSettings.BoardMode;
-    public bool UsesD2xxCardCapacity => true;
+    public BoardMode ActiveBoardMode => BoardMode.JbzSerial;
 
     public BoardCapacity CurrentBoardCapacity => BoardCapacity.FromSettings(_productionSettings);
 
@@ -67,12 +66,11 @@ public sealed class MainViewModel : ObservableObject
     public int ConfiguredIoEnd => CurrentBoardCapacity.LastGlobalIo;
 
     public ProductionSettings ProductionSettings => _productionSettings;
+    public JbzBoardTransportAdapter BoardTransport => _board;
 
-    public bool HasEnoughCardsForModel =>
-        Model is null || !UsesD2xxCardCapacity ||
-        (CurrentBoardCapacity.IsRangeWithinSystem &&
-         Model.MaxIo <= BoardCapacity.MaxGlobalIo &&
-         RequiredCardCount <= ConfiguredCardCount);
+    // Universal Tester New reports/validates the physical model during upload;
+    // the legacy JBZ UART expansion-card gate no longer blocks model selection.
+    public bool HasEnoughCardsForModel => true;
 
     public HomeViewModel Home { get; }
     public TestViewModel Test { get; }
@@ -85,8 +83,8 @@ public sealed class MainViewModel : ObservableObject
     {
         _settings = AppSettings.Load();
         _productionSettings = ProductionConfigService.Load();
-        _board = new UnifiedBoardTransport(
-            _settings.Board.FtdiSerial,
+        _board = new JbzBoardTransportAdapter(
+            _productionSettings.BoardPortName,
             _productionSettings
         );
 
@@ -112,7 +110,7 @@ public sealed class MainViewModel : ObservableObject
 
         // Việc tự nạp mã + tự kết nối bo được bắt đầu tại MainWindow.Loaded.
         // Không dùng fire-and-forget trong constructor để tránh race giữa WPF
-        // StartupUri/ShowDialog và lần khởi tạo D2XX duy nhất của phiên.
+        // StartupUri/ShowDialog và lần khởi tạo JBZ UART duy nhất của phiên.
         _page = Home;
 
         ShowHomeCommand = new RelayCommand(
@@ -126,7 +124,7 @@ public sealed class MainViewModel : ObservableObject
         ExitCommand = new RelayCommand(() =>
         {
             // Không Shutdown trực tiếp ở đây. MainWindow.Closing sẽ chờ dừng
-            // worker FTDI/Keysight/relay xong rồi mới cho process thoát.
+            // worker JBZ UART/Keysight/relay xong rồi mới cho process thoát.
             Application.Current.MainWindow?.Close();
         });
     }
@@ -144,7 +142,7 @@ public sealed class MainViewModel : ObservableObject
     {
         Status = "ĐANG NẠP MÃ HÀNG VÀ KẾT NỐI BO...";
 
-        // DB migration/import counter và nhận dạng FTDI độc lập. Chỉ kết nối
+        // DB migration/import counter và nhận dạng JBZ UART độc lập. Chỉ kết nối
         // hardware song song; nạp model/statistics chờ bootstrap xong để DB cũ
         // luôn được chuyển sang canonical path trước khi repository có thể tạo DB.
         Task productionDataTask = Task.Run(StartupBootstrapService.EnsureDeferredProductionFiles);
@@ -253,7 +251,8 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
-    public async Task<ProductModel?> LoadModelAsync(string path)
+    public async Task<ProductModel?> LoadModelAsync(string path,
+        IProgress<JbzModelUploadProgress>? progress = null, CancellationToken ct = default)
     {
         if (Test.IsProductRemovalPending)
             throw new InvalidOperationException("VUI LÒNG THÁO SẢN PHẨM");
@@ -264,23 +263,11 @@ public sealed class MainViewModel : ObservableObject
 
         ProductModel? model;
         string extension = Path.GetExtension(full).ToLowerInvariant();
-        ProductBundle? bundle = null;
-
-        if (full.EndsWith(".jbzproduct.json", StringComparison.OrdinalIgnoreCase))
-        {
-            bundle = ProductBundle.Load(full);
-            if (string.IsNullOrWhiteSpace(bundle.D2xxThtPath) || !File.Exists(bundle.D2xxThtPath))
-                throw new InvalidDataException($"Bundle {bundle.PartNumber} chưa có file .tht cho JBZ D2XX.");
-            model = await Test.LoadSelectedModelFromPathAsync(bundle.D2xxThtPath);
-        }
-        else if (extension != ".tht")
-        {
-            throw new InvalidDataException("Project này chỉ dùng file mã hàng .tht.");
-        }
-        else
-        {
-            model = await Test.LoadSelectedModelFromPathAsync(full);
-        }
+        if (extension != ".model")
+            throw new InvalidDataException("Ứng dụng chỉ nhận file mã hàng .model của bo JBZ UART.");
+        string? setupPath = JbzSetupParser.FindForModel(full);
+        JbzSetupProfile? setup = setupPath is null ? null : JbzSetupParser.Load(setupPath, full);
+        model = await Test.LoadSelectedModelFromPathAsync(full, progress, ct);
 
         if (model is null) return null;
 
@@ -294,7 +281,9 @@ public sealed class MainViewModel : ObservableObject
         Raise(nameof(ConfiguredIoStart));
         Raise(nameof(ConfiguredIoEnd));
         Raise(nameof(HasEnoughCardsForModel));
-        Status = $"MODEL ĐÃ TẢI: {model.ModelName}";
+        Status = setup is null
+            ? $"MODEL ĐÃ TẢI: {model.ModelName} (.setup not found)"
+            : $"MODEL ĐÃ TẢI: {model.ModelName} + {Path.GetFileName(setup.SourcePath)}";
 
         if (!HasEnoughCardsForModel) ShowCardCapacityWarning();
 
@@ -319,6 +308,7 @@ public sealed class MainViewModel : ObservableObject
         ProductionSettings old = new()
         {
             BoardMode = _productionSettings.BoardMode,
+            BoardPortName = _productionSettings.BoardPortName,
             ExpansionCardCount = _productionSettings.ExpansionCardCount,
             StartCardNumber = _productionSettings.StartCardNumber,
             UsbDelay = _productionSettings.UsbDelay,
@@ -327,7 +317,9 @@ public sealed class MainViewModel : ObservableObject
 
         ProductionConfigService.ReloadInto(_productionSettings);
         AsyncFileLogService.Current.Configure(_productionSettings.EnableSystemLogs);
-        bool boardSelectionChanged = old.BoardMode != _productionSettings.BoardMode;
+        bool boardSelectionChanged = old.BoardMode != _productionSettings.BoardMode ||
+            !string.Equals(old.BoardPortName, _productionSettings.BoardPortName,
+                StringComparison.OrdinalIgnoreCase);
         bool scanHardwareChanged =
             old.ExpansionCardCount != _productionSettings.ExpansionCardCount ||
             old.StartCardNumber != _productionSettings.StartCardNumber ||

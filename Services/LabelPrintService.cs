@@ -3,9 +3,9 @@ using System.IO.Ports;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Diagnostics;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public sealed class LabelPrintService : IAsyncDisposable
 {

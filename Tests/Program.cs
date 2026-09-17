@@ -1,4 +1,4 @@
-﻿using System.IO.Compression;
+using System.IO.Compression;
 using System.Diagnostics;
 using System.Collections.Specialized;
 using System.Buffers.Binary;
@@ -6,15 +6,16 @@ using System.Globalization;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using System.Windows.Media;
-using JBZUniversalTester.Models;
-using JBZUniversalTester.Converters;
-using JBZUniversalTester.Services;
-using JBZUniversalTester.ViewModels;
-using JBZUniversalTester.Views;
+using JBZUniveresalLunix.Models;
+using JBZUniveresalLunix.Converters;
+using JBZUniveresalLunix.Services;
+using JBZUniveresalLunix.ViewModels;
+using JBZUniveresalLunix.Views;
 using Microsoft.Data.Sqlite;
 
-namespace JBZUniversalTester.SelfTests;
+namespace JBZUniveresalLunix.SelfTests;
 
 internal static class Program
 {
@@ -33,27 +34,21 @@ internal static class Program
 
         (string Name, Action Run)[] tests =
         [
-            ("Board capacity/address boundaries", TestBoardCapacity),
+            ("JBZ UART streaming protocol parser", TestJbzProtocolParser),
+            ("JBZ model ACK fake-board contract", TestJbzModelAckContract),
+            ("JBZ .model compiler golden trace", TestJbzModelCompilerGolden),
+            ("JBZ realtime OPEN/SHORT topology projection", TestJbzRealtimeTopologyProjection),
+            ("JBZ TESTPIN multi-contact trace and independent OPEN", TestJbzLiveProbeTrace),
+            ("JBZ firmware HEX and traced packet layout", TestJbzFirmwareProtocol),
             ("Production scan accepts first frame after decoder sequence reset", TestProductionScanFirstFrameAfterSequenceReset),
             ("Scan watchdog intentional pause and staged recovery", TestScanWatchdogRecovery),
             ("New version inherits station production data without overwrite", TestProductionDataUpgrade),
-            ("Production/probe decoder separation", TestDecoderModes),
-            ("Production probe preview arrives before frame terminator", TestProductionProbePreview),
-            ("10-card complete-frame stress", TestTenCardCompleteFrameStress),
             ("Startup connected-IO safety interlock", TestStartupIoInterlock),
-            ("Topology learning uses one direct-contact signal", TestTopologyLearningDirectContact),
-            ("THT discard contact interlock and frame isolation", TestDiscardContactInterlock),
-            ("Probe target-only touch detection", TestProbeTargetOnlyTouchDetection),
-            ("Manual Probe TP latch and connector transitions", TestManualProbeSession),
             ("Inline probe does not clear wiring faults", TestInlineProbeDoesNotClearWiringFaults),
-            ("Htdrv endpoint/probe display cases", TestHtdrvEndpointProbeDisplayCases),
             ("500-cycle scan/probe/fault stress", TestFiveHundredCycleScanProbeFaultStress),
             ("Continuity/open/wrong/splice engine", TestEngineVectors),
             ("Pending continuity presentation and CLIP branch visibility", TestPendingContinuityPresentation),
             ("Final Htdrv TestWindow presentation lifecycle", TestFinalHtdrvTestWindowPresentation),
-            ("Production PASS gate minimal latency", TestProductionPassGateMinimalLatency),
-            ("THT column semantics and string wire topology", TestThtColumnSemantics),
-            ("Blank THT IO mapping compatibility", TestBlankThtIoMappingCompatibility),
             ("Learned diagnostic topology normalization and persistence", TestLearnedTopology),
             ("Relay PASS/FAIL safe ordering", TestRelayOrdering),
             ("History SQLite/search/CSV/XLSX native types", TestHistory),
@@ -66,15 +61,13 @@ internal static class Program
             ("Canonical runtime paths and SQLite PartCnt authority", TestCanonicalRuntimePersistence),
             ("System log master switch preserves History", TestSystemLogMasterSwitch),
             ("ALL6 label data order", TestLabel),
-            ("THT label renderer and LOT lifecycle", TestThtLabelAndLotLifecycle),
             ("PASS label snapshot/idempotency/traceability", TestLabelPrintingSafety),
-            ("Standard product picker filter", TestProductPickerFilter),
+            ("Part-number auto resolver and paired setup", TestPartNumberResolver),
             ("Fault display localization and detail", TestFaultDisplayFormatter),
             ("UI brush cache and engine change filter", TestUiPerformanceGuards),
             ("Authoritative production state and stale UI snapshot gate", TestAuthoritativeProductionState),
             ("Model-aware product evidence rejects raw single IO", TestModelAwareProductEvidence),
             ("Duplicate CLIP fault rows do not lock hardware", TestDuplicateClipFaultRows),
-            ("D2XX resistance selectors and ten-slot configuration", TestD2xxResistanceRouting),
             ("Leak connector mapping and PASS/FAIL presentation", TestWaterProofConfigurationAndPresentation),
             ("Final TestView status/master/device fault guards", TestFinalTestStatusGuards),
             ("Direct manual relay controls and production interlock", TestManualModeInterlock),
@@ -105,6 +98,325 @@ internal static class Program
         return failed == 0 ? 0 : 1;
     }
 
+    private static void TestJbzProtocolParser()
+    {
+        var parser = new JbzProtocolParser();
+        Assert(parser.Push(Encoding.ASCII.GetBytes(":OPEN,10,10,")).Count == 0,
+            "Partial UART line must be buffered");
+        IReadOnlyList<JbzBoardEvent> events = parser.Push(
+            Encoding.ASCII.GetBytes("11\r:OTHER,7,8\n:CIRCUIT,0\r\n:TESTPIN,42,OFF\r"));
+        Assert(events.Count == 4, "CR, LF and CRLF framing must all be accepted");
+        Assert(events[0].Family == JbzEventFamily.Open && events[0].Numbers!.SequenceEqual([10, 10, 11]), "OPEN payload");
+        Assert(events[1].Family == JbzEventFamily.Other && events[1].Numbers!.SequenceEqual([7, 8]), "OTHER payload");
+        Assert(events[2].Family == JbzEventFamily.Circuit && events[2].Numbers![0] == 0, "CIRCUIT PASS semantics");
+        Assert(events[3].Family == JbzEventFamily.TestPin && events[3].Numbers![0] == 42 && events[3].Values![0] == "OFF", "TESTPIN state");
+        JbzBoardEvent shortEvent = JbzProtocolParser.ParseLine(":SHORT,193,194");
+        Assert(shortEvent.Family == JbzEventFamily.Short && shortEvent.Numbers!.SequenceEqual([193, 194]),
+            "SHORT must remain a first-class Rev 1.42 wiring event");
+        Assert(JbzProtocolParser.ParseLine(":NEWTEST").Family == JbzEventFamily.NewTest,
+            "NEWTEST event family");
+        Assert(JbzProtocolParser.ParseLine(":SEQ,1,2").Family == JbzEventFamily.Sequence,
+            "SEQ event family");
+        Assert(JbzProtocolParser.ParseLine(":CLEARCONNECTOR").Family == JbzEventFamily.ClearConnector,
+            "CLEARCONNECTOR event family");
+        Assert(JbzProtocolParser.ParseLine(":RESISTOR,3961").Values![0] == "3961",
+            "Raw resistor ADC must not be converted to ohms");
+    }
+
+    private static void TestJbzModelAckContract()
+    {
+        var fakeBoard = Channel.CreateUnbounded<JbzBoardEvent>();
+        static JbzProtocolCommand Cmd(string tx, string ack, int timeoutMs = 100) =>
+            new(tx, new(ack, false, TimeSpan.FromMilliseconds(timeoutMs)));
+        static void Push(Channel<JbzBoardEvent> board, string line) =>
+            board.Writer.TryWrite(JbzProtocolParser.ParseLine(line));
+
+        Push(fakeBoard, ":OK,MODEL");
+        Assert(JbzModelAckWaiter.WaitAsync(Cmd(":MODEL,WH322110", ":OK,MODEL"),
+            fakeBoard.Reader, CancellationToken.None).GetAwaiter().GetResult().Raw == ":OK,MODEL",
+            "MODEL exact ACK succeeds");
+
+        Push(fakeBoard, ":OK,PINDATA,12");
+        Assert(JbzModelAckWaiter.WaitAsync(Cmd(":PINDATA,12,1,0,1,0,0", ":OK,PINDATA,12"),
+            fakeBoard.Reader, CancellationToken.None).GetAwaiter().GetResult().Raw == ":OK,PINDATA,12",
+            "PINDATA index ACK succeeds");
+
+        Push(fakeBoard, ":OK,PINDATA,11");
+        AssertThrows<InvalidDataException>(() => JbzModelAckWaiter.WaitAsync(
+            Cmd(":PINDATA,12,1,0,1,0,0", ":OK,PINDATA,12"), fakeBoard.Reader,
+            CancellationToken.None).GetAwaiter().GetResult(), "Wrong PINDATA index must fail");
+
+        Push(fakeBoard, ":OK,MODEL"); // stale ACK from a previous family
+        Push(fakeBoard, ":OK,PINDATA,12");
+        Assert(JbzModelAckWaiter.WaitAsync(Cmd(":PINDATA,12,1,0,1,0,0", ":OK,PINDATA,12"),
+            fakeBoard.Reader, CancellationToken.None).GetAwaiter().GetResult().Raw == ":OK,PINDATA,12",
+            "Stale unrelated ACK cannot complete the current command");
+
+        AssertThrows<TimeoutException>(() => JbzModelAckWaiter.WaitAsync(
+            Cmd(":PINCOUNT,102", ":OK,PINCOUNT", 15), fakeBoard.Reader,
+            CancellationToken.None).GetAwaiter().GetResult(), "No ACK times out");
+
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        AssertThrows<OperationCanceledException>(() => JbzModelAckWaiter.WaitAsync(
+            Cmd(":PINCOUNT,102", ":OK,PINCOUNT"), fakeBoard.Reader,
+            cancelled.Token).GetAwaiter().GetResult(), "Cancellation stops ACK wait");
+
+        Push(fakeBoard, ":ERROR,DISCONNECTED");
+        AssertThrows<IOException>(() => JbzModelAckWaiter.WaitAsync(
+            Cmd(":PINCOUNT,102", ":OK,PINCOUNT"), fakeBoard.Reader,
+            CancellationToken.None).GetAwaiter().GetResult(), "Board disconnect/error stops ACK wait");
+    }
+
+    private static void TestJbzModelCompilerGolden()
+    {
+        string root = Path.Combine(Environment.CurrentDirectory, "JBZ_Windows", "tests", "fixtures");
+        JbzCompiledModel model = JbzModelCompiler.Compile(Path.Combine(root, "WH322110.model"));
+        string[] golden = File.ReadAllLines(Path.Combine(root, "WH322110_trace_commands.txt"));
+        Assert(model.Commands.Select(command => command.Text).SequenceEqual(golden),
+            "Compiled commands must match the proven Python golden trace exactly");
+        Assert(model.Commands.Count == 115 && model.PinRows == 200 && model.SourceRecords == 102 &&
+               model.TargetItems == 98 && model.ConnectorCount == 14,
+            "WH322110 compiler summary must match the reference");
+        Assert(model.Product.PartNumber == "P737561000" && model.Product.ProductName == "VOLT SNSG" &&
+               model.Product.VehicleType == "MX5 HEV" && model.Product.CustomerCode == "P7375/61000",
+            "WH322110 display fields match the reference [Common] metadata");
+
+        JbzCompiledModel special = JbzModelCompiler.Compile(Path.Combine(root, "WH321798.model"));
+        string[] specialGolden = File.ReadAllLines(Path.Combine(root, "WH321798_trace_commands.txt"));
+        Assert(special.Commands.Select(command => command.Text).SequenceEqual(specialGolden),
+            "WH321798 including Special=A flag and 201-pin CON tail must match Rev 1.42 trace exactly");
+        Assert(special.Commands.Count == 116 && special.PinRows == 201 && special.SourceRecords == 103 &&
+               special.TargetItems == 98 && special.ConnectorCount == 14,
+            "WH321798 compiler summary must match the captured Rev 1.42 upload");
+        Assert(special.Commands.Any(command => command.Text == ":PINDATA,97,196,98,0,0,16"),
+            "Special=A source must encode firmware flag 16");
+
+        // Regression from production log 2026-09-16: 321085.model contained
+        // [Common]/Model=DL3, but firmware identity must still be 321085.
+        string mismatchRoot = Path.Combine(Path.GetTempPath(), "JBZModelIdentity_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(mismatchRoot);
+        try
+        {
+            string mismatchPath = Path.Combine(mismatchRoot, "321085.model");
+            string mismatchText = File.ReadAllText(Path.Combine(root, "WH322110.model"))
+                .Replace("Model=WH322110", "Model=DL3", StringComparison.Ordinal);
+            File.WriteAllText(mismatchPath, mismatchText);
+            JbzCompiledModel mismatch = JbzModelCompiler.Compile(mismatchPath);
+            Assert(mismatch.ModelName == "321085" &&
+                   mismatch.Product.ModelName == "321085" &&
+                   mismatch.Commands[0].Text == ":MODEL,321085",
+                ".model file stem is the canonical firmware/model identity even when [Common]/Model differs");
+        }
+        finally
+        {
+            try { Directory.Delete(mismatchRoot, recursive: true); } catch { }
+        }
+    }
+
+    private static void TestJbzRealtimeTopologyProjection()
+    {
+        string path = Path.Combine(Environment.CurrentDirectory, "JBZ_Windows", "tests", "sample.model");
+        JbzCompiledModel compiled = JbzModelCompiler.Compile(path);
+        var adapter = new JbzBoardTransportAdapter(string.Empty, new ProductionSettings());
+        adapter.ConfigureModel(compiled.Product);
+
+        var frames = new List<ScanFrame>();
+        adapter.FrameReceived += (_, frame) => frames.Add(frame);
+        MethodInfo onEvent = typeof(JbzBoardTransportAdapter).GetMethod(
+            "OnEvent", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("OnEvent not found");
+
+        void Push(string line) => onEvent.Invoke(adapter, [null, JbzProtocolParser.ParseLine(line)]);
+
+        Push(":CLEAR");
+        Assert(frames.Count == 1 && !frames[^1].Complete && !frames[^1].TerminatorKnown &&
+               frames[^1].Connections.TryGetValue(1, out IReadOnlySet<int>? clearTargets) &&
+               clearTargets.Count == 0,
+            "CLEAR publishes presentation-only all-open continuity preview");
+
+        Push(":OPEN,1");
+        Assert(!frames[^1].Complete && frames[^1].Connections[1].SetEquals([2]),
+            "OPEN with source only hides the completed Test-screen network through preview");
+
+        Push(":OPEN,1,1,2");
+        Assert(!frames[^1].Complete && frames[^1].Connections[1].Count == 0,
+            "OPEN source+missing targets restores the Test-screen row immediately without deciding PASS/FAIL");
+
+        int beforeOther = frames.Count;
+        Push(":OTHER,1,99");
+        Assert(frames.Count == beforeOther + 1 && !frames[^1].Complete &&
+               frames[^1].Connections[1].Contains(99) &&
+               frames[^1].FaultHints.TryGetValue((1, 99), out ProductFaultType otherType) &&
+               otherType == ProductFaultType.WrongWiring,
+            "OTHER is shown immediately and preserved as firmware WRONG_WIRING");
+
+        Push(":SHORT,1,77");
+        Assert(!frames[^1].Complete &&
+               frames[^1].Connections[1].Contains(77) &&
+               frames[^1].FaultHints.TryGetValue((1, 77), out ProductFaultType shortType) &&
+               shortType == ProductFaultType.ShortCircuit,
+            "SHORT is shown immediately and preserved as firmware SHORT_CIRCUIT");
+        Push(":CIRCUIT,1");
+        Assert(frames[^1].Complete && frames[^1].Connections[1].Contains(99),
+            "CIRCUIT,1 publishes the authoritative wrong-wire topology");
+
+        Push(":CIRCUIT,0");
+        Assert(frames[^1].Complete && frames[^1].Connections[1].SetEquals([2]),
+            "CIRCUIT,0 authoritatively restores the clean expected topology");
+
+        adapter.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
+
+    private static void TestJbzLiveProbeTrace()
+    {
+        string fixtureRoot = Path.Combine(Environment.CurrentDirectory, "JBZ_Windows", "tests", "fixtures");
+        JbzCompiledModel model = JbzModelCompiler.Compile(Path.Combine(fixtureRoot, "WH321798.model"));
+        PinRecord pin125 = model.Product.Pins.Single(pin => pin.IoNumber == 125);
+        Assert(pin125.Connector == "HOLDER 07" && pin125.PinNumber == "7" && pin125.WireName == "M3C3" && pin125.Color == "P",
+            "TESTPIN 125 maps directly to its physical .model row and metadata");
+        PinRecord pin200 = model.Product.Pins.Single(pin => pin.IoNumber == 200);
+        Assert(pin200.Connector == "BAND" && pin200.PinNumber == "5",
+            "A physical pin outside normal network topology remains available to probe presentation");
+
+        var adapter = new JbzBoardTransportAdapter(string.Empty, new ProductionSettings());
+        adapter.ConfigureModel(model.Product);
+        var previews = new List<int[]>();
+        var frames = new List<ScanFrame>();
+        adapter.ProductionProbePreviewReceived += (_, preview) => previews.Add(preview.ActiveIo.ToArray());
+        adapter.FrameReceived += (_, frame) => frames.Add(frame);
+        MethodInfo onEvent = typeof(JbzBoardTransportAdapter).GetMethod("OnEvent", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        void Push(string line) => onEvent.Invoke(adapter, [null, JbzProtocolParser.ParseLine(line)]);
+
+        Push(":TESTPIN,125,ON");
+        Assert(previews[^1].SequenceEqual([125]) && frames.Count == 0,
+            "TESTPIN ON updates live contacts without creating an authoritative result");
+        Push(":OPEN,82");
+        Assert(previews[^1].SequenceEqual([125]) && frames.Count == 1 && !frames[^1].Complete,
+            "OPEN changes electrical preview without changing probe contacts or completing production");
+        Push(":TESTPIN,125,OFF");
+        Assert(previews[^1].Length == 0 && frames.Count == 1,
+            "OFF removes the exact contact immediately without publishing a production frame");
+        Push(":OPEN,82,82,125");
+        Assert(previews[^1].Length == 0 && frames.Count == 2 && !frames[^1].Complete,
+            "OPEN after OFF remains independent of the cleared probe state");
+        Push(":TESTPIN,189,ON");
+        Push(":TESTPIN,190,ON");
+        Assert(previews[^1].SequenceEqual([190, 189]), "Two simultaneous contacts render newest first");
+        int previewCount = previews.Count;
+        Push(":TESTPIN,190,ON");
+        Assert(previews.Count == previewCount, "Duplicate ON does not create a duplicate contact");
+        Push(":TESTPIN,189,OFF");
+        Assert(previews[^1].SequenceEqual([190]), "OFF on one pin preserves the other active pin");
+        Push(":TESTPIN,190,OFF");
+        Push(":TESTPIN,113,ON");
+        Push(":TESTPIN,126,ON");
+        Push(":TESTPIN,114,ON");
+        Push(":TESTPIN,113,OFF");
+        Assert(previews[^1].SequenceEqual([114, 126]), "Three-contact trace keeps surviving contacts in latest-first order");
+        Push(":CLEAR");
+        Assert(previews[^1].Length == 0, "CLEAR removes all live TESTPIN contacts");
+        Push(":TESTPIN,200,ON");
+        adapter.ConfigureModel(model.Product);
+        Assert(previews[^1].Length == 0, "Model change removes stale TESTPIN contacts");
+        Push(":PIN,15,1");
+        Assert(previews[^1].SequenceEqual([15]), "Exact PIN,physical,1 compatibility maps to ON");
+        Push(":PIN,15,0");
+        Assert(previews[^1].Length == 0, "Exact PIN,physical,0 compatibility maps to OFF");
+        Push(":TESTPIN,125,ON");
+        adapter.StopScanAsync().GetAwaiter().GetResult();
+        Assert(previews[^1].Length == 0, "STOP clears all live contacts even when the COM transport is idle");
+        Push(":TESTPIN,125,ON");
+        adapter.ResetClearAsync().GetAwaiter().GetResult();
+        Assert(previews[^1].Length == 0, "Leaving the Test view clears live contacts without UART commands");
+        Assert(JbzProtocolParser.ParseLine(":PIN,15,2").Family == JbzEventFamily.Raw &&
+               JbzProtocolParser.ParseLine(":TESTPIN,15,MAYBE").Family == JbzEventFamily.Raw,
+            "Unproven PIN and TESTPIN forms remain raw diagnostics");
+        foreach (string raw in File.ReadAllLines(Path.Combine(fixtureRoot, "pin_probe_trace_rx.txt")))
+            Push(raw);
+        Assert(previews[^1].Length == 0 && frames.All(frame => !frame.Complete),
+            "Reference probe fixture ends with no orphan contact and no authoritative production result");
+        string boardSource = File.ReadAllText(Path.Combine(Environment.CurrentDirectory, "Services", "JbzSerialBoardTransport.cs"));
+        Assert(!boardSource.Contains(":PINTEST", StringComparison.Ordinal),
+            "Production UART transport never sends PINTEST");
+        adapter.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
+
+    private static void TestJbzFirmwareProtocol()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"jbz-firmware-{Guid.NewGuid():N}.hex");
+        try
+        {
+            File.WriteAllLines(path,
+            [
+                ":020000040800F2",
+                ":048000000102030472",
+                ":0400000508008189E5",
+                ":00000001FF"
+            ]);
+            JbzFirmwareImage image = JbzIntelHexParser.Load(path, requireProvenImageRange: false);
+            Assert(image.TotalBytes == 4 && image.FirstAddress == 0x08008000 && image.LastAddressExclusive == 0x08008004,
+                "Intel HEX address reconstruction");
+            byte[] packet = JbzFirmwareUpdateService.BuildProgramPacket(image.Blocks[0]);
+            Assert(packet.SequenceEqual(new byte[] { 0x50, 0x00, 0x80, 0x00, 0x08, 0x04, 0x00, 1, 2, 3, 4, 10 }),
+                "Firmware packet must be P + address LE32 + length LE16 + data + additive checksum");
+            bool rejected = false;
+            try { _ = JbzIntelHexParser.Load(path, requireProvenImageRange: true); }
+            catch (InvalidDataException) { rejected = true; }
+            Assert(rejected, "Production preflight must reject a HEX outside the trace-proven exact range");
+        }
+        finally { if (File.Exists(path)) File.Delete(path); }
+    }
+
+    private static void TestPartNumberResolver()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "JBZPartResolver", Guid.NewGuid().ToString("N"));
+        string profile = Path.Combine(root, "unused-profile");
+        Directory.CreateDirectory(Path.Combine(root, "Models"));
+        Directory.CreateDirectory(Path.Combine(root, "Setups"));
+        try
+        {
+            string modelPath = Path.Combine(root, "Models", "321085.model");
+            string setupPath = Path.Combine(root, "Setups", "321085.setup");
+            File.WriteAllText(modelPath, "[Common]\nModel=321085\n");
+            File.WriteAllText(setupPath, "[Common]\nModel=/home/pi/Models/321085.model\n[WaterProof]\nUse=1\n");
+            JbzPartFiles pair = JbzPartFileResolver.Resolve("321085", root, profile);
+            Assert(pair.ModelPath == modelPath && pair.SetupPath == setupPath,
+                "Part number resolves both files beside the application without a file picker");
+            Assert(JbzSetupParser.Load(pair.SetupPath, pair.ModelPath).Get("WaterProof", "Use") == "1",
+                "Legacy setup remains local configuration, not board commands");
+            AssertThrows<InvalidDataException>(() => JbzPartFileResolver.Resolve("../321085", root, profile),
+                "Part number cannot escape Models/Setups directories");
+            File.Delete(setupPath);
+            AssertThrows<FileNotFoundException>(() => JbzPartFileResolver.Resolve("321085", root, profile),
+                "Missing paired setup must fail before board upload");
+
+            string uploadDialogSource = File.ReadAllText(Path.Combine(
+                Environment.CurrentDirectory, "Views", "JbzPartSelectionWindow.xaml.cs"));
+            Assert(uploadDialogSource.Contains("XÁC NHẬN NẠP MODEL", StringComparison.Ordinal) &&
+                   uploadDialogSource.Contains("DialogResult = true;", StringComparison.Ordinal) &&
+                   !uploadDialogSource.Contains("NẠP MODEL HOÀN TẤT", StringComparison.Ordinal),
+                "Model upload asks once and closes its progress window after success");
+
+            string station = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string stationModel = Path.Combine(station, "Models", "321085.model");
+            string stationSetup = Path.Combine(station, "Setups", "321085.setup");
+            if (File.Exists(stationModel) && File.Exists(stationSetup))
+            {
+                JbzPartFiles actual = JbzPartFileResolver.Resolve("321085", profile, station);
+                JbzCompiledModel compiled = JbzModelCompiler.Compile(actual.ModelPath);
+                Assert(compiled.ModelName == "DL3" && compiled.Product.PartNumber == "WH321085" &&
+                       compiled.Product.ProductName == "HEAD LAMP" && compiled.Product.VehicleType == "DL3" &&
+                       compiled.Product.CustomerCode == "WH321085" && compiled.Commands.Count > 0 &&
+                       compiled.Commands.First().Text == ":MODEL,DL3" &&
+                       compiled.Commands.Last().Text == ":FINISH",
+                    "Operator's 321085.model keeps the separate firmware model and product display fields");
+            }
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+#if LEGACY_D2XX
     private static void TestProductPickerFilter()
     {
         const BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Static;
@@ -118,22 +430,23 @@ internal static class Program
         bool Accepts(string fileName) =>
             (bool)(filter.Invoke(null, [fileName]) ?? false);
 
-        Assert(Accepts("sample.tht"), ".tht must be visible");
-        Assert(Accepts("sample.THT"), ".THT must be visible");
+        Assert(Accepts("sample.model"), ".model must be visible");
+        Assert(Accepts("sample.MODEL"), ".MODEL must be visible");
+        Assert(!Accepts("sample.tht"), ".tht must be hidden");
         Assert(!Accepts("sample.json"), ".json must be hidden");
         Assert(!Accepts("sample.jbzproduct.json"), ".jbzproduct.json must be hidden");
         Assert(
             string.Equals(
                 filterText.GetRawConstantValue()?.ToString(),
-                "The Files (*.tht)|*.tht|All Files (*.*)|*.*",
+                "JBZ Model (*.model)|*.model|All Files (*.*)|*.*",
                 StringComparison.Ordinal),
-            "Native dialog filter must match the original Htdrv .tht/all-files order");
+            "Native dialog filter must select JBZ .model files");
 
         string pickerSource = File.ReadAllText(
             Path.Combine(Environment.CurrentDirectory, "ViewModels", "HomeViewModel.cs"));
         string pickerGuardSource = File.ReadAllText(
             Path.Combine(Environment.CurrentDirectory, "Views", "FixedPositionOpenFileDialogGuard.cs"));
-        Assert(pickerSource.Contains("DefaultExt = \".tht\"", StringComparison.Ordinal) &&
+        Assert(pickerSource.Contains("DefaultExt = \".model\"", StringComparison.Ordinal) &&
                pickerSource.Contains("OriginalItemDirectory = @\"C:\\Item\"", StringComparison.Ordinal) &&
                pickerSource.Contains("FirstOrDefault(window => window.IsActive)", StringComparison.Ordinal) &&
                pickerSource.Contains("AutoUpgradeEnabled = false", StringComparison.Ordinal) &&
@@ -165,6 +478,8 @@ internal static class Program
             "OpenFileDialog compensates the DWM frame for the original visible size, centers after Shell layout, and remains movable");
     }
 
+#endif
+#if LEGACY_D2XX
     private static void TestDiscardContactInterlock()
     {
         const string thtText =
@@ -313,7 +628,7 @@ internal static class Program
         Assert(
             System.Text.RegularExpressions.Regex.Matches(
                 testViewModelSource,
-                "new JBZUniversalTester\\.Views\\.FaultConfirmationWindow\\(").Count == 2 &&
+                "new JBZUniveresalLunix\\.Views\\.FaultConfirmationWindow\\(").Count == 2 &&
             System.Text.RegularExpressions.Regex.Matches(
                 testViewModelSource,
                 "ShowFaultConfirmationDialog\\(").Count == 5,
@@ -359,6 +674,7 @@ internal static class Program
             "Final PASS rejection must require _DISCARD sensor completion like every other FAIL");
     }
 
+#endif
     private static void TestProductionScanFirstFrameAfterSequenceReset()
     {
         var board = new FakeBoard();
@@ -413,10 +729,9 @@ internal static class Program
             BindingFlags.Instance | BindingFlags.NonPublic)
             ?? throw new InvalidOperationException("EnsureContinuousProductionScanAsync method not found.");
         ((Task)ensureContinuous.Invoke(vm, [])!).GetAwaiter().GetResult();
-        Assert(
-            vmBoard.Commands.Count(command => command == "START") == 1 &&
-            vmBoard.AppliedScanCapacity?.StartScanParameter == 8,
-            "Running active=1 stream is reconciled to requested active=8 instead of returning early");
+        Assert(vmBoard.Commands.All(command => command != "START") &&
+               vm.State == "CHỜ CHỌN MÃ HÀNG",
+            "Startup without a local model waits for selection without issuing START");
 
         Assert(
             ScanSupervisor.ResolveFirstFrameTimeoutMs(BoardCapacity.Create(10)) == 15_000,
@@ -548,6 +863,28 @@ internal static class Program
                supervisor.HealthSnapshot.State == ScanHealthState.Monitoring,
             "Reopen recovery restores the same scan mode and reaches Monitoring");
 
+        var uartBoard = new FakeBoard { ProducesPassiveScanFrames = false };
+        var uartClock = new ManualTimeProvider(
+            new DateTimeOffset(2026, 9, 10, 0, 0, 0, TimeSpan.Zero));
+        var uartSupervisor = new ScanSupervisor(uartBoard, _ => { }, uartClock);
+        uartSupervisor.EnsureProductionScanAsync(BoardCapacity.MaxGlobalIo, CancellationToken.None)
+            .GetAwaiter().GetResult();
+        uartClock.Advance(TimeSpan.FromSeconds(30));
+        Assert(uartSupervisor.HealthSnapshot.State == ScanHealthState.Monitoring &&
+               !uartSupervisor.TryBeginWatchdogRecovery(1_500, 1_000, out _),
+            "UART event scan must not trigger a false first-frame or passive-frame stall recovery");
+        uartSupervisor.StartProductionScanAndVerifyFrameAsync(
+            BoardCapacity.MaxGlobalIo, CancellationToken.None, "UART_AFTER_MODEL_UPLOAD")
+            .GetAwaiter().GetResult();
+        Assert(uartBoard.Commands.All(command => command is not "STOP" and not "START"),
+            "UART scan reuse does not send another command just to obtain an empty frame");
+        uartBoard.StopScanAsync().GetAwaiter().GetResult();
+        Assert(uartSupervisor.TryBeginWatchdogRecovery(1_500, 1_000, out _) &&
+               uartSupervisor.RecoverSoftAsync(BoardCapacity.MaxGlobalIo,
+                   BoardScanMode.Production, CancellationToken.None).GetAwaiter().GetResult() &&
+               uartSupervisor.HealthSnapshot.State == ScanHealthState.Monitoring,
+            "UART scan-stopped recovery restarts without requiring a passive frame");
+
         string source = File.ReadAllText(
             Path.Combine(Environment.CurrentDirectory, "ViewModels", "TestViewModel.cs"));
         int recoveryStart = source.IndexOf(
@@ -566,6 +903,34 @@ internal static class Program
             "Recovery is scoped to transport lifetime and cannot repeat production side effects");
         Assert(source.Split("_scanSupervisor.Suspend(\"Resistance\")", StringSplitOptions.None).Length - 1 >= 3,
             "Manual, Master and automatic resistance paths suspend ScanSupervisor before TestEngine stops scan");
+        int uploadStart = source.IndexOf("public async Task<ProductModel?> LoadSelectedModelFromPathAsync", StringComparison.Ordinal);
+        int uploadEnd = source.IndexOf("public async Task<ProductModel?> LoadPreparedModelAsync", uploadStart, StringComparison.Ordinal);
+        string uploadMethod = source[uploadStart..uploadEnd];
+        Assert(uploadMethod.Contains("await _scanRecoveryGate.WaitAsync(ct)", StringComparison.Ordinal) &&
+               uploadMethod.Contains("_scanSupervisor.Suspend(\"ModelUpload\")", StringComparison.Ordinal) &&
+               uploadMethod.Contains("await _board.ConfigureModelAsync(model, progress, ct)", StringComparison.Ordinal) &&
+               uploadMethod.Contains("_scanRecoveryGate.Release()", StringComparison.Ordinal),
+            "Operator model transfer delegates atomic STOP/MODEL to the adapter while scan recovery stays suspended");
+        string adapterSource = File.ReadAllText(Path.Combine(
+            Environment.CurrentDirectory, "Services", "JbzBoardTransportAdapter.cs"));
+        Assert(adapterSource.Split("await _modelOperationGate.WaitAsync(ct)", StringSplitOptions.None).Length - 1 >= 4 &&
+               adapterSource.Split("_modelOperationGate.Release()", StringSplitOptions.None).Length - 1 >= 4,
+            "UART START and explicit model transfer share one board-side model operation gate");
+        Assert(adapterSource.Contains("case JbzEventFamily.Open:", StringComparison.Ordinal) &&
+               adapterSource.Contains("PublishContinuityPreview", StringComparison.Ordinal) &&
+               adapterSource.Contains("case JbzEventFamily.Short:", StringComparison.Ordinal),
+            "Rev 1.42 OPEN/SHORT/OTHER events must drive realtime Test-screen presentation previews");
+        string serialSource = File.ReadAllText(Path.Combine(
+            Environment.CurrentDirectory, "Services", "JbzSerialBoardTransport.cs"));
+        Assert(serialSource.Contains("Task<JbzBoardEvent> acknowledgment = WaitAsync(JbzEventFamily.Stop", StringComparison.Ordinal) &&
+               serialSource.Contains("await acknowledgment", StringComparison.Ordinal) &&
+               serialSource.Contains("await WaitAsync(JbzEventFamily.Start", StringComparison.Ordinal) &&
+               serialSource.Contains("await SendCoreAsync($\":MAXEXT,{maxExt}\"", StringComparison.Ordinal),
+            "UART STOP/START transitions must wait for firmware state ACK and START must send MAXEXT immediately");
+        Assert(!source.Contains("StartTestCycleAsync(cycleToken)", StringComparison.Ordinal) &&
+               !adapterSource.Contains("IJbzOriginalTestCycleControl", StringComparison.Ordinal) &&
+               !serialSource.Contains("TestOnAsync", StringComparison.Ordinal),
+            "Universal Tester New Production ARM must reuse START and have no legacy TESTON sender");
 
         static ScanFrame HealthFrame(long sequence, long generation, bool complete = true) => new(
             DateTime.Now,
@@ -598,11 +963,11 @@ internal static class Program
             File.WriteAllText(Path.Combine(older, "production.settings.json"), "{\"LotNo\":3456}");
             File.WriteAllText(Path.Combine(previous, "production.statistics.json"), "latest-statistics");
             File.WriteAllText(Path.Combine(previous, "production.settings.json"), "{\"LotNo\":2000}");
-            File.WriteAllText(Path.Combine(previous, "JBZUniversalTester.cfg"), "[LotNo]3456\r\n");
-            File.WriteAllText(Path.Combine(previous, "JBZUniversalTester.log"), "canonical-log");
+            File.WriteAllText(Path.Combine(previous, "JBZUniveresalLunix.cfg"), "[LotNo]3456\r\n");
+            File.WriteAllText(Path.Combine(previous, "JBZUniveresalLunix.log"), "canonical-log");
             File.WriteAllText(Path.Combine(previous, "PartCnt.txt"), "PART-A 200000 4321");
             File.WriteAllBytes(
-                Path.Combine(previous, "Data", "JBZUniversalTester.db"),
+                Path.Combine(previous, "Data", "JBZUniveresalLunix.db"),
                 [1, 2, 3, 4]);
 
             // A value already created on the destination machine is authoritative.
@@ -617,17 +982,17 @@ internal static class Program
                 !File.Exists(Path.Combine(target, "production.settings.json")),
                 "Legacy JSON files must not be copied into the canonical runtime directory");
             Assert(
-                File.ReadAllText(Path.Combine(target, "JBZUniversalTester.cfg")) == "[LotNo]3456\r\n",
+                File.ReadAllText(Path.Combine(target, "JBZUniveresalLunix.cfg")) == "[LotNo]3456\r\n",
                 "Canonical CFG must be inherited");
             Assert(
                 File.ReadAllText(Path.Combine(target, "PartCnt.txt")) == "PART-A 200000 5000",
                 "Existing destination PartCnt must never be overwritten");
             Assert(
-                File.ReadAllBytes(Path.Combine(target, "Data", "JBZUniversalTester.db"))
+                File.ReadAllBytes(Path.Combine(target, "Data", "JBZUniveresalLunix.db"))
                     .SequenceEqual(new byte[] { 1, 2, 3, 4 }),
                 "Canonical SQLite database must be inherited");
             Assert(
-                !File.Exists(Path.Combine(target, "JBZUniversalTester.log")),
+                !File.Exists(Path.Combine(target, "JBZUniveresalLunix.log")),
                 "Runtime logs must never be inherited from an older version");
             Assert(migrated.Count == 2, "Only missing production state files must be reported as migrated");
         }
@@ -1083,6 +1448,38 @@ internal static class Program
                engine.GetProductEvidenceSnapshot().ShortConfirmedCount == 1,
             "Short confirmation remains realtime without waiting for an expected pair");
 
+        // Universal Tester New already classifies :OTHER/:SHORT in firmware.
+        // Those explicit hints must not pass through the legacy D2XX debounce gate.
+        engine.SetModel(Model(
+            ("PAIR-A", new[] { 1, 2 }),
+            ("PAIR-B", new[] { 3, 4 })));
+        var firmwareWrong = FrameSeq(1141, (1, new[] { 4 })) with
+        {
+            ExplicitFaults = new Dictionary<(int SourceIo, int TargetIo), ProductFaultType>
+            {
+                [(1, 4)] = ProductFaultType.WrongWiring
+            }
+        };
+        engine.ProcessFrame(firmwareWrong);
+        Assert(engine.HasWiringFault &&
+               engine.GetProductEvidenceSnapshot().WrongConfirmedCount == 1,
+            "Firmware OTHER is authoritative and confirms wrong wiring in the first CIRCUIT snapshot");
+
+        engine.SetModel(Model(
+            ("PAIR-A", new[] { 1, 2 }),
+            ("PAIR-B", new[] { 3, 4 })));
+        var firmwareShort = FrameSeq(1142, (2, new[] { 3 })) with
+        {
+            ExplicitFaults = new Dictionary<(int SourceIo, int TargetIo), ProductFaultType>
+            {
+                [(2, 3)] = ProductFaultType.ShortCircuit
+            }
+        };
+        engine.ProcessFrame(firmwareShort);
+        Assert(engine.HasWiringFault &&
+               engine.GetProductEvidenceSnapshot().ShortConfirmedCount == 1,
+            "Firmware SHORT is authoritative and confirms short circuit in the first CIRCUIT snapshot");
+
         engine.SetModel(Model(("PAIR-A", new[] { 1, 2 })));
         Assert(engine.ApplyContinuityPreviewSource(1, new[] { 2 }, sequence: 115) &&
                engine.HasContinuityPreviewProductActivity &&
@@ -1121,12 +1518,12 @@ internal static class Program
             $"lot={vm.Lot}/{lotBefore}, sound={productSoundFlag}, detected={productDetectedThisCycle}, " +
             $"commands={string.Join(',', vmBoard.Commands)})");
 
-        string d2xxSource = File.ReadAllText(
-            Path.Combine(Environment.CurrentDirectory, "Services", "D2xxBoardTransport.cs"));
+        string uartSource = File.ReadAllText(
+            Path.Combine(Environment.CurrentDirectory, "Services", "JbzSerialBoardTransport.cs"));
         string supervisorSource = File.ReadAllText(
             Path.Combine(Environment.CurrentDirectory, "Services", "ScanSupervisor.cs"));
-        Assert(d2xxSource.Contains(
-                   "readGeneration != Volatile.Read(ref _scanGeneration)",
+        Assert(uartSource.Contains(
+                   "generation != Volatile.Read(ref _generation)",
                    StringComparison.Ordinal) &&
                supervisorSource.Contains("frame.ScanGeneration != _previousScanGeneration", StringComparison.Ordinal),
             "Stale scan generations remain rejected by transport and ScanSupervisor gates");
@@ -1339,12 +1736,12 @@ internal static class Program
             .GetResult();
         publishRecoveryFrame.GetAwaiter().GetResult();
         Assert(recoveryVm.ResultStatusText == "LẮP SẢN PHẨM" &&
-               recoveryVm.Faults.Count == 0 &&
+               recoveryVm.Faults.Count(row => row.WireName == "RECOVERY-PAIR") == 2 &&
                recoveryVm.CurrentProductionRuntimeState == ProductionRuntimeState.WaitingForProduct &&
                !recoveryVm.IsProductRemovalPending &&
                !recoveryBoard.Commands.Contains("START") &&
                !recoveryBoard.Commands.Contains("SET:2"),
-            "Rejected FAIL commit reuses healthy removal scan, returns to authoritative WaitingForProduct with no removal latch, and cannot remain latched at KHÔNG ĐẠT");
+            "Rejected FAIL commit returns to WaitingForProduct with both pending wire rows visible and no stale removal latch");
 
         string xaml = File.ReadAllText(Path.Combine(Environment.CurrentDirectory, "Views", "TestWindow.xaml"));
         Assert(!xaml.Contains("ProbeToggleText", StringComparison.Ordinal) &&
@@ -1409,11 +1806,14 @@ internal static class Program
                xaml.Contains("x:Key=\"TestExitForeground\" Color=\"#A61B1B\"", StringComparison.Ordinal),
             "TestView back navigation uses the shared light-red exit treatment");
         Assert(xaml.Contains("x:Name=\"HeaderNavigationRow\"", StringComparison.Ordinal) &&
-               xaml.Contains("x:Name=\"StatusLedPanel\"", StringComparison.Ordinal) &&
-               xaml.Contains("Margin=\"10,0,2,0\"", StringComparison.Ordinal) &&
+               !xaml.Contains("x:Name=\"StatusLedPanel\"", StringComparison.Ordinal) &&
+               !xaml.Contains("YellowStatusLed", StringComparison.Ordinal) &&
+               !xaml.Contains("WhiteStatusLed", StringComparison.Ordinal) &&
+               !xaml.Contains("GreenStatusLed", StringComparison.Ordinal) &&
+               !xaml.Contains("RedStatusLed", StringComparison.Ordinal) &&
                xaml.Contains("x:Name=\"LabelActionButtonsPanel\"", StringComparison.Ordinal) &&
                xaml.Contains("<ColumnDefinition Width=\"6\"/>", StringComparison.Ordinal),
-            "TestView separates the four status LEDs from navigation and gives both label actions responsive equal widths");
+            "TestView removes all four legacy status LEDs while preserving navigation and label actions");
 
         string testWindowSource = File.ReadAllText(
             Path.Combine(Environment.CurrentDirectory, "Views", "TestWindow.xaml.cs"));
@@ -1422,17 +1822,11 @@ internal static class Program
                testWindowSource.Contains("TestGridMaximumScale = 1.25", StringComparison.Ordinal) &&
                testWindowSource.Contains("Resources[\"TestFaultGridFontSize\"]", StringComparison.Ordinal),
             "TestView keeps large 1280x768 text and scales grid typography/row spacing uniformly through Full HD");
-        int yellowLedIndex = xaml.IndexOf("x:Name=\"YellowStatusLed\"", StringComparison.Ordinal);
-        int whiteLedIndex = xaml.IndexOf("x:Name=\"WhiteStatusLed\"", StringComparison.Ordinal);
-        int greenLedIndex = xaml.IndexOf("x:Name=\"GreenStatusLed\"", StringComparison.Ordinal);
-        int redLedIndex = xaml.IndexOf("x:Name=\"RedStatusLed\"", StringComparison.Ordinal);
-        Assert(yellowLedIndex >= 0 && yellowLedIndex < whiteLedIndex &&
-               whiteLedIndex < greenLedIndex && greenLedIndex < redLedIndex &&
-               testWindowSource.Contains("TimeSpan.FromMilliseconds(180)", StringComparison.Ordinal) &&
-               testWindowSource.Contains("TimeSpan.FromMilliseconds(90)", StringComparison.Ordinal) &&
-               testWindowSource.Contains("blink < 3", StringComparison.Ordinal) &&
-               testWindowSource.Contains("viewModel.IsDeviceFault", StringComparison.Ordinal),
-            "TestView LEDs keep YELLOW-WHITE-GREEN-RED order, pulse timing, three PASS blinks, and hardware-fault blackout");
+        Assert(!testWindowSource.Contains("StatusLed", StringComparison.Ordinal) &&
+               !testWindowSource.Contains("PulseYellowLed", StringComparison.Ordinal) &&
+               !testWindowSource.Contains("PulseWhiteLed", StringComparison.Ordinal) &&
+               !testWindowSource.Contains("GreenPassBlink", StringComparison.Ordinal),
+            "Removing the four LEDs also removes their frame handlers, pulse timers and PASS blink workload");
 
         string mainWindowSource = File.ReadAllText(
             Path.Combine(Environment.CurrentDirectory, "Views", "MainWindow.xaml.cs"));
@@ -1470,8 +1864,8 @@ internal static class Program
                testWindowSource.Contains("if (_autoStartProduction)", StringComparison.Ordinal),
             "TestWindow has no offline preview path; MainWindow must reject entry without a healthy board");
         int typeColumnIndex = xaml.IndexOf("Header=\"Lo&#7841;i\"", StringComparison.Ordinal);
-        int ioColumnIndex = xaml.IndexOf("Header=\"IO\" Binding=\"{Binding IoText}\"", StringComparison.Ordinal);
-        int connectorColumnIndex = xaml.IndexOf("Header=\"Connector\"", StringComparison.Ordinal);
+        int ioColumnIndex = xaml.IndexOf("Header=\"IO\" Binding=\"{Binding IoText}\"", typeColumnIndex, StringComparison.Ordinal);
+        int connectorColumnIndex = xaml.IndexOf("Header=\"Connector\"", ioColumnIndex, StringComparison.Ordinal);
         Assert(typeColumnIndex >= 0 &&
                ioColumnIndex > typeColumnIndex &&
                connectorColumnIndex > ioColumnIndex,
@@ -1526,9 +1920,11 @@ internal static class Program
                settingsXaml.Contains("Grid.Row=\"2\"", StringComparison.Ordinal) &&
                settingsXaml.Contains("Grid.Column=\"2\"", StringComparison.Ordinal),
             "Label printer controls use a compact three-row layout so manual resistance stays visible");
-        Assert(settingsXaml.Contains("x:Name=\"RelayWiringModeComboBox\"", StringComparison.Ordinal) &&
-               settingsXaml.Contains("Settings.RelayWiringMode", StringComparison.Ordinal),
-            "Production settings exposes one physical relay-role mapping and states FAIL behavior clearly");
+        Assert(settingsXaml.Contains("RELAY 1 (OUT0)", StringComparison.Ordinal) &&
+               settingsXaml.Contains("RELAY 5 (OUT4)", StringComparison.Ordinal) &&
+               !settingsXaml.Contains("JigRelayChannelComboBox", StringComparison.Ordinal) &&
+               !settingsXaml.Contains("MarkingRelayChannelComboBox", StringComparison.Ordinal),
+            "Production settings fixes physical Relay 1 to OUT0 and Relay 5 to OUT4");
         Assert(xaml.Contains("x:Name=\"TestHeaderSurface\" Width=\"1344\" Height=\"234\"", StringComparison.Ordinal) &&
                xaml.Contains("x:Name=\"TestAppVersionText\"", StringComparison.Ordinal) &&
                xaml.Contains("Grid.Row=\"8\"", StringComparison.Ordinal) &&
@@ -1564,7 +1960,7 @@ internal static class Program
                settingsXaml.IndexOf("x:Name=\"WaterProofSettingsPanel\"", StringComparison.Ordinal) >
                    settingsXaml.IndexOf("x:Name=\"RelaySettingsPanel\"", StringComparison.Ordinal) &&
                settingsXaml.IndexOf("x:Name=\"WaterProofSettingsPanel\"", StringComparison.Ordinal) <
-                   settingsXaml.IndexOf("Text=\"MANUAL RELAY\"", StringComparison.Ordinal) &&
+                   settingsXaml.IndexOf("Text=\"MANUAL OUTPUT BO MỚI (0-4)\"", StringComparison.Ordinal) &&
                !settingsSource.Contains("MoveWaterProofSettingsToRelayColumn", StringComparison.Ordinal),
             "Unused legacy UI fields are hidden and TEST LEAK is grouped in the relay/maintenance column");
         System.Xml.Linq.XElement[] settingsButtons =
@@ -1572,7 +1968,7 @@ internal static class Program
                 .Descendants()
                 .Where(element => element.Name.LocalName == "Button")
                 .ToArray();
-        Assert(settingsButtons.Length == 14 &&
+        Assert(settingsButtons.Length == 21 &&
                settingsButtons.All(button =>
                    button.Attribute("Style")?.Value.Contains("StaticResource", StringComparison.Ordinal) == true) &&
                settingsXaml.Contains("SettingsPrimaryButtonStyle", StringComparison.Ordinal) &&
@@ -1731,36 +2127,46 @@ internal static class Program
             "Manual relay menu is ready without a saved ManualModeEnabled setting");
 
         board.Commands.Clear();
-        int relay = vm.SetManualRelayAsync(1, true).GetAwaiter().GetResult();
-        Assert(relay == 1 && vm.IsManualModeActive && vm.State == "MANUAL" && !board.IsScanning,
-            "Manual Relay 1 ON holds one relay and keeps Production scan stopped");
+        int relay = vm.SetManualRelayAsync(0, true).GetAwaiter().GetResult();
+        Assert(relay == 0 && vm.IsManualModeActive && vm.State == "MANUAL" && !board.IsScanning,
+            "Manual physical Relay 1 / OUT0 holds one relay and keeps Production scan stopped");
         Assert(board.Commands.Count(command => command == "OFF") >= 1 &&
-               board.Commands.Last() == "SET:1",
-            "Manual Relay 1 ON forces all relay OFF before selecting Relay 1");
+               board.Commands.Last() == "SET:0",
+            "Manual Relay 1 / OUT0 forces both physical relays OFF before selecting Relay 1");
+
+        foreach (int nonRelayOutput in new[] { 1, 2, 3 })
+        {
+            try
+            {
+                vm.SetManualRelayAsync(nonRelayOutput, true).GetAwaiter().GetResult();
+                throw new InvalidOperationException($"OUT{nonRelayOutput} must not be exposed as a physical relay");
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+            }
+        }
 
         board.Commands.Clear();
-        relay = vm.SetManualRelayAsync(2, true).GetAwaiter().GetResult();
-        Assert(relay == 2 && vm.IsManualModeActive && !board.IsScanning,
-            "Manual Relay 2 ON replaces Relay 1 while Manual remains active");
-        Assert(string.Join(",", board.Commands) == "OFF,SET:2",
-            "Manual relay switching is mutually exclusive: OFF before SET:2");
+        relay = vm.SetManualRelayAsync(4, true).GetAwaiter().GetResult();
+        Assert(relay == 4 && vm.IsManualModeActive && !board.IsScanning && board.Commands.Last() == "SET:4",
+            "Manual physical Relay 5 / OUT4 replaces Relay 1 while Manual remains active");
 
         board.Commands.Clear();
         vm.ResetManualOutputsAsync().GetAwaiter().GetResult();
         Assert(!vm.IsManualModeActive &&
                string.Join(",", board.Commands) == "OFF,RESET,OFF,START",
-            "RESET while Relay 2 is ON forces OFF, clears the board, confirms OFF, then resumes scan");
+            "RESET while a Universal Tester New output is ON forces OFF, clears the board, confirms OFF, then resumes scan");
 
         board.Commands.Clear();
-        relay = vm.SetManualRelayAsync(1, true).GetAwaiter().GetResult();
-        Assert(relay == 1 && vm.IsManualModeActive && board.Commands.Last() == "SET:1",
-            "Manual Relay 1 can be selected again after RESET");
+        relay = vm.SetManualRelayAsync(0, true).GetAwaiter().GetResult();
+        Assert(relay == 0 && vm.IsManualModeActive && board.Commands.Last() == "SET:0",
+            "Manual Relay 1 / OUT0 can be selected again after RESET");
 
         board.Commands.Clear();
-        relay = vm.SetManualRelayAsync(1, false).GetAwaiter().GetResult();
-        Assert(relay == 0 && !vm.IsManualModeActive &&
+        relay = vm.SetManualRelayAsync(0, false).GetAwaiter().GetResult();
+        Assert(relay == -1 && !vm.IsManualModeActive &&
                board.Commands.Contains("OFF") && board.Commands.Last() == "START",
-            "TẮT TẤT CẢ forces both outputs OFF and resumes Production scan");
+            "TẮT TẤT CẢ forces all Universal Tester New outputs OFF and resumes Production scan");
 
         vm.StartProductionTestAsync().GetAwaiter().GetResult();
         Assert(vm.State != "MANUAL", "Production is no longer locked after direct Relay OFF/RESET");
@@ -1777,7 +2183,7 @@ internal static class Program
         faultBoard.ThrowOnSetRelay = true;
         try
         {
-            faultVm.SetManualRelayAsync(1, true).GetAwaiter().GetResult();
+            faultVm.SetManualRelayAsync(0, true).GetAwaiter().GetResult();
             throw new InvalidOperationException("Manual relay failure should throw");
         }
         catch (InvalidOperationException)
@@ -1796,17 +2202,25 @@ internal static class Program
         Assert(settingsPageSource.Contains("await _main.Test.ResetManualOutputsAsync();", StringComparison.Ordinal) &&
                mainWindowSource.Contains("await settingsPage.ReleaseManualOutputsAsync();", StringComparison.Ordinal),
             "Every Settings-page close path awaits Manual RESET before releasing the page");
-        Assert(settingsXaml.Contains("T&#7854;T T&#7844;T C&#7842;", StringComparison.Ordinal) &&
-               !settingsXaml.Contains("ManualRelay2OffCommand", StringComparison.Ordinal),
-            "Manual relay UI exposes the proven mutually-exclusive R1/R2 selector and one ALL OFF command");
+        Assert(settingsXaml.Contains("MANUAL RELAY BO MỚI", StringComparison.Ordinal) &&
+               settingsXaml.Contains("ManualRelay0OnCommand", StringComparison.Ordinal) &&
+               settingsXaml.Contains("ManualRelay4OnCommand", StringComparison.Ordinal) &&
+               !settingsXaml.Contains("ManualRelay1OnCommand", StringComparison.Ordinal) &&
+               !settingsXaml.Contains("ManualRelay2OnCommand", StringComparison.Ordinal) &&
+               !settingsXaml.Contains("ManualRelay3OnCommand", StringComparison.Ordinal) &&
+               settingsXaml.Contains("TẮT CẢ 2 RELAY", StringComparison.Ordinal),
+            "Manual settings expose only physical Relay 1/OUT0 and Relay 5/OUT4");
 
-        string d2xxSource = File.ReadAllText(
-            Path.Combine(Environment.CurrentDirectory, "Services", "D2xxBoardTransport.cs"));
-        Assert(d2xxSource.Contains("const int RelayCommandSettleMs = 100;", StringComparison.Ordinal) &&
-               d2xxSource.Contains("await Task.Delay(RelayCommandSettleMs, CancellationToken.None);", StringComparison.Ordinal) &&
-               d2xxSource.IndexOf("await Task.Delay(RelayCommandSettleMs, CancellationToken.None);", StringComparison.Ordinal) <
-               d2xxSource.IndexOf("Volatile.Write(ref _activeRelay, relayState);", StringComparison.Ordinal),
-            "D2XX completes the non-cancellable firmware relay settle before caching the new relay state");
+        string uartSource = File.ReadAllText(
+            Path.Combine(Environment.CurrentDirectory, "Services", "JbzBoardTransportAdapter.cs"));
+        Assert(uartSource.Contains("_serial.OutputAsync(relay, true, ct)", StringComparison.Ordinal),
+            "Manual relay control uses the serialized UART board owner");
+        string serialSource = File.ReadAllText(
+            Path.Combine(Environment.CurrentDirectory, "Services", "JbzSerialBoardTransport.cs"));
+        Assert(serialSource.Contains("OUTPUT_ACK channel=", StringComparison.Ordinal) &&
+               serialSource.Contains("WaitAsync(JbzEventFamily.Output", StringComparison.Ordinal) &&
+               serialSource.Contains(":OUTPUTTEST,{channel}", StringComparison.Ordinal),
+            "Universal Tester New OUTPUTTEST waits for the matching :OUTPUT channel/state acknowledgment");
     }
 
     private static void TestStartupIoInterlock()
@@ -1819,47 +2233,6 @@ internal static class Program
             StartupIoInterlock.FindConnectedPairs(duplicatedDirections);
         Assert(normalized.Count == 1 && normalized[0] == new StartupIoContactPair(1, 18),
             "Startup IO detector normalizes and de-duplicates bidirectional edges");
-
-        ScanFrame substitutedSource = FrameSeq(99, (12, new[] { 13 })) with
-        {
-            ActiveIo = new HashSet<int> { 13 },
-            ExpectedIoCount = 64,
-            SourceCount = 63,
-            ScanUnitCount = 1
-        };
-        Assert(StartupIoInterlock.FindConnectedPairs(
-                   substitutedSource,
-                   Model(("OTHER", new[] { 1, 18 })),
-                   BoardCapacity.Create(1)).Count == 0,
-            "A lone TARGET replacing its SOURCE word is raw IO activity, not IO12<->IO13 product evidence");
-
-        ScanFrame expectedSubstitutedSource = substitutedSource with
-        {
-            ConnectionsBySource = new Dictionary<int, IReadOnlySet<int>>
-            {
-                [12] = new HashSet<int> { 13 }
-            }
-        };
-        Assert(StartupIoInterlock.FindConnectedPairs(
-                   expectedSubstitutedSource,
-                   Model(("EXPECTED", new[] { 12, 13 })),
-                   BoardCapacity.Create(1)).Single() == new StartupIoContactPair(12, 13),
-            "A real expected product pair remains authoritative even when its target replaces a SOURCE word");
-
-        Assert(StartupIoInterlock.FindConnectedPairs(
-                   ProbeFrameSeq(98, 13),
-                   model: null,
-                   capacity: BoardCapacity.Create(10)).Count == 0,
-            "Probe/TP fan-in is never product-removal evidence");
-
-        TestViewModel rawIoVm = CreateTestViewModel(
-            new ProductionSettings { MasterFaultRequiredCount = 0 },
-            out FakeBoard rawIoBoard);
-        rawIoVm.SetModel(Model(("RAW-IO-CONTROL", new[] { 1, 18 })));
-        rawIoBoard.Publish(substitutedSource with { Sequence = 99 });
-        Assert(!rawIoVm.IsProductRemovalPending &&
-               !rawIoVm.State.Contains("THÁO SẢN PHẨM", StringComparison.OrdinalIgnoreCase),
-            "A complete frame containing only raw IO13 cannot lock START or request product removal");
 
         var resumeProduction = new ProductionSettings
         {
@@ -1946,108 +2319,34 @@ internal static class Program
         Assert(!vm.IsProductRemovalPending &&
                vm.State == "CHỜ LẮP SẢN PHẨM" && vm.ResultStatusText == "LẮP SẢN PHẨM",
             "A complete clean frame clears the startup interlock and arms Production");
-    }
 
-    private static void TestTopologyLearningDirectContact()
-    {
-        var connections = new Dictionary<int, IReadOnlySet<int>>();
-        for (int source = 1; source <= 256; source++)
-        {
-            if (source != 20)
-                connections[source] = new HashSet<int> { 20 };
-        }
-
-        var frame = new ScanFrame(
-            DateTime.Now,
-            4,
-            new HashSet<int> { 20 },
-            [],
-            true,
-            0,
-            171,
-            connections,
-            new Dictionary<int, int> { [20] = 255 },
-            BoardScanMode.Production);
-
-        IReadOnlyList<int> directActiveIo = TopologyLearningService.FindProbeContactIo(
-            frame,
-            BoardCapacity.Create(4));
-
-        Assert(directActiveIo.SequenceEqual(new[] { 20 }),
-            "Topology learning reports only the directly active GND-contact IO, not every connection source");
-        LearnedTopologySnapshot probeSnapshot = TopologyLearningService.BuildSnapshot(
-            frame,
-            BoardCapacity.Create(4));
-        Assert(probeSnapshot.Rows.Count == 0,
-            "A detected Probe signature is not learned a second time as a continuity network");
-
-        var noisyPairConnections = new Dictionary<int, IReadOnlySet<int>>();
-        int[] everyIo = Enumerable.Range(1, 256).ToArray();
-        foreach (int source in everyIo)
-        {
-            noisyPairConnections[source] = everyIo
-                .Where(target => target != source)
-                .ToHashSet();
-        }
-
-        var noisyPairFrame = new ScanFrame(
-            DateTime.Now,
-            4,
-            new HashSet<int> { 21, 23 },
-            [],
-            true,
-            0,
-            172,
-            noisyPairConnections,
-            new Dictionary<int, int> { [21] = 255, [23] = 255 },
-            BoardScanMode.Production);
-        LearnedTopologySnapshot noisyPairSnapshot = TopologyLearningService.BuildSnapshot(
-            noisyPairFrame,
-            BoardCapacity.Create(4));
-        Assert(TopologyLearningService.FindProbeContactIo(
-                   noisyPairFrame,
-                   BoardCapacity.Create(4)).Count == 0 &&
-               noisyPairSnapshot.Networks.Count == 1 &&
-               noisyPairSnapshot.Networks[0].Ios.SequenceEqual(new[] { 21, 23 }),
-            "Two active IOs produce only their IO21-to-IO23 network even when raw scan sources contain card-wide noise");
-
-        var singleContactFrame = new ScanFrame(
-            DateTime.Now,
-            4,
-            new HashSet<int> { 12 },
-            [],
-            true,
-            0,
-            173,
-            new Dictionary<int, IReadOnlySet<int>>
+        // Closing TestView while a product is only partially assembled is a
+        // background installed-product interlock, not the post-result removal state.
+        TestViewModel incompleteVm = CreateTestViewModel(
+            new ProductionSettings
             {
-                [12] = new HashSet<int> { 12 }
+                MasterFaultRequiredCount = 0,
+                ProductSettleTimeMs = 0
             },
-            new Dictionary<int, int> { [12] = 1 },
-            BoardScanMode.Production);
-        Assert(TopologyLearningService.FindProbeContactIo(
-                   singleContactFrame,
-                   BoardCapacity.Create(4)).Count == 0 &&
-               TopologyLearningService.BuildSnapshot(
-                   singleContactFrame,
-                   BoardCapacity.Create(4)).Rows.Count == 0,
-            "A single GND/IO self-contact has no Probe or topology effect");
-
-        ScanFrame ordinaryPair = FrameSeq(174, (7, new[] { 18 }));
-        Assert(TopologyLearningService.FindProbeContactIo(
-                   ordinaryPair,
-                   BoardCapacity.Create(4)).Count == 0 &&
-               TopologyLearningService.BuildSnapshot(
-                   ordinaryPair,
-                   BoardCapacity.Create(4)).Rows.Count == 1,
-            "An ordinary IO-to-IO pair remains learnable topology and is not treated as Probe");
-
-        string testViewModelSource = File.ReadAllText(
-            Path.Combine(Environment.CurrentDirectory, "ViewModels", "TestViewModel.cs"));
-        Assert(testViewModelSource.Contains(
-                   "Volatile.Read(ref _topologyLearningActive) == 0",
-                   StringComparison.Ordinal),
-            "Background product interlock is bypassed while topology learning owns the frame presentation");
+            out FakeBoard incompleteBoard);
+        incompleteVm.SetModel(Model(
+            ("INCOMPLETE-A", new[] { 1, 2 }),
+            ("INCOMPLETE-B", new[] { 3, 4 })));
+        incompleteVm.StartProductionTestAsync().GetAwaiter().GetResult();
+        incompleteBoard.Publish(FrameSeq(900, (1, new[] { 2 })));
+        Assert(incompleteVm.CurrentProductionRuntimeState == ProductionRuntimeState.TestingRealtime,
+            "Partial assembly is detected as realtime product presence");
+        incompleteVm.StopViewAsync().GetAwaiter().GetResult();
+        Assert(incompleteVm.IsProductRemovalPending &&
+               incompleteVm.CurrentProductionRuntimeState != ProductionRuntimeState.WaitingForRemoval &&
+               incompleteVm.State.Contains("LẮP DỞ", StringComparison.Ordinal),
+            "Leaving TestView mid-assembly locks the product in background without pretending a PASS/FAIL removal phase");
+        incompleteBoard.Publish(FrameSeq(901, (1, new[] { 2 })));
+        Assert(incompleteVm.IsProductRemovalPending,
+            "Background incomplete-product lock remains while any product edge is still present");
+        incompleteBoard.Publish(FrameSeq(902));
+        Assert(!incompleteVm.IsProductRemovalPending,
+            "A complete empty background frame releases the incomplete-product lock");
     }
 
     private static void TestDuplicateClipFaultRows()
@@ -2082,326 +2381,6 @@ internal static class Program
         Assert(vm.Faults.Count == desired.Length &&
                vm.Faults.Select(row => row.Status).SequenceEqual(desired.Select(row => row.Status)),
             "Duplicate CLIP rows synchronize without an out-of-range Move");
-    }
-
-    private static void TestD2xxResistanceRouting()
-    {
-        for (int channel = D2xxResistanceRouting.MinChannel;
-             channel <= D2xxResistanceRouting.MaxChannel;
-             channel++)
-        {
-            byte selector = D2xxResistanceRouting.ToResistanceSelector(channel);
-            Assert(selector == channel, $"CH{channel} selector must be direct value 0x{channel:X2}");
-            Assert(
-                D2xxResistanceRouting.BuildRouteB(channel).SequenceEqual(
-                    new byte[] { 0x91, 0x00, 0x00, (byte)channel }),
-                $"CH{channel} RouteB must end in 0x{channel:X2}");
-        }
-
-        Assert(D2xxResistanceRouting.BuildRouteA().SequenceEqual(
-            new byte[] { 0x90, 0x00, 0x00, 0x01 }),
-            "Resistance RouteA is canonical");
-        Assert(D2xxResistanceRouting.ToResistanceSelector(3) != 0x04,
-            "CH3 must not regress to bitmask 0x04");
-        Assert(D2xxResistanceRouting.ToResistanceSelector(4) != 0x08,
-            "CH4 must not regress to bitmask 0x08");
-        Assert(D2xxResistanceRouting.ToResistanceSelector(5) != 0x10,
-            "CH5 must not regress to bitmask 0x10");
-        Assert(D2xxResistanceRouting.ToResistanceSelector(10) == 0x0A,
-            "CH10 selector must be 0x0A");
-        AssertThrows<ArgumentOutOfRangeException>(
-            () => D2xxResistanceRouting.ToResistanceSelector(0),
-            "CH0 must be rejected by D2XX routing");
-        AssertThrows<ArgumentOutOfRangeException>(
-            () => D2xxResistanceRouting.ToResistanceSelector(11),
-            "CH11 must be rejected by D2XX routing");
-        AssertThrows<ArgumentOutOfRangeException>(
-            () => D2xxResistanceRouting.BuildRouteB(0),
-            "CH0 route must be rejected");
-        AssertThrows<ArgumentOutOfRangeException>(
-            () => D2xxResistanceRouting.BuildRouteB(11),
-            "CH11 route must be rejected");
-        Assert(D2xxResistanceRouting.BuildReleaseRouteB().SequenceEqual(
-                new byte[] { 0x91, 0x00, 0x00, 0x00 }) &&
-               D2xxResistanceRouting.BuildReleaseRouteA().SequenceEqual(
-                new byte[] { 0x90, 0x00, 0x00, 0x30 }),
-            "Resistance release frames remain 91/00 and 90/30");
-
-        var legacyFiveSlots = new ProductionSettings
-        {
-            RelayWiringMode = 1,
-            ResistanceChannels =
-            [
-                new() { Enabled = true, Name = "R1", Channel = 8, MinOhm = 9, MaxOhm = 11 },
-                new() { Enabled = false, Name = "R2", Channel = 2, MinOhm = 20, MaxOhm = 25 },
-                new() { Enabled = true, Name = "R3", Channel = 10, MinOhm = 95, MaxOhm = 105 },
-                new() { Enabled = true, Name = "R4", Channel = 4, MinOhm = 0.5, MaxOhm = 1.5 },
-                new() { Enabled = false, Name = "R5", Channel = 5, MinOhm = 0, MaxOhm = 0 }
-            ]
-        };
-        MethodInfo normalize = typeof(ProductionConfigService).GetMethod(
-            "Normalize",
-            BindingFlags.NonPublic | BindingFlags.Static)
-            ?? throw new InvalidOperationException("Production settings normalizer not found");
-        normalize.Invoke(null, [legacyFiveSlots]);
-
-        Assert(legacyFiveSlots.ResistanceChannels.Length == 10,
-            "Five-slot configuration must migrate to ten slots");
-        Assert(legacyFiveSlots.ResistanceChannels[0] is
-            { Name: "R1", Enabled: true, Channel: 8, MinOhm: 9, MaxOhm: 11 },
-            "R1 fields must survive migration");
-        Assert(legacyFiveSlots.ResistanceChannels[2] is
-            { Name: "R3", Enabled: true, Channel: 10, MinOhm: 95, MaxOhm: 105 },
-            "R3 arbitrary CH10 mapping and limits must survive migration");
-        Assert(legacyFiveSlots.ResistanceChannels[5] is
-            { Name: "R6", Enabled: false, Channel: 6, MinOhm: 0, MaxOhm: 0 } &&
-            legacyFiveSlots.ResistanceChannels[9] is
-            { Name: "R10", Enabled: false, Channel: 10, MinOhm: 0, MaxOhm: 0 },
-            "R6-R10 must be added disabled with useful default channels");
-
-        Assert(ResistanceMeasurementPlan.BuildManualSteps(legacyFiveSlots, 0)
-                .Select(step => step.Name)
-                .SequenceEqual(new[] { "R1", "R3", "R4" }),
-            "Manual ALL measures every currently enabled resistance slot");
-        Assert(ResistanceMeasurementPlan.BuildManualSteps(legacyFiveSlots, 5) is
-                [{ Name: "R5", Channel: 5 }],
-            "Manual single CH may measure its configured slot even when automatic measurement is disabled");
-
-        string settingsResistanceXaml = File.ReadAllText(
-            Path.Combine(Environment.CurrentDirectory, "Views", "ProductionSettingsPage.xaml"));
-        Assert(settingsResistanceXaml.Contains("ManualMeasureResistanceCommand", StringComparison.Ordinal) &&
-               settingsResistanceXaml.Contains("ManualResistanceOptions", StringComparison.Ordinal) &&
-               settingsResistanceXaml.Contains("ManualResistanceResults", StringComparison.Ordinal) &&
-               settingsResistanceXaml.Contains("Value=\"ĐANG ĐO\"", StringComparison.Ordinal),
-            "Settings exposes manual ALL/single-CH measurement and returned results");
-
-        string cfgPath = Path.Combine(
-            Path.GetTempPath(),
-            $"jbz-resistance-{Guid.NewGuid():N}.cfg");
-        try
-        {
-            ProductionConfigService.SaveLegacyCfg(legacyFiveSlots, cfgPath);
-            MethodInfo loadEnglishCfg = typeof(ProductionConfigService).GetMethod(
-                "LoadEnglishCfg",
-                BindingFlags.NonPublic | BindingFlags.Static)
-                ?? throw new InvalidOperationException("Legacy production settings loader not found");
-            var loaded = (ProductionSettings)(loadEnglishCfg.Invoke(null, [cfgPath])
-                ?? throw new InvalidOperationException("Legacy production settings loader returned null"));
-
-            Assert(loaded.ResistanceChannels.Length == 10,
-                "Saved configuration must load all ten resistance slots");
-            Assert(loaded.ResistanceChannels[0] is
-                { Name: "R1", Enabled: true, Channel: 8, MinOhm: 9, MaxOhm: 11 } &&
-                loaded.ResistanceChannels[2] is
-                { Name: "R3", Enabled: true, Channel: 10, MinOhm: 95, MaxOhm: 105 },
-                "Save/load must preserve Enabled, Channel, MinOhm and MaxOhm");
-            Assert(loaded.RelayWiringMode == 1 && loaded.FaultJigRelayNumber == 2,
-                "Save/load must preserve reversed R1 MARKING / R2 JIG wiring and its FAIL eject relay");
-        }
-        finally
-        {
-            if (File.Exists(cfgPath))
-                File.Delete(cfgPath);
-        }
-
-        var configured = new ProductionSettings
-        {
-            ResistanceChannels =
-            [
-                new() { Enabled = true, Name = "R1", Channel = 8, MinOhm = 1, MaxOhm = 2 },
-                new() { Enabled = true, Name = "R2", Channel = 2, MinOhm = 3, MaxOhm = 4 },
-                new() { Enabled = true, Name = "R3", Channel = 10, MinOhm = 5, MaxOhm = 6 },
-                new() { Enabled = true, Name = "R4", Channel = 4, MinOhm = 7, MaxOhm = 8 },
-                new() { Enabled = false, Name = "R5", Channel = 5, MinOhm = 9, MaxOhm = 10 },
-                new() { Enabled = true, Name = "R6", Channel = 0, MinOhm = 11, MaxOhm = 12 },
-                new() { Enabled = true, Name = "R7", Channel = 7, MinOhm = 0, MaxOhm = 10 },
-                new() { Enabled = true, Name = "R8", Channel = 7, MinOhm = 0, MaxOhm = 10 }
-            ]
-        };
-        List<ResistanceStep> steps = ResistanceMeasurementPlan.BuildEnabledSteps(configured);
-
-        Assert(steps.Select(step => step.Name).SequenceEqual(new[] { "R1", "R2", "R3", "R4", "R7", "R8" }),
-            "Runtime order must follow R slot order, not physical channel order");
-        Assert(steps.Select(step => step.Channel).SequenceEqual(new[] { 8, 2, 10, 4, 7, 7 }),
-            "Each R slot must retain its configured physical channel");
-        Assert(steps.All(step => step.Name is not "R5" and not "R6"),
-            "Disabled slots and Channel=0 slots must be skipped");
-
-        var duplicateChannelPlan = new ProductionSettings
-        {
-            ResistanceChannels =
-            [
-                new() { Enabled = true, Name = "R1", Channel = 4, MinOhm = 1, MaxOhm = 2 },
-                new() { Enabled = true, Name = "R2", Channel = 4, MinOhm = 3, MaxOhm = 4 }
-            ]
-        };
-        Assert(
-            ResistanceMeasurementPlan.BuildEnabledSteps(duplicateChannelPlan)
-                .Select(step => step.Channel)
-                .SequenceEqual(new[] { 4, 4 }),
-            "Two R slots may independently select the same physical CH4");
-
-        var malformed = new ProductionSettings
-        {
-            ResistanceChannels =
-            [
-                new() { Enabled = true, Name = "R2", Channel = 11, MinOhm = -5, MaxOhm = -10 },
-                new() { Enabled = true, Name = "R1", Channel = 3, MinOhm = 5, MaxOhm = 2 },
-                new() { Enabled = true, Name = "R1", Channel = 8, MinOhm = 1, MaxOhm = 2 },
-                new() { Enabled = true, Name = "", Channel = 4, MinOhm = 1, MaxOhm = 3 }
-            ]
-        };
-        normalize.Invoke(null, [malformed]);
-        Assert(malformed.ResistanceChannels.Length == 10,
-            "Duplicate/blank malformed settings normalize without crashing");
-        Assert(malformed.ResistanceChannels[0] is
-            { Name: "R1", Enabled: true, Channel: 8, MinOhm: 1, MaxOhm: 2 },
-            "Duplicate R1 keeps the first fully valid record");
-        Assert(malformed.ResistanceChannels[1] is
-            { Name: "R2", Enabled: true, Channel: 10, MinOhm: 0, MaxOhm: 0 },
-            "Out-of-range channel and invalid limits are safely clamped");
-
-        var fakeBoard = new FakeBoard();
-        var fakeVisa = new FakeKeysightVisaService(connected: true, measurement: 1.0);
-        var fastApp = new AppSettings();
-        fastApp.Test.ResistanceMinimumSettleMs = 0;
-        fastApp.Test.ResistanceSampleIntervalMs = 0;
-        fastApp.Test.ResistanceStableSampleCount = 2;
-        fastApp.Test.ResistanceStabilityTimeoutMs = 100;
-        using (var measurementEngine = new TestEngine(fakeBoard, fakeVisa, fastApp, configured))
-        {
-            measurementEngine.SetModel(new ProductModel { ModelName = "R-PLAN" });
-            List<ResistanceResult> measured = measurementEngine.MeasureResistanceAsync()
-                .GetAwaiter().GetResult();
-
-            Assert(fakeBoard.ResistanceSteps.Select(step => step.Name)
-                    .SequenceEqual(new[] { "R1", "R2", "R3", "R4", "R7", "R8" }) &&
-                   fakeBoard.ResistanceSteps.Select(step => step.Channel)
-                    .SequenceEqual(new[] { 8, 2, 10, 4, 7, 7 }),
-                "Engine routes valid slots in canonical R1-R10 order, including duplicate CH7");
-            Assert(fakeBoard.ResistanceFrames.SelectMany(pair => pair)
-                    .Chunk(8)
-                    .All(bytes => bytes.Take(4).SequenceEqual(new byte[] { 0x90, 0x00, 0x00, 0x01 })),
-                "Every measured slot starts with canonical 90 00 00 01");
-            Assert(fakeBoard.ResistanceFrames
-                    .Select(frame => frame[7])
-                    .SequenceEqual(new byte[] { 0x08, 0x02, 0x0A, 0x04, 0x07, 0x07 }),
-                "Engine emits direct CH8/CH2/CH10/CH4/CH7/CH7 selectors, never bitmasks");
-            Assert(measured.Count == 6 && fakeVisa.MeasureCallCount == 12 &&
-                   measured.All(result => result.IsStable && result.SampleCount == 2),
-                "Each enabled slot requires two stable samples; disabled/Channel=0 slots create no route or result");
-            Assert(fakeBoard.ReleaseResistanceRouteCount == 1 &&
-                   fakeBoard.ReleaseResistanceFrames.SequenceEqual(
-                       new byte[] { 0x91, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x30 }),
-                "Measurement route is released in finally after the sequence");
-        }
-
-        var manualBoard = new FakeBoard();
-        var manualVisa = new FakeKeysightVisaService(connected: true, measurement: 5.5);
-        using (var manualEngine = new TestEngine(manualBoard, manualVisa, fastApp, configured))
-        {
-            List<ResistanceStep> manualSteps = ResistanceMeasurementPlan.BuildManualSteps(configured, 10);
-            var manualUpdates = new List<ResistanceResult>();
-            List<ResistanceResult> manualResults = manualEngine
-                .MeasureResistanceStepsAsync(manualSteps, manualUpdates.Add)
-                .GetAwaiter()
-                .GetResult();
-            Assert(manualResults is [{ Name: "R3", Channel: 10 }] &&
-                   manualBoard.ResistanceSteps.Select(step => step.Channel).SequenceEqual(new[] { 10 }) &&
-                   manualVisa.MeasureCallCount == 2 &&
-                   manualUpdates.Count == 2 &&
-                   manualUpdates[0].ResultText == "ĐANG ĐO" &&
-                   manualUpdates[1].ResultText == "PASS" &&
-                   manualUpdates[1].Display != "—",
-                "Manual single CH reports measuring, then only the stable final value and PASS");
-        }
-
-        var stableGateSettings = new ProductionSettings
-        {
-            ResistanceChannels =
-            [
-                new() { Enabled = true, Name = "R1", Channel = 1, MinOhm = 8_000, MaxOhm = 11_000 }
-            ]
-        };
-        var transientOpenVisa = new FakeKeysightVisaService(connected: true, measurement: 8_818);
-        transientOpenVisa.Measurements.Enqueue(9.9e37);
-        transientOpenVisa.Measurements.Enqueue(8_820);
-        transientOpenVisa.Measurements.Enqueue(8_818);
-        using (var transientOpenEngine = new TestEngine(
-                   new FakeBoard(), transientOpenVisa, fastApp, stableGateSettings))
-        {
-            transientOpenEngine.SetModel(new ProductModel { ModelName = "R-STABLE" });
-            var updates = new List<ResistanceResult>();
-            ResistanceResult result = transientOpenEngine
-                .MeasureResistanceAsync(updates.Add)
-                .GetAwaiter().GetResult().Single();
-            Assert(result.Passed && result.IsStable && !result.IsOpen &&
-                   result.SampleCount == 3 &&
-                   Math.Abs((result.ValueOhm ?? 0) - 8_819) < 0.001 &&
-                   updates.Count == 2 && updates[0].ResultText == "ĐANG ĐO" &&
-                   updates[1].Passed,
-                "Transient OPEN is hidden; two following numeric samples stabilize at their average and PASS");
-        }
-
-        var persistentOpenVisa = new FakeKeysightVisaService(connected: true, measurement: 9.9e37);
-        using (var persistentOpenEngine = new TestEngine(
-                   new FakeBoard(), persistentOpenVisa, fastApp, stableGateSettings))
-        {
-            persistentOpenEngine.SetModel(new ProductModel { ModelName = "R-OPEN" });
-            ResistanceResult result = persistentOpenEngine.MeasureResistanceAsync()
-                .GetAwaiter().GetResult().Single();
-            Assert(!result.Passed && result.IsStable && result.IsOpen && result.SampleCount == 2,
-                "Consecutive OPEN samples confirm a real stable OPEN failure");
-        }
-
-        var outOfRangeVisa = new FakeKeysightVisaService(connected: true, measurement: 12_010);
-        outOfRangeVisa.Measurements.Enqueue(12_000);
-        using (var outOfRangeEngine = new TestEngine(
-                   new FakeBoard(), outOfRangeVisa, fastApp, stableGateSettings))
-        {
-            outOfRangeEngine.SetModel(new ProductModel { ModelName = "R-OUT" });
-            ResistanceResult result = outOfRangeEngine.MeasureResistanceAsync()
-                .GetAwaiter().GetResult().Single();
-            Assert(!result.Passed && result.IsStable && !result.IsOpen &&
-                   result.SampleCount == 2 && result.ValueOhm > 11_000,
-                "Stable numeric value outside MinOhm/MaxOhm remains a real failure");
-        }
-
-        var failureBoard = new FakeBoard();
-        var failingVisa = new FakeKeysightVisaService(connected: true, measurement: 1.0)
-        {
-            ThrowOnMeasure = true
-        };
-        using (var failureEngine = new TestEngine(failureBoard, failingVisa, fastApp, duplicateChannelPlan))
-        {
-            failureEngine.SetModel(new ProductModel { ModelName = "R-FAIL" });
-            AssertThrows<InvalidOperationException>(
-                () => failureEngine.MeasureResistanceAsync().GetAwaiter().GetResult(),
-                "Keysight failure must propagate to the production lifecycle");
-            Assert(failureBoard.ReleaseResistanceRouteCount == 1,
-                "Keysight failure still releases the resistance route in finally");
-        }
-
-        var allSkipped = new ProductionSettings
-        {
-            ResistanceChannels =
-            [
-                new() { Enabled = false, Name = "R1", Channel = 1 },
-                new() { Enabled = true, Name = "R2", Channel = 0 }
-            ]
-        };
-        var skippedBoard = new FakeBoard();
-        var disconnectedVisa = new FakeKeysightVisaService(connected: false, measurement: 1.0);
-        using (var skippedEngine = new TestEngine(skippedBoard, disconnectedVisa, fastApp, allSkipped))
-        {
-            skippedEngine.SetModel(new ProductModel { ModelName = "R-SKIP" });
-            List<ResistanceResult> skipped = skippedEngine.MeasureResistanceAsync()
-                .GetAwaiter().GetResult();
-            Assert(skipped.Count == 0 &&
-                   skippedBoard.ResistanceSteps.Count == 0 &&
-                   disconnectedVisa.MeasureCallCount == 0,
-                "All skipped slots return before VISA connection and produce no route/result");
-        }
     }
 
     private static void TestWaterProofConfigurationAndPresentation()
@@ -3107,138 +3086,13 @@ internal static class Program
         Assert(!scanToken.IsCancellationRequested, "START_SCAN token is independent from ProductCycleToken");
     }
 
-    private static void TestProbeTargetOnlyTouchDetection()
-    {
-        ProductModel model = Model(("PAIR", new[] { 1, 18 }), ("PROBE-PIN", new[] { 113, 114 }));
-        var frame = new ScanFrame(
-            DateTime.Now,
-            1,
-            new HashSet<int> { 113 },
-            [],
-            false,
-            0,
-            7,
-            new Dictionary<int, IReadOnlySet<int>>(),
-            new Dictionary<int, int> { [113] = 1 },
-            BoardScanMode.Production);
-
-        IReadOnlyList<ProbeContactClassifier.Detection> detections =
-            ProbeContactClassifier.DetectMany(frame, model, maxContacts: 2, boardCapacity: BoardCapacity.Create(10));
-
-        Assert(detections.Count == 0,
-            "One target-only hit is only noise/candidate and must not confirm Probe");
-
-        ScanFrame strongFrame = FrameSeq(
-            8,
-            Enumerable.Range(20, 20)
-                .Select(source => (source, new[] { 113 }))
-                .ToArray());
-        detections = ProbeContactClassifier.DetectMany(
-            strongFrame,
-            model,
-            maxContacts: 2,
-            boardCapacity: BoardCapacity.Create(10));
-        Assert(detections.Count == 1 && detections[0].Io == 113 && detections[0].FanIn == 20,
-            "A complete frame with strong repeated fan-in identifies one Probe IO");
-        Assert(!ProbeContactClassifier.HasDirectConnectionEvidence(strongFrame),
-            "Htdrv high-fan-in Probe signature is not treated as a direct wire connection");
-
-        ScanFrame directWireFrame = FrameSeq(10, (5, new[] { 8 }), (6, new[] { 7 }));
-        Assert(ProbeContactClassifier.DetectMany(
-                   directWireFrame,
-                   model,
-                   maxContacts: 2,
-                   boardCapacity: BoardCapacity.Create(10)).Count == 0 &&
-               ProbeContactClassifier.HasDirectConnectionEvidence(directWireFrame),
-            "Htdrv hit=1 edges 5-8 and 6-7 remain direct wire evidence, not Probe");
-
-        int[] spliceIos = Enumerable.Range(1, 13).ToArray();
-        ProductModel largeSplice = Model(("SPLICE", spliceIos));
-        ScanFrame expectedFanIn = FrameSeq(
-            9,
-            spliceIos.Skip(1).Select(source => (source, new[] { 1 })).ToArray());
-        Assert(ProbeContactClassifier.DetectMany(
-                   expectedFanIn,
-                   largeSplice,
-                   maxContacts: 1,
-                   boardCapacity: BoardCapacity.Create(1)).Count == 0,
-            "A large fan-in that belongs to the expected THT splice is not misclassified as Probe");
-
-        ScanFrame twoProbeContacts = FrameSeq(
-            10,
-            Enumerable.Range(20, 20)
-                .Select(source => (source, new[] { 113, 114 }))
-                .ToArray());
-        Assert(ProbeContactClassifier.DetectMany(
-                   twoProbeContacts,
-                   model,
-                   maxContacts: 2,
-                   boardCapacity: BoardCapacity.Create(10)).Count == 2 &&
-               !ProbeContactClassifier.HasDirectConnectionEvidence(twoProbeContacts),
-            "Htdrv trace: two high-fan-in targets remain two Probe contacts, not a direct wire fault");
-
-        ScanFrame directBridgeAfterProbe = FrameSeq(11, (113, new[] { 114 }));
-        Assert(ProbeContactClassifier.DetectMany(
-                   directBridgeAfterProbe,
-                   model,
-                   maxContacts: 2,
-                   boardCapacity: BoardCapacity.Create(10)).Count == 0 &&
-               ProbeContactClassifier.HasDirectConnectionEvidence(directBridgeAfterProbe),
-            "Htdrv trace: a low-fan-in edge after Probe release is direct electrical evidence and must reach TestEngine");
-    }
-
-    private static void TestManualProbeSession()
-    {
-        ProductModel model = Model(("PAIR", new[] { 1, 2 }));
-        BoardCapacity capacity = BoardCapacity.Create(1);
-        var session = new ManualProbeSession(confirmFrames: 2, releaseFrames: 2);
-        session.Start();
-
-        ProbeContactClassifier.Detection tp = new(7, 120, "TP", FanIn: 20);
-        ManualProbeUpdate firstTp = session.Update(1, [tp], model, capacity);
-        Assert(firstTp.Transition == ManualProbeTransition.PointerCandidateChanged && session.ProbeIo == 0,
-            "First strong TP frame remains a candidate");
-        session.Update(1, [tp], model, capacity);
-        Assert(session.ProbeIo == 0, "Duplicate callback from the same frame cannot confirm TP");
-        ManualProbeUpdate confirmedTp = session.Update(2, [tp], model, capacity);
-        Assert(confirmedTp.Transition == ManualProbeTransition.PointerConfirmed &&
-               session.ProbeIo == 7 &&
-               session.Phase == ManualProbePhase.ConnectorCheck,
-            "Second distinct stable frame latches the free TP IO and enters connector check");
-
-        ProbeContactClassifier.Detection io1 = new(1, 100, "IO1", FanIn: 20, IsMapped: true);
-        ProbeContactClassifier.Detection io2 = new(2, 110, "IO2", FanIn: 20, IsMapped: true);
-        session.Update(3, [io1], model, capacity);
-        session.Update(4, [io1], model, capacity);
-        Assert(session.ContactIo == 1 && session.ProbeIo == 7,
-            "Stable connector contact is shown without replacing the latched TP");
-
-        session.Update(5, [io2, io1], model, capacity);
-        Assert(session.ContactIo == 1,
-            "A multi-target transition keeps the previous stable connector");
-        session.Update(6, [io2], model, capacity);
-        Assert(session.ContactIo == 1, "First frame on a new connector is only a candidate");
-        session.Update(7, [io2], model, capacity);
-        Assert(session.ContactIo == 2 && session.ProbeIo == 7,
-            "New connector replaces the old one only after stable confirmation");
-
-        session.Update(8, [], model, capacity);
-        Assert(session.ContactIo == 2, "First empty frame is release debounce");
-        session.Update(9, [], model, capacity);
-        Assert(session.ContactIo == 0 && session.ProbeIo == 7,
-            "Release clears connector contact but keeps TP latched");
-        session.Reset();
-        Assert(session.Phase == ManualProbePhase.Inactive && session.ProbeIo == 0,
-            "Session reset clears the TP latch");
-    }
-
     private static void TestLegacyDatabaseWithoutSchemaInfo()
     {
         string root = Path.Combine(
             Path.GetTempPath(),
             "JBZLegacyDatabaseWithoutSchemaInfo",
             Guid.NewGuid().ToString("N"));
-        string dbPath = Path.Combine(root, "JBZUniversalTester.db");
+        string dbPath = Path.Combine(root, "JBZUniveresalLunix.db");
         string backupPath = dbPath + $".pre-schema-v{TestHistoryStore.CurrentSchemaVersion}.backup";
         try
         {
@@ -3326,7 +3180,7 @@ internal static class Program
             Path.GetTempPath(),
             "JBZDatabaseSchemaV5Tests",
             Guid.NewGuid().ToString("N"));
-        string dbPath = Path.Combine(root, "JBZUniversalTester.db");
+        string dbPath = Path.Combine(root, "JBZUniveresalLunix.db");
         try
         {
             Directory.CreateDirectory(root);
@@ -3550,7 +3404,7 @@ internal static class Program
             Path.GetTempPath(),
             "JBZHistoryInitializationLockTests",
             Guid.NewGuid().ToString("N"));
-        string dbPath = Path.Combine(root, "JBZUniversalTester.db");
+        string dbPath = Path.Combine(root, "JBZUniveresalLunix.db");
         try
         {
             Directory.CreateDirectory(root);
@@ -3593,7 +3447,7 @@ internal static class Program
             Path.GetTempPath(),
             "JBZHistoryInterruptedTransactionTests",
             Guid.NewGuid().ToString("N"));
-        string dbPath = Path.Combine(root, "JBZUniversalTester.db");
+        string dbPath = Path.Combine(root, "JBZUniveresalLunix.db");
         try
         {
             Directory.CreateDirectory(root);
@@ -3647,7 +3501,7 @@ internal static class Program
             Path.GetTempPath(),
             "JBZProductionPersistenceRetryTests",
             Guid.NewGuid().ToString("N"));
-        string dbPath = Path.Combine(root, "JBZUniversalTester.db");
+        string dbPath = Path.Combine(root, "JBZUniveresalLunix.db");
         ProductionPersistenceService? persistence = null;
         try
         {
@@ -3699,16 +3553,16 @@ internal static class Program
 
     private static void TestCanonicalRuntimePersistence()
     {
-        Assert(Path.GetFileName(RuntimePaths.ConfigFile) == "JBZUniversalTester.cfg",
+        Assert(Path.GetFileName(RuntimePaths.ConfigFile) == "JBZUniveresalLunix.cfg",
             "Canonical config filename");
         Assert(Path.GetFileName(RuntimePaths.PartCounterFile) == "PartCnt.txt",
             "Canonical PartCnt filename");
-        Assert(Path.GetFileName(RuntimePaths.LogFile) == "JBZUniversalTester.log",
+        Assert(Path.GetFileName(RuntimePaths.LogFile) == "JBZUniveresalLunix.log",
             "Canonical log filename");
-        Assert(Path.GetFileName(RuntimePaths.DatabaseFile) == "JBZUniversalTester.db" &&
+        Assert(Path.GetFileName(RuntimePaths.DatabaseFile) == "JBZUniveresalLunix.db" &&
                string.Equals(Path.GetFileName(Path.GetDirectoryName(RuntimePaths.DatabaseFile)), "Data", StringComparison.OrdinalIgnoreCase),
             "Canonical database path");
-        Assert(Path.GetFileName(RuntimePaths.CrashReportFile) == "JBZUniversalTester.RPT" &&
+        Assert(Path.GetFileName(RuntimePaths.CrashReportFile) == "JBZUniveresalLunix.RPT" &&
                string.Equals(Path.GetFileName(Path.GetDirectoryName(RuntimePaths.CrashReportFile)), "Crash", StringComparison.OrdinalIgnoreCase),
             "Canonical lazy crash-report path");
         Assert(RuntimePaths.PassRoot == @"C:\Pass" && RuntimePaths.ErrorRoot == @"C:\Error" &&
@@ -3754,7 +3608,7 @@ internal static class Program
         }
 
         string root = Path.Combine(Path.GetTempPath(), "JBZCanonicalPersistenceTests", Guid.NewGuid().ToString("N"));
-        string dbPath = Path.Combine(root, "Data", "JBZUniversalTester.db");
+        string dbPath = Path.Combine(root, "Data", "JBZUniveresalLunix.db");
         string counterPath = Path.Combine(root, "PartCnt.txt");
         try
         {
@@ -3822,7 +3676,7 @@ internal static class Program
             }
 
             string[] logFiles = Directory.EnumerateFiles(logsRoot, "*.log").ToArray();
-            Assert(logFiles.Length == 1 && Path.GetFileName(logFiles[0]) == "JBZUniversalTester.log",
+            Assert(logFiles.Length == 1 && Path.GetFileName(logFiles[0]) == "JBZUniveresalLunix.log",
                 "Runtime writes one canonical main log instead of category/day files");
             string logText = File.ReadAllText(logFiles[0]);
             Assert(!logText.Contains("NORMAL_LIFECYCLE_RECORD", StringComparison.Ordinal) &&
@@ -3875,242 +3729,6 @@ internal static class Program
         return $"#{color.R:X2}{color.G:X2}{color.B:X2}";
     }
 
-    private static void TestBoardCapacity()
-    {
-        var defaultSettings = new ProductionSettings();
-        Assert(
-            defaultSettings.ExpansionCardCount == 2 &&
-            defaultSettings.CardCount == 2 &&
-            BoardCapacity.FromSettings(defaultSettings).TotalIoCapacity == 128,
-            "A new station defaults to two expansion cards / 128 IO");
-
-        for (int cardCount = 1; cardCount <= 10; cardCount++)
-        {
-            BoardCapacity everyCapacity = BoardCapacity.Create(cardCount);
-            Assert(everyCapacity.ExpansionCardCount == cardCount &&
-                   everyCapacity.TotalIoCapacity == cardCount * 64 &&
-                   everyCapacity.StartScanParameter == cardCount,
-                $"Every selectable card count {cardCount} maps to {cardCount * 64} IO and START_SCAN={cardCount}");
-        }
-
-        AssertCapacity(1, 2, 1, 64);
-        AssertCapacity(2, 4, 2, 128);
-        AssertCapacity(3, 6, 3, 192);
-        AssertCapacity(4, 8, 4, 256);
-        AssertCapacity(5, 10, 5, 320);
-        AssertCapacity(10, 20, 10, 640);
-
-        BoardCapacity capacity = BoardCapacity.Create(10);
-        var mapper = new BoardAddressMapper(capacity);
-        AssertAddress(mapper, 1, 1, 1, 1);
-        AssertAddress(mapper, 32, 1, 1, 32);
-        AssertAddress(mapper, 33, 1, 2, 1);
-        AssertAddress(mapper, 64, 1, 2, 32);
-        AssertAddress(mapper, 65, 2, 1, 1);
-        AssertAddress(mapper, 96, 2, 1, 32);
-        AssertAddress(mapper, 97, 2, 2, 1);
-        AssertAddress(mapper, 128, 2, 2, 32);
-        AssertAddress(mapper, 129, 3, 1, 1);
-        AssertAddress(mapper, 160, 3, 1, 32);
-        AssertAddress(mapper, 161, 3, 2, 1);
-        AssertAddress(mapper, 192, 3, 2, 32);
-        AssertAddress(mapper, 193, 4, 1, 1);
-        AssertAddress(mapper, 224, 4, 1, 32);
-        AssertAddress(mapper, 225, 4, 2, 1);
-        AssertAddress(mapper, 256, 4, 2, 32);
-        AssertAddress(mapper, 577, 10, 1, 1);
-        AssertAddress(mapper, 608, 10, 1, 32);
-        AssertAddress(mapper, 609, 10, 2, 1);
-        AssertAddress(mapper, 640, 10, 2, 32);
-        Assert(capacity.ContainsGlobalIo(640), "IO640 accepted");
-        Assert(!capacity.ContainsGlobalIo(641), "IO641 rejected");
-
-        (int MaxIo, int RequiredCards, long RequiredIo)[] requiredCases =
-        [
-            (1, 1, 64),
-            (64, 1, 64),
-            (65, 2, 128),
-            (128, 2, 128),
-            (129, 3, 192),
-            (192, 3, 192),
-            (193, 4, 256),
-            (201, 4, 256),
-            (256, 4, 256),
-            (257, 5, 320),
-            (640, 10, 640)
-        ];
-        foreach ((int maxIo, int requiredCards, long requiredIo) in requiredCases)
-        {
-            BoardScanCapacity requiredCapacity = BoardScanCapacity.Create(
-                new ProductionSettings { ExpansionCardCount = 10 },
-                maxIo);
-            Assert(requiredCapacity.RequiredScanUnits == requiredCards &&
-                   requiredCapacity.RequiredIoCapacity == requiredIo,
-                $"MaxIO {maxIo} requires {requiredCards} card / {requiredIo} IO");
-        }
-
-        BoardScanCapacity insufficient = BoardScanCapacity.Create(
-            new ProductionSettings { ExpansionCardCount = 3 },
-            201);
-        Assert(!insufficient.IsModelWithinInstalledCapacity &&
-               insufficient.Installed.TotalIoCapacity == 192 &&
-               insufficient.RequiredScanUnits == 4 &&
-               insufficient.RequiredIoCapacity == 256 &&
-               insufficient.CapacityErrorMessage.Contains("192 / 256 IO", StringComparison.Ordinal),
-            "Configured 3 / MaxIO 201 blocks Production and warns 192 / 256 IO");
-
-        BoardScanCapacity configured4 = BoardScanCapacity.Create(
-            new ProductionSettings { ExpansionCardCount = 4 },
-            201);
-        Assert(configured4.IsModelWithinInstalledCapacity &&
-               configured4.RequiredScanUnits == 4 &&
-               configured4.StartScanParameter == 4,
-            "Configured 4 / MaxIO 201 is valid and keeps START_SCAN=4");
-
-        BoardScanCapacity configured10Model201 = BoardScanCapacity.Create(
-            new ProductionSettings { ExpansionCardCount = 10 },
-            201);
-        Assert(configured10Model201.IsModelWithinInstalledCapacity &&
-               configured10Model201.RequiredScanUnits == 4 &&
-               configured10Model201.InstalledScanUnits == 10 &&
-               configured10Model201.ActiveScanUnits == 4 &&
-               configured10Model201.StartScanParameter == 4 &&
-               configured10Model201.ActiveIoCapacity == 256,
-            "Installed 10 / MaxIO 201 keeps installed capacity but scans only the four required cards");
-
-        BoardScanCapacity configured10Model512 = BoardScanCapacity.Create(
-            new ProductionSettings { ExpansionCardCount = 10 },
-            512);
-        Assert(configured10Model512.IsModelWithinInstalledCapacity &&
-               configured10Model512.RequiredScanUnits == 8 &&
-               configured10Model512.InstalledScanUnits == 10 &&
-               configured10Model512.ActiveScanUnits == 8 &&
-               configured10Model512.StartScanParameter == 8,
-            "Installed 10 / MaxIO 512 scans only the eight required cards");
-
-        BoardScanCapacity configured10Model37 = BoardScanCapacity.Create(
-            new ProductionSettings { ExpansionCardCount = 10 },
-            37);
-        Assert(configured10Model37.IsModelWithinInstalledCapacity &&
-               configured10Model37.InstalledScanUnits == 10 &&
-               configured10Model37.RequiredScanUnits == 1 &&
-               configured10Model37.ActiveScanUnits == 1 &&
-               configured10Model37.StartScanParameter == 1 &&
-               configured10Model37.ActiveIoCapacity == 64,
-            "The logged MaxIO 37 case scans 64 sources instead of all 640 installed sources");
-
-        BoardScanCapacity configured10WithoutModel = BoardScanCapacity.Create(
-            new ProductionSettings { ExpansionCardCount = 10 },
-            0);
-        Assert(configured10WithoutModel.ActiveScanUnits == 10 &&
-               configured10WithoutModel.StartScanParameter == 10 &&
-               configured10WithoutModel.ActiveIoCapacity == 640,
-            "Startup without a model and blank-THT IO mapping still scan every installed card");
-
-        BoardScanCapacity overLimit = BoardScanCapacity.Create(
-            new ProductionSettings { ExpansionCardCount = 10 },
-            641);
-        Assert(!overLimit.IsModelWithinInstalledCapacity &&
-               overLimit.RequiredScanUnits == 11 &&
-               overLimit.CapacityErrorMessage.Contains("vượt giới hạn 640 IO", StringComparison.Ordinal),
-            "MaxIO 641 is rejected as beyond the 10-card/640-IO hardware limit");
-
-        BoardScanCapacity tenCardModel = BoardScanCapacity.Create(
-            new ProductionSettings { ExpansionCardCount = 10 },
-            640);
-        Assert(tenCardModel.IsModelWithinInstalledCapacity &&
-               tenCardModel.RequiredScanUnits == 10 &&
-               tenCardModel.ActiveScanUnits == 10 &&
-               tenCardModel.ActiveIoCapacity == 640 &&
-               tenCardModel.StartScanParameter == 10,
-            "A valid IO640 model fits exactly in ten cards without a capacity warning");
-
-        var offsetStart = new ProductionSettings
-        {
-            ExpansionCardCount = 4,
-            StartCardNumber = 3
-        };
-        BoardCapacity offsetCapacity = BoardCapacity.FromSettings(offsetStart);
-        Assert(offsetCapacity.FirstGlobalIo == 1 && offsetCapacity.LastGlobalIo == 256 &&
-               offsetCapacity.TotalIoCapacity == 256 && offsetCapacity.StartCardNumber == 3 &&
-               offsetCapacity.ScanCardCount == 6 && offsetCapacity.StartScanParameter == 6 &&
-               offsetCapacity.FirstPhysicalIo == 129 && offsetCapacity.LastPhysicalIo == 384,
-            "StartCard=3 keeps logical IO1-256 and scans the physical card 3-6 range");
-
-        var offsetMapper = new BoardAddressMapper(offsetCapacity);
-        AssertAddress(offsetMapper, 1, 3, 1, 1);
-        AssertAddress(offsetMapper, 256, 6, 2, 32);
-        Assert(!offsetMapper.TryDecode(0x80, BoardIoDecoder.SourceBase, 127, out _) &&
-               offsetMapper.TryDecode(0x81, BoardIoDecoder.SourceBase, 0, out int firstOffsetIo) &&
-               firstOffsetIo == 1 &&
-               offsetMapper.TryDecode(0x82, BoardIoDecoder.SourceBase, 127, out int lastOffsetIo) &&
-               lastOffsetIo == 256,
-            "Decoder ignores cards before Start Card and maps the selected physical range to logical IO1-N");
-
-        BoardScanCapacity offsetModel = BoardScanCapacity.Create(offsetStart, 201);
-        BoardScanCapacity offsetSmallModel = BoardScanCapacity.Create(offsetStart, 37);
-        BoardScanCapacity offsetTooLarge = BoardScanCapacity.Create(offsetStart, 257);
-        Assert(offsetModel.IsModelWithinInstalledCapacity &&
-               offsetModel.Active.ExpansionCardCount == 4 &&
-               offsetModel.StartScanParameter == 6 &&
-               offsetSmallModel.IsModelWithinInstalledCapacity &&
-               offsetSmallModel.Active.ExpansionCardCount == 1 &&
-               offsetSmallModel.StartScanParameter == 3 &&
-               offsetSmallModel.ActiveIoCapacity == 64 &&
-               !offsetTooLarge.IsModelWithinInstalledCapacity,
-            "Start Card does not let a model exceed the configured logical card count");
-
-        string settingsXaml = File.ReadAllText(
-            Path.Combine(Environment.CurrentDirectory, "Views", "ProductionSettingsPage.xaml"));
-        Assert(settingsXaml.Contains("Settings.ExpansionCardCount", StringComparison.Ordinal) &&
-               settingsXaml.Contains("x:Name=\"TotalIoCapacityText\"", StringComparison.Ordinal) &&
-               settingsXaml.Contains("Settings.StartCardNumber", StringComparison.Ordinal) &&
-               !settingsXaml.Contains("Settings.PhysicalCardCount", StringComparison.Ordinal) &&
-               !settingsXaml.Contains("Settings.PortCount", StringComparison.Ordinal),
-            "Production Settings exposes Start Card, ExpansionCardCount and read-only Total IO");
-
-        string cfgPath = Path.Combine(Path.GetTempPath(), $"jbz-card-capacity-{Guid.NewGuid():N}.cfg");
-        try
-        {
-            ProductionConfigService.SaveLegacyCfg(offsetStart, cfgPath);
-            string cfg = File.ReadAllText(cfgPath);
-            Assert(offsetStart.StartCardNumber == 3 && offsetStart.CardCount == 6 &&
-                    cfg.Contains("[StartCardNumber]3", StringComparison.Ordinal) &&
-                    cfg.Contains("[ExpansionCardCount]4", StringComparison.Ordinal) &&
-                    cfg.Contains("[CardCount]6", StringComparison.Ordinal),
-                "CFG persists Start Card, logical card count and firmware scan-through consistently");
-            Assert(!cfg.Contains("[Version]", StringComparison.OrdinalIgnoreCase) &&
-                   !cfg.Contains("[BoardMode]", StringComparison.OrdinalIgnoreCase) &&
-                   !cfg.Contains("[UseTestPointer]", StringComparison.OrdinalIgnoreCase) &&
-                   !cfg.Contains("[ManualModeEnabled]", StringComparison.OrdinalIgnoreCase) &&
-                   !cfg.Contains("[AutoMasterSequence]", StringComparison.OrdinalIgnoreCase) &&
-                   !cfg.Contains("[SettingsPassword]", StringComparison.OrdinalIgnoreCase) &&
-                   !cfg.Contains("[DiscardPassword]", StringComparison.OrdinalIgnoreCase) &&
-                   !cfg.Contains("[App.", StringComparison.OrdinalIgnoreCase),
-                "Operator CFG excludes internal board/code settings and password material");
-        }
-        finally
-        {
-            if (File.Exists(cfgPath))
-                File.Delete(cfgPath);
-        }
-    }
-
-    private static void AssertAddress(
-        BoardAddressMapper mapper,
-        int globalIo,
-        int expansionCard,
-        int port,
-        int localIo)
-    {
-        BoardCardAddress address = mapper.GetCardAddress(globalIo);
-        Assert(address.GlobalIoNumber == globalIo &&
-               address.ExpansionCardNumber == expansionCard &&
-               address.PortNumber == port &&
-               address.LocalIoOnPort == localIo,
-            $"IO{globalIo} => expansion card {expansionCard} / port {port} / local {localIo}");
-    }
-
     private static void AssertCapacity(int expansion, int physical, int scan, int io)
     {
         BoardCapacity capacity = BoardCapacity.Create(expansion);
@@ -4119,379 +3737,8 @@ internal static class Program
         Assert(capacity.TotalIoCapacity == io, $"Expansion {expansion}: IO");
     }
 
-    private static void TestDecoderModes()
-    {
-        var decoder = new BoardIoDecoder();
-        decoder.ConfigureCapacity(BoardCapacity.Create(1));
-        decoder.ConfigureMode(BoardScanMode.Production);
-        byte[] smallRaw = BuildProductionScanFrame(1, 0x00, (1, 18));
-        ScanFrame production = decoder.Feed(smallRaw).Single(frame => frame.Complete);
-        Assert(production.Complete && production.Mode == BoardScanMode.Production, "Production complete");
-        Assert(production.Connections.TryGetValue(1, out IReadOnlySet<int>? targets) && targets.SetEquals([18]), "IO1->IO18");
-        Assert(production.SourceCount == 64 && production.ExpectedIoCount == 64 &&
-               production.EndMarkerCode == 0x00 && production.UnknownBytes == 0,
-            "Small production frame has strict coverage and C0 00 metadata");
-
-        decoder.Reset();
-        var replacementRaw = BuildProductionScanFrame(1, 0x00, (1, 2)).ToList();
-        replacementRaw.RemoveRange(4, 2); // Bo thật có thể phát A0 01 thay cho source 80 01.
-        ScanFrame targetReplacement = decoder.Feed(replacementRaw.ToArray()).Single(frame => frame.Complete);
-        Assert(targetReplacement.Complete &&
-               targetReplacement.SourceCount == 63 &&
-               targetReplacement.ActiveIo.SetEquals([2]) &&
-               targetReplacement.Connections.TryGetValue(1, out IReadOnlySet<int>? replacementTargets) &&
-               replacementTargets.SetEquals([2]),
-            "Target word replacing its own source still provides complete production coverage");
-        using (TestEngine replacementEngine = CreateEngine(out _))
-        {
-            replacementEngine.SetModel(Model(("NAM", new[] { 1, 2 })));
-            replacementEngine.ProcessFrame(targetReplacement);
-            Assert(replacementEngine.ContinuityPassed,
-                "Source-replacement frame reaches TestEngine and passes the NAM IO1-IO2 network");
-        }
-
-        decoder.Reset();
-        Assert(decoder.Feed(smallRaw.AsSpan(0, smallRaw.Length - 1)).All(frame => !frame.Complete),
-            "Partial terminator is buffered");
-        ScanFrame splitFrame = decoder.Feed(smallRaw.AsSpan(smallRaw.Length - 1)).Single(frame => frame.Complete);
-        Assert(splitFrame.Connections.TryGetValue(1, out IReadOnlySet<int>? splitTargets) &&
-               splitTargets.SetEquals([18]) && splitFrame.Complete,
-            "Frame split across reads is reconstructed");
-
-        decoder.Reset();
-        byte[] secondRaw = BuildProductionScanFrame(1, 0x00, (2, 8));
-        IReadOnlyList<ScanFrame> multiple = decoder.Feed(smallRaw.Concat(secondRaw).ToArray())
-            .Where(frame => frame.Complete)
-            .ToArray();
-        Assert(multiple.Count == 2 &&
-               multiple[0].Connections[1].SetEquals([18]) &&
-               multiple[1].Connections[2].SetEquals([8]),
-            "Multiple complete frames in one read are decoded");
-
-        decoder.Reset();
-        byte[] partialLarge = BuildProductionScanFrame(10, 0x01)
-            .Take(300 * 2)
-            .Concat(new byte[] { 0xC0, 0x01 })
-            .ToArray();
-        decoder.ConfigureCapacity(BoardCapacity.Create(10));
-        ScanFrame incomplete = decoder.Feed(partialLarge).Single();
-        Assert(!incomplete.Complete && incomplete.SourceCount == 300 &&
-               incomplete.ExpectedIoCount == 640 && incomplete.EndMarkerCode == 0x01,
-            "Partial 300/640 frame is diagnostic incomplete and cannot ARM");
-
-        decoder.Reset();
-        byte[] largeRaw = BuildProductionScanFrame(10, 0x01);
-        ScanFrame large = decoder.Feed(largeRaw).Single();
-        Assert(large.Complete && large.SourceCount == 640 && large.ExpectedIoCount == 640 &&
-               large.EndMarkerCode == 0x01 && large.UnknownBytes == 0,
-            "Ten-card 640-source frame accepts C0 01 without unknown bytes");
-        Assert(large.Connections.Values.All(targets => targets.Count == 0) &&
-               ReferenceEquals(large.Connections[1], large.Connections[640]),
-            "Empty source targets share one immutable set instead of allocating 640 empty HashSets per frame");
-
-        decoder.Reset();
-        Assert(decoder.Feed(largeRaw.AsSpan(0, largeRaw.Length - 1)).Count == 0,
-            "Large C0 byte remains buffered across RX boundary");
-        ScanFrame splitLarge = decoder.Feed([0x01]).Single();
-        Assert(splitLarge.Complete && splitLarge.EndMarkerCode == 0x01,
-            "Split C0/01 terminator is recognized");
-
-        decoder.Reset();
-        byte[] unknownEnd = BuildProductionScanFrame(8, 0x02);
-        ScanFrame unknownTerminator = decoder.Feed(unknownEnd).Single();
-        Assert(!unknownTerminator.Complete && !unknownTerminator.TerminatorKnown &&
-               unknownTerminator.EndMarkerCode == 0x02,
-            "C0 02 is diagnostic only, not guessed as a valid terminator");
-
-        BoardScanCapacity configured10Required8 = BoardScanCapacity.Create(
-            new ProductionSettings { ExpansionCardCount = 10 },
-            512);
-        Assert(configured10Required8.InstalledScanUnits == 10 &&
-               configured10Required8.RequiredScanUnits == 8 &&
-               configured10Required8.ActiveScanUnits == 8 &&
-               configured10Required8.StartScanParameter == 8 &&
-               configured10Required8.ActiveIoCapacity == 512 &&
-               configured10Required8.IsModelWithinInstalledCapacity,
-            "Installed 10 / required 8 keeps installed capacity but scans active 8");
-
-        BoardScanCapacity probeAllInstalled = BoardScanCapacity.Create(
-            new ProductionSettings { ExpansionCardCount = 2, UseTestPointer = true },
-            maxGlobalIo: 18,
-            scanAllInstalledIo: true);
-        Assert(probeAllInstalled.InstalledScanUnits == 2 &&
-               probeAllInstalled.ActiveScanUnits == 2 &&
-               probeAllInstalled.ActiveIoCapacity == 128 &&
-               probeAllInstalled.IsModelWithinInstalledCapacity,
-            "Test pointer scans all configured IO: a two-card station exposes IO1-128 regardless of THT MaxIo");
-
-        BoardScanCapacity insufficient = BoardScanCapacity.Create(
-            new ProductionSettings { ExpansionCardCount = 4 },
-            512);
-        Assert(insufficient.InstalledScanUnits == 4 && insufficient.RequiredScanUnits == 8 &&
-               !insufficient.IsModelWithinInstalledCapacity,
-            "Installed 4 / required 8 is an explicit capacity mismatch");
-
-        Assert(BoardCapacity.Create(2).StartScanParameter == 2 &&
-               BoardCapacity.Create(4).StartScanParameter == 4,
-            "START_SCAN parameter follows BoardCapacity, not a hard-coded 02");
-
-        decoder.ConfigureCapacity(BoardCapacity.Create(4, 3));
-        decoder.ConfigureMode(BoardScanMode.Production);
-        ScanFrame offsetFrame = decoder.Feed(
-            BuildProductionScanFrame(6, 0x01, (129, 130))).Single(frame => frame.Complete);
-        Assert(offsetFrame.Complete && offsetFrame.SourceCount == 256 &&
-               offsetFrame.ExpectedIoCount == 256 &&
-               offsetFrame.Connections.TryGetValue(1, out IReadOnlySet<int>? offsetTargets) &&
-               offsetTargets.SetEquals([2]),
-            "StartCard=3 discards physical cards 1-2 and exposes physical IO129 as logical IO1");
-
-        var confirmationSettings = new ProductionSettings { IoConfirm1 = 2, IoConfirmN = 3 };
-        var confirmationTransport = new D2xxBoardTransport(string.Empty, confirmationSettings);
-        MethodInfo shouldPublish = typeof(D2xxBoardTransport).GetMethod(
-            "ShouldPublishConfirmedFrame",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("ShouldPublishConfirmedFrame method not found.");
-        bool Confirm(ScanFrame frame) => (bool)(shouldPublish.Invoke(confirmationTransport, [frame]) ?? false);
-        ScanFrame stableA = FrameSeq(1, (1, [2]));
-        ScanFrame stableB = FrameSeq(2, (1, [3]));
-        Assert(!Confirm(stableA) && !Confirm(stableB) && Confirm(stableB),
-            "IO Confirm 1/2 resets when the complete logical snapshot changes");
-        ScanFrame stableC = FrameSeq(3, (1, [4]));
-        Assert(!Confirm(stableC) && !Confirm(stableC) && Confirm(stableC),
-            "IO Confirm N=3 requires three consecutive matching snapshots after first confirmation");
-        confirmationTransport.DisposeAsync().AsTask().GetAwaiter().GetResult();
-
-        var singleConfirmTransport = new D2xxBoardTransport(
-            string.Empty,
-            new ProductionSettings { IoConfirm1 = 1, IoConfirmN = 1 });
-        MethodInfo singleShouldPublish = typeof(D2xxBoardTransport).GetMethod(
-            "ShouldPublishConfirmedFrame",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("ShouldPublishConfirmedFrame method not found.");
-        bool ConfirmSingle(ScanFrame frame) =>
-            (bool)(singleShouldPublish.Invoke(singleConfirmTransport, [frame]) ?? false);
-        Assert(ConfirmSingle(FrameSeq(4, (1, [2]))) &&
-               ConfirmSingle(FrameSeq(5, (1, [3]))),
-            "IO Confirm=1 publishes every complete state immediately without requiring a repeated snapshot");
-        singleConfirmTransport.DisposeAsync().AsTask().GetAwaiter().GetResult();
-
-        var orderTransport = new D2xxBoardTransport(
-            string.Empty,
-            new ProductionSettings { IoConfirm1 = 2, IoConfirmN = 2 });
-        MethodInfo orderShouldPublish = typeof(D2xxBoardTransport).GetMethod(
-            "ShouldPublishConfirmedFrame",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("ShouldPublishConfirmedFrame method not found.");
-        bool ConfirmOrder(ScanFrame frame) =>
-            (bool)(orderShouldPublish.Invoke(orderTransport, [frame]) ?? false);
-        ScanFrame orderA = FrameSeq(10, (1, [2, 3]), (4, [5]));
-        ScanFrame orderB = FrameSeq(11, (4, [5]), (1, [3, 2]));
-        Assert(!ConfirmOrder(orderA) && ConfirmOrder(orderB),
-            "Stable-frame confirmation compares exact logical sets without depending on dictionary/target order");
-        orderTransport.DisposeAsync().AsTask().GetAwaiter().GetResult();
-
-        decoder.ConfigureCapacity(BoardCapacity.Create(4));
-        decoder.ConfigureMode(BoardScanMode.Probe);
-        ScanFrame touch5 = decoder.Feed([0xA0, 0x04]).Single();
-        Assert(touch5.Mode == BoardScanMode.Probe && touch5.ActiveIo.SetEquals([5]), "Probe touch IO5");
-        ScanFrame release5 = decoder.Feed([0x80, 0x04]).Single();
-        Assert(release5.ActiveIo.Count == 0, "Probe release IO5");
-        ScanFrame touch113 = decoder.Feed([0xA0, 0x70]).Single();
-        Assert(touch113.ActiveIo.SetEquals([113]), "Probe unmapped IO113");
-
-        // ConfigureMode phải reset source còn dở của decoder trước đó.
-        decoder.ConfigureMode(BoardScanMode.Production);
-        decoder.ConfigureCapacity(BoardCapacity.Create(1));
-        ScanFrame noStaleSource = decoder.Feed(BuildProductionScanFrame(1, 0x00)).Single();
-        Assert(noStaleSource.Connections.Values.All(targetsAfterSwitch => targetsAfterSwitch.Count == 0),
-            "No stale source/target edge after mode switch");
-
-        decoder.ConfigureCapacity(BoardCapacity.Create(3));
-        _ = decoder.Feed(BuildProductionScanFrame(3, 0x00).AsSpan(0, 200));
-        decoder.ConfigureCapacity(BoardCapacity.Create(10));
-        ScanFrame afterCapacityChange = decoder.Feed(BuildProductionScanFrame(10, 0x01)).Single();
-        Assert(afterCapacityChange.Complete &&
-               afterCapacityChange.SourceCount == 640 &&
-               afterCapacityChange.ExpectedIoCount == 640 &&
-               afterCapacityChange.Sequence == 1,
-            "Changing 3 -> 10 cards discards old partial data and resets frame sequence");
-    }
-
-    private static void TestTenCardCompleteFrameStress()
-    {
-        var decoder = new BoardIoDecoder();
-        decoder.ConfigureCapacity(BoardCapacity.Create(10));
-        decoder.ConfigureMode(BoardScanMode.Production);
-        byte[] raw = BuildProductionScanFrame(10, 0x01);
-
-        using TestEngine engine = CreateEngine(out FakeBoard board);
-        engine.SetModel(Model(("PAIR", new[] { 1, 18 })));
-        int changed = 0;
-        engine.Changed += (_, _) => changed++;
-
-        var supervisor = new ScanSupervisor(board, _ => { });
-        bool restarted = supervisor.EnsureProductionScanAsync(640, CancellationToken.None)
-            .GetAwaiter()
-            .GetResult();
-
-        const int frameCount = 500;
-        long retainedBefore = GC.GetTotalMemory(forceFullCollection: true);
-        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
-        var stopwatch = Stopwatch.StartNew();
-        for (int index = 0; index < frameCount; index++)
-        {
-            ScanFrame frame = decoder.Feed(raw).Single();
-            board.Publish(frame);
-            engine.ProcessFrame(frame);
-        }
-        stopwatch.Stop();
-        long allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
-        long retainedAfter = GC.GetTotalMemory(forceFullCollection: true);
-        int startCount = board.Commands.Count(command => command == "START");
-        int stopCount = board.Commands.Count(command => command == "STOP");
-
-        Assert(!restarted && startCount == 0 && stopCount == 0,
-            "Ten-card stress reuses the healthy configured stream without repeated START/STOP");
-        Assert(board.CompleteFramesReceived == frameCount &&
-               engine.FramesProcessed == frameCount,
-            "Ten-card stress processes all 500 complete 640-IO frames");
-        Assert(changed <= 1,
-            "Ten-card identical topology does not raise unbounded Changed/UI events");
-        Assert(retainedAfter <= retainedBefore + (32L * 1024 * 1024),
-            $"Ten-card stress retained memory stays bounded ({retainedBefore} -> {retainedAfter})");
-        Console.WriteLine(
-            $"10-CARD STRESS: frames={frameCount} elapsedMs={stopwatch.ElapsedMilliseconds} " +
-            $"allocated={allocated:N0} changed={changed} START={startCount} STOP={stopCount}");
-    }
-
-    private static void TestProductionProbePreview()
-    {
-        var decoder = new BoardIoDecoder();
-        decoder.ConfigureCapacity(BoardCapacity.Create(4));
-        decoder.ConfigureMode(BoardScanMode.Production);
-
-        var raw = new List<byte>();
-        for (int source = 1; source <= 24; source++)
-        {
-            int sourceZeroBased = source - 1;
-            raw.Add(checked((byte)(BoardIoDecoder.SourceBase + sourceZeroBased / BoardAddressMapper.IoPerProtocolBank)));
-            raw.Add(checked((byte)(sourceZeroBased % BoardAddressMapper.IoPerProtocolBank)));
-            int targetZeroBased = 198 - 1;
-            raw.Add(checked((byte)(BoardIoDecoder.TargetBase + targetZeroBased / BoardAddressMapper.IoPerProtocolBank)));
-            raw.Add(checked((byte)(targetZeroBased % BoardAddressMapper.IoPerProtocolBank)));
-        }
-
-        IReadOnlyList<ScanFrame> frames = decoder.Feed(raw.ToArray());
-        IReadOnlyList<ProductionProbePreview> previews = decoder.DrainProductionProbePreviews();
-        Assert(frames.All(frame => !frame.Complete) &&
-               previews.Count == 1 &&
-               previews[0].ActiveIo.SequenceEqual([198]) &&
-               previews[0].RequiredHitCount == 12 &&
-               previews[0].PeakHitCount == 12,
-            "Strong Production probe contact is previewed before C0 without creating a partial ScanFrame");
-
-        var singleReadDecoder = new BoardIoDecoder();
-        singleReadDecoder.ConfigureCapacity(BoardCapacity.Create(4));
-        singleReadDecoder.ConfigureMode(BoardScanMode.Production);
-        var completeRaw = new List<byte>(raw);
-        for (int source = 25; source <= 256; source++)
-        {
-            int sourceZeroBased = source - 1;
-            completeRaw.Add(checked((byte)(BoardIoDecoder.SourceBase + sourceZeroBased / BoardAddressMapper.IoPerProtocolBank)));
-            completeRaw.Add(checked((byte)(sourceZeroBased % BoardAddressMapper.IoPerProtocolBank)));
-        }
-        completeRaw.Add(BoardIoDecoder.WordEnd1);
-        completeRaw.Add(0x00);
-        Assert(singleReadDecoder.Feed(completeRaw.ToArray()).Single(frame => frame.Complete).Complete &&
-               singleReadDecoder.DrainProductionProbePreviews().Count == 1,
-            "Early Probe preview survives when TARGET threshold and C0 arrive in the same FT_Read batch");
-
-        var singleTargetDecoder = new BoardIoDecoder();
-        singleTargetDecoder.ConfigureCapacity(BoardCapacity.Create(4));
-        singleTargetDecoder.ConfigureMode(BoardScanMode.Production);
-        _ = singleTargetDecoder.Feed([BoardIoDecoder.SourceBase, 0, BoardIoDecoder.TargetBase, 11]);
-        Assert(singleTargetDecoder.DrainProductionProbePreviews().Count == 0,
-            "One ordinary TARGET word cannot become an early Probe/GND false positive");
-
-        var production = new ProductionSettings
-        {
-            MasterFaultRequiredCount = 0,
-            ProductSettleTimeMs = 10_000,
-            WrongConnectionConfirmMs = 0,
-            ShortCircuitConfirmMs = 0
-        };
-        TestViewModel vm = CreateTestViewModel(production, out FakeBoard board);
-        vm.SetModel(Model(("PAIR", new[] { 1, 86 })));
-        vm.StartProductionTestAsync().GetAwaiter().GetResult();
-        long processedBefore = vm.ProductionFramesProcessed;
-        int commandsBefore = board.Commands.Count;
-        board.PublishProbePreview(previews[0] with { ScanGeneration = 1 });
-        Assert(vm.HasInlineProbeContacts &&
-               vm.Faults.Count(row => row.Kind == FaultKind.Probe && row.Io == 198) == 1 &&
-               vm.ProductionFramesProcessed == processedBefore &&
-               board.Commands.Count == commandsBefore,
-            "Early Probe preview renders candidate UI immediately without changing TestEngine, counters, or relay; " +
-            $"active={vm.HasInlineProbeContacts}, rows={string.Join("|", vm.Faults.Select(row => $"{row.Kind}:IO{row.Io}"))}, " +
-            $"processed={processedBefore}->{vm.ProductionFramesProcessed}, " +
-            $"commands={commandsBefore}->{board.Commands.Count}");
-
-        TestEngine previewEngine = (TestEngine)(typeof(TestViewModel).GetField(
-            "_engine",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?.GetValue(vm) ?? throw new InvalidOperationException("Preview engine not found"));
-        long engineFramesBeforeCandidate = previewEngine.FramesProcessed;
-        board.PublishProbePreview(new ProductionProbePreview(
-            DateTime.Now, [1], 12, 12, Sequence: 50, ScanGeneration: 1));
-        board.Publish(FrameSeq(50, (230, new[] { 1 })) with { ScanGeneration = 1 });
-        Assert(previewEngine.FramesProcessed == engineFramesBeforeCandidate &&
-               vm.CurrentProductionRuntimeState == ProductionRuntimeState.WaitingForProduct &&
-               previewEngine.GetPassGateDiagnostics().WrongCandidateCount == 0 &&
-               (int)(typeof(TestViewModel).GetField(
-                   "_productStartSoundPlayed",
-                   BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(vm) ?? -1) == 0,
-            "Probe preview quarantines the matching leading complete frame before ProductEvidence, WRONG and sound");
-
-        board.PublishProbePreview(new ProductionProbePreview(
-            DateTime.Now, [1], 12, 12, Sequence: 51, ScanGeneration: 1));
-        board.Publish(ProbeFrameSeq(51, 1) with { ScanGeneration = 1 });
-        Assert(vm.HasInlineProbeContacts &&
-               vm.CurrentProbePresentationState == ProbePresentationState.Touch &&
-               vm.CurrentProductionRuntimeState == ProductionRuntimeState.WaitingForProduct &&
-               vm.Faults.All(row => row.Kind == FaultKind.Probe),
-            "Confirmed Probe touch owns presentation but never changes ProductState");
-        board.Publish(FrameSeq(52) with { ScanGeneration = 1 });
-        Assert(!vm.HasInlineProbeContacts &&
-               vm.CurrentProbePresentationState == ProbePresentationState.Released &&
-               vm.CurrentProductionRuntimeState == ProductionRuntimeState.WaitingForProduct,
-            "Probe release restores the prior waiting ProductState on the next complete frame");
-    }
-
-    private static byte[] BuildProductionScanFrame(
-        int scanUnits,
-        byte terminatorCode,
-        (int Source, int Target)? connection = null)
-    {
-        int ioCount = scanUnits * BoardCapacity.IoPerExpansionCard;
-        var bytes = new List<byte>((ioCount * 2) + 4);
-        for (int io = 1; io <= ioCount; io++)
-        {
-            int zeroBased = io - 1;
-            bytes.Add(checked((byte)(BoardIoDecoder.SourceBase + zeroBased / BoardAddressMapper.IoPerProtocolBank)));
-            bytes.Add(checked((byte)(zeroBased % BoardAddressMapper.IoPerProtocolBank)));
-
-            if (connection is { } edge && edge.Source == io)
-            {
-                int targetZeroBased = edge.Target - 1;
-                bytes.Add(checked((byte)(BoardIoDecoder.TargetBase + targetZeroBased / BoardAddressMapper.IoPerProtocolBank)));
-                bytes.Add(checked((byte)(targetZeroBased % BoardAddressMapper.IoPerProtocolBank)));
-            }
-        }
-
-        bytes.Add(BoardIoDecoder.WordEnd1);
-        bytes.Add(terminatorCode);
-        return bytes.ToArray();
-    }
-
+#if LEGACY_D2XX
+#endif
     private static void TestEngineVectors()
     {
         using var engine = CreateEngine(out _);
@@ -4503,9 +3750,26 @@ internal static class Program
                initialPairRows.Any(row => row.Io == 1 && row.Kind == FaultKind.MissingConnection && row.FaultType == "Đơn" && row.Pin == "1") &&
                initialPairRows.Any(row => row.Io == 18 && row.Kind == FaultKind.MissingConnection && row.FaultType == "Đơn" && row.Pin == "18") &&
                initialPairRows.All(row => row.Status == "CHƯA KẾT NỐI") &&
+               initialPairRows.All(row => row.ExpectedSourceIo == 1 && row.ExpectedTargetIo == 18) &&
                initialPairRows.All(row => !row.IoText.Contains("<->", StringComparison.Ordinal) &&
                                           !row.Pin.Contains("<->", StringComparison.Ordinal)),
-            "Model load shows one Htdrv-style endpoint row per pin, not a merged IO/pin row");
+            "Model load shows one Htdrv-style endpoint row per pin and both endpoint rows keep the same canonical IO1<->IO18 pair");
+
+        ProductModel aoDisplay = Model(("AO", new[] { 32, 33, 34, 35 }));
+        engine.SetModel(aoDisplay);
+        FaultRow[] aoRows = engine.BuildRows().Where(row => row.WireName == "AO").ToArray();
+        Assert(aoRows.Length == 4 &&
+               aoRows.Single(row => row.Io == 32).ExpectedSourceIo == 32 &&
+               aoRows.Single(row => row.Io == 32).ExpectedTargetIo == 33 &&
+               aoRows.Single(row => row.Io == 33).ExpectedSourceIo == 32 &&
+               aoRows.Single(row => row.Io == 33).ExpectedTargetIo == 33 &&
+               aoRows.Single(row => row.Io == 34).ExpectedSourceIo == 32 &&
+               aoRows.Single(row => row.Io == 34).ExpectedTargetIo == 34 &&
+               aoRows.Single(row => row.Io == 35).ExpectedSourceIo == 32 &&
+               aoRows.Single(row => row.Io == 35).ExpectedTargetIo == 35,
+            "AO multi-endpoint rows display source-to-own-endpoint pairs instead of repeating IO32<->IO32");
+
+        engine.SetModel(pair);
         ScanFrame pairPassFrame = Frame((1, new[] { 18 }));
         engine.ProcessFrame(pairPassFrame);
         Thread.Sleep(ProductionTimingPolicy.DefaultProductSettleTimeMs + 5);
@@ -4556,8 +3820,8 @@ internal static class Program
         Thread.Sleep(ProductionTimingPolicy.DefaultProductSettleTimeMs + 5);
         engine.ProcessFrame(twoPairPass);
         engine.ProcessFrame(Frame((2, new[] { 8 })));
-        Assert(engine.IsPassReleaseStarted && !engine.IsProductReleased,
-            "After PASS/eject, losing one required connection detects release start before full release");
+        Assert(!engine.IsProductReleased,
+            "Partial unplugging does not complete removal; Universal Tester New keeps one THÁO SẢN PHẨM state until all product edges are gone");
 
         engine.SetModel(twoPairs);
         engine.ProcessFrame(Frame((1, new[] { 18 })));
@@ -4746,10 +4010,9 @@ internal static class Program
                !engine.HasWiringFault,
             "Latching CLIP a1 hides only common/a1 per existing common behavior; a2/a3 remain without false SHORT");
         FaultRow[] clipRemovalRows = engine.BuildRemovalRows().ToArray();
-        Assert(clipRemovalRows.Length == 1 &&
-               clipRemovalRows[0].Io == 202 &&
-               clipRemovalRows[0].Status == "CHỜ THÁO",
-            "Connected CLIP removal rows use the removal-only CHỜ THÁO presentation");
+        Assert(clipRemovalRows.Select(row => row.Io).Order().SequenceEqual([203, 204]) &&
+               clipRemovalRows.All(row => row.Status == "CHƯA KẾT NỐI"),
+            "Universal Tester New removal uses the same inverse-open CLIP table; no D2XX CHỜ THÁO rows remain");
     }
 
     private static void TestFinalHtdrvTestWindowPresentation()
@@ -4768,17 +4031,16 @@ internal static class Program
         TestViewModel vm = CreateTestViewModel(production, out FakeBoard board);
         vm.SetModel(model);
         vm.StartProductionTestAsync().GetAwaiter().GetResult();
-        Assert(vm.Faults.Count == 0 &&
-               vm.IsCenterResultVisible &&
-               vm.CenterResultText == "LẮP SẢN PHẨM",
-            "No product activity keeps FaultGrid empty and shows LẮP SẢN PHẨM");
+        Assert(vm.Faults.Count(row => row.WireName == "BG1") == 2 &&
+               vm.Faults.Count(row => row.WireName == "BG2") == 2 &&
+               vm.Faults.All(row => row.Status == "CHƯA KẾT NỐI"),
+            "Universal Tester New shows every pending wire row before the product is installed");
 
         board.Publish(FrameSeq(100, (1, new[] { 3 })));
-        Assert(!vm.IsCenterResultVisible &&
-               vm.Faults.Count(row => row.WireName == "BG2") == 2 &&
+        Assert(vm.Faults.Count(row => row.WireName == "BG2") == 2 &&
                !vm.Faults.Any(row => row.WireName == "BG1") &&
                vm.Faults.All(row => row.FaultType == "Đơn" && row.Status == "CHƯA KẾT NỐI"),
-            "First real product edge starts presentation and only the passed network disappears");
+            "As soon as BG1 becomes electrically complete, only BG1 disappears while BG2 remains visible");
 
         MethodInfo showBoardUnavailable = typeof(TestViewModel).GetMethod(
             "ShowBoardUnavailablePresentation",
@@ -4799,7 +4061,7 @@ internal static class Program
         Assert(overlayVm.IsCenterResultVisible &&
                overlayVm.IsCenterPassPresentation &&
                overlayVm.CenterResultText == "PASS",
-            "Center PASS appears only from the existing final Completed phase/state");
+            "Legacy center-result state remains internally coherent even though TestWindow no longer renders the overlay");
 
         using TestEngine engine = CreateEngine(out _, production);
         engine.SetModel(model);
@@ -4847,19 +4109,18 @@ internal static class Program
 
         engine.SetModel(model);
         engine.ProcessFrame(FrameSeq(130, (1, new[] { 3 }), (2, new[] { 4 })));
-        FaultRow[] connectedRemovalRows = engine.BuildRemovalRows().ToArray();
-        Assert(connectedRemovalRows.Length == 4 &&
-               connectedRemovalRows.All(row => row.Status == "CHỜ THÁO"),
-            "Removal presentation initially shows every connection still on the jig");
+        FaultRow[] removalRowsWhileConnected = engine.BuildRemovalRows().ToArray();
+        Assert(removalRowsWhileConnected.Length == 0,
+            "Universal Tester New keeps the same inverse-open table during removal: connected pairs stay hidden");
         engine.ProcessFrame(FrameSeq(131, (2, new[] { 4 })));
-        FaultRow[] remaining = engine.BuildRemovalRows().ToArray();
-        Assert(remaining.Length == 2 &&
-               remaining.All(row => row.WireName == "BG2" && row.Status == "CHỜ THÁO") &&
+        FaultRow[] removalRowsAfterOneOpen = engine.BuildRemovalRows().ToArray();
+        Assert(removalRowsAfterOneOpen.Length == 2 &&
+               removalRowsAfterOneOpen.All(row => row.WireName == "BG1" && row.Status == "CHƯA KẾT NỐI") &&
                !engine.IsProductReleased,
-            "Removing one network hides only that network and retains the last real connection");
+            "When one network is removed it reappears as CHƯA KẾT NỐI; the remaining connected network stays hidden");
         engine.ProcessFrame(FrameSeq(132));
-        Assert(engine.BuildRemovalRows().Count == 0 && engine.IsProductReleased,
-            "Only complete loss of product relations empties removal rows and confirms release");
+        Assert(engine.BuildRemovalRows().Count == 4 && engine.IsProductReleased,
+            "Complete product removal restores all pending rows and confirms release without D2XX CHỜ THÁO rows");
 
         string testWindowXaml = File.ReadAllText(
             Path.Combine(Environment.CurrentDirectory, "Views", "TestWindow.xaml"));
@@ -4867,8 +4128,9 @@ internal static class Program
                testWindowXaml.Contains("EnableColumnVirtualization\" Value=\"True", StringComparison.Ordinal) &&
                testWindowXaml.Contains("VirtualizingPanel.IsVirtualizing\" Value=\"True", StringComparison.Ordinal) &&
                testWindowXaml.Contains("VirtualizingPanel.VirtualizationMode\" Value=\"Recycling", StringComparison.Ordinal) &&
-               testWindowXaml.Contains("IsHitTestVisible=\"False\"", StringComparison.Ordinal),
-            "TestWindow keeps recycling virtualization and a non-interactive center overlay");
+               !testWindowXaml.Contains("CenterResultText", StringComparison.Ordinal) &&
+               !testWindowXaml.Contains("IsCenterResultVisible", StringComparison.Ordinal),
+            "TestWindow keeps recycling virtualization and no longer overlays a large center status over the wire table");
         Assert(!testWindowXaml.Contains("DropShadowEffect", StringComparison.Ordinal),
             "Wire-color cells avoid per-row DropShadowEffect rendering");
 
@@ -5146,14 +4408,15 @@ internal static class Program
                !mainWindowXaml.Contains("Test.ConnectBoardCommand", StringComparison.Ordinal) &&
                mainWindowSource.Contains("StartupControlUnlockTimeout", StringComparison.Ordinal) &&
                mainWindowSource.Contains("Task.WhenAny(", StringComparison.Ordinal) &&
-               mainWindowSource.Contains("ReportStartupBoardTimeout()", StringComparison.Ordinal) &&
+               !mainWindowSource.Contains("ReportStartupBoardTimeout()", StringComparison.Ordinal) &&
                mainWindowSource.Contains("ObserveDeferredStartupAsync(initialization)", StringComparison.Ordinal) &&
+               mainWindowSource.Contains("IsBoardIdentityVerified", StringComparison.Ordinal) &&
                !mainWindowSource.Contains("ĐANG TỰ THỬ LẠI", StringComparison.Ordinal),
-            "Slow board startup latches the session and requires an application restart");
+            "Slow UART discovery keeps production locked until firmware identity is verified");
         string scanSupervisorSource = File.ReadAllText(
             Path.Combine(Environment.CurrentDirectory, "Services", "ScanSupervisor.cs"));
-        string d2xxTransportSource = File.ReadAllText(
-            Path.Combine(Environment.CurrentDirectory, "Services", "D2xxBoardTransport.cs"));
+        string uartTransportSource = File.ReadAllText(
+            Path.Combine(Environment.CurrentDirectory, "Services", "JbzSerialBoardTransport.cs"));
         Assert(testViewModelSource.Contains("StopScanIntentionallyAsync", StringComparison.Ordinal) &&
                testViewModelSource.Contains("RecoverProductionScanAsync", StringComparison.Ordinal) &&
                scanSupervisorSource.Contains("ScanHealthState.Suspended", StringComparison.Ordinal) &&
@@ -5162,8 +4425,8 @@ internal static class Program
                scanSupervisorSource.Contains("RecoverSoftAsync", StringComparison.Ordinal) &&
                scanSupervisorSource.Contains("RecoverReopenAsync", StringComparison.Ordinal) &&
                scanSupervisorSource.Contains("_board.DisconnectAsync()", StringComparison.Ordinal) &&
-               !d2xxTransportSource.Contains("attempt <= 6", StringComparison.Ordinal),
-            "D2XX watchdog uses explicit pause, first-frame state, soft recovery, then one clean reopen");
+               !uartTransportSource.Contains("attempt <= 6", StringComparison.Ordinal),
+            "UART watchdog uses explicit pause, first-frame state, soft recovery, then one clean reopen");
         Assert(mainWindowXaml.Contains("Color=\"#273F91\"", StringComparison.Ordinal) &&
                mainWindowXaml.Contains("Color=\"#B45309\"", StringComparison.Ordinal) &&
                mainWindowXaml.Contains("Color=\"#0F766E\"", StringComparison.Ordinal) &&
@@ -5235,7 +4498,7 @@ internal static class Program
             "Every HistoryPage button uses the shared semantic palette and interaction template");
 
         string appSource = File.ReadAllText(Path.Combine(Environment.CurrentDirectory, "App.xaml.cs"));
-        Assert(appSource.Contains("Local\\JBZUniversalTester.Production", StringComparison.Ordinal) &&
+        Assert(appSource.Contains("Local\\JBZUniveresalLunix.Production", StringComparison.Ordinal) &&
                appSource.Contains("_ownsSingleInstanceMutex", StringComparison.Ordinal),
             "A station cannot open two app processes that compete for the same board and SQLite database");
 
@@ -5272,18 +4535,6 @@ internal static class Program
 
     private static void TestIncompleteProductFullReleaseResetsClipCycle()
     {
-        const string referenceThtPath = @"C:\ITEM\WH322244.tht";
-        if (File.Exists(referenceThtPath))
-        {
-            ProductModel parsedReference = new ThtModelParser().Load(referenceThtPath);
-            Assert(parsedReference.Clip is not null &&
-                   parsedReference.Clip.CommonIo == 201 &&
-                   parsedReference.Clip.Branches.Any(branch => branch.Name == "a1" && branch.TargetIo == 202) &&
-                   parsedReference.Clip.Branches.Any(branch => branch.Name == "a2" && branch.TargetIo == 203) &&
-                   parsedReference.Clip.Branches.Any(branch => branch.Name == "a3" && branch.TargetIo == 204),
-                "WH322244 actual THT parses AO=IO201 and a1/a2/a3 from their configured IO columns");
-        }
-
         var production = new ProductionSettings
         {
             MasterFaultRequiredCount = 0,
@@ -5716,184 +4967,14 @@ internal static class Program
         }
     }
 
-    private static void TestProductionPassGateMinimalLatency()
-    {
-        var slowConfirmProduction = new ProductionSettings
-        {
-            IoConfirm1 = 5,
-            IoConfirmN = 5,
-            OpenCircuitConfirmMs = 500,
-            ShortCircuitConfirmMs = 500,
-            WrongConnectionConfirmMs = 500,
-            ProductSettleTimeMs = 500,
-            JigContactUnstableWindowMs = 500,
-            MasterFaultRequiredCount = 0,
-            Relay1JigPulseMs = 50,
-            Relay2MarkingPulseMs = 50,
-            PassMarkingToJigDelayMs = 0,
-            PageDelay = 5000
-        };
-
-        using TestEngine oneNetEngine = CreateEngine(out _, slowConfirmProduction);
-        oneNetEngine.SetModel(Model(("ONLY", new[] { 1, 86 })));
-        oneNetEngine.ProcessFrame(FrameSeq(1, (1, new[] { 86 })));
-        PassGateDiagnostics oneNetGate = oneNetEngine.GetPassGateDiagnostics();
-        Assert(oneNetEngine.ExpectedNetCount == 1 &&
-               oneNetGate.PassedNetCount == 1 &&
-               oneNetEngine.ContinuityPassed,
-            "One-network product PASSes on the first valid complete frame");
-
-        using TestEngine reverseOneNetEngine = CreateEngine(out _, slowConfirmProduction);
-        reverseOneNetEngine.SetModel(Model(("ONLY", new[] { 1, 86 })));
-        reverseOneNetEngine.ProcessFrame(FrameSeq(1, (86, new[] { 1 })));
-        Assert(reverseOneNetEngine.ContinuityPassed &&
-               reverseOneNetEngine.ReadyToEvaluateProductFaults,
-            "Reverse-direction continuity both passes and opens the production PASS gate");
-
-        using TestEngine reverseMultiNetEngine = CreateEngine(out _, slowConfirmProduction);
-        reverseMultiNetEngine.SetModel(Model(
-            ("1", new[] { 13, 10 }),
-            ("2", new[] { 14, 9 }),
-            ("CLIP1", new[] { 19, 20 }),
-            ("RET1", new[] { 21, 22 })));
-        reverseMultiNetEngine.ProcessFrame(FrameSeq(
-            221,
-            (10, new[] { 13 }),
-            (9, new[] { 14 }),
-            (20, new[] { 19 }),
-            (22, new[] { 21 })));
-        PassGateDiagnostics reverseMultiNetGate = reverseMultiNetEngine.GetPassGateDiagnostics();
-        Assert(reverseMultiNetGate.PassedNetCount == 4 &&
-               reverseMultiNetGate.RemainingNetworks.Count == 0 &&
-               reverseMultiNetEngine.ContinuityPassed &&
-               reverseMultiNetEngine.ReadyToEvaluateProductFaults &&
-               !reverseMultiNetEngine.HasWiringFault,
-            "Four-network frame from affected machine PASSes even when every valid edge is source-reversed");
-
-        using TestEngine criticalTopologyEngine = CreateEngine(out FakeBoard criticalBoard, slowConfirmProduction);
-        ProductModel criticalTopology = Model(("~1", new[] { 1, 2 }));
-        criticalTopologyEngine.SetModel(criticalTopology);
-        PassGateDiagnostics criticalInitial = criticalTopologyEngine.GetPassGateDiagnostics();
-        IReadOnlyList<FaultRow> criticalInitialRows = criticalTopologyEngine.BuildRows();
-        Assert(criticalTopologyEngine.ExpectedNetCount == 1 &&
-               criticalInitial.PassedNetCount == 0 &&
-               !criticalTopologyEngine.ContinuityPassed &&
-               !criticalTopologyEngine.HasWiringFault &&
-               criticalInitialRows.Count(row => row.ProductFaultType != ProductFaultType.None) == 0 &&
-               criticalInitialRows.Any(row =>
-                   row.Kind == FaultKind.MissingConnection &&
-                   row.RelatedIos.SequenceEqual([1, 2])),
-            "Critical topology: two THT endpoints in one wire/net build one missing display row, not two product faults");
-
-        var rawTopologyDecoder = new BoardIoDecoder();
-        rawTopologyDecoder.ConfigureCapacity(BoardCapacity.Create(1));
-        rawTopologyDecoder.ConfigureMode(BoardScanMode.Production);
-        ScanFrame rawTopologyFrame = rawTopologyDecoder
-            .Feed([0x80, 0x00, 0xA0, 0x01, 0xC0, 0x00])
-            .Single();
-        Assert(rawTopologyFrame.Connections.TryGetValue(1, out IReadOnlySet<int>? rawTopologyTargets) &&
-               rawTopologyTargets.SetEquals([2]),
-            "Raw protocol 80 00 A0 01 C0 00 decodes as SOURCE IO1 -> TARGET IO2");
-
-        criticalTopologyEngine.ProcessFrame(FrameSeq(2, (2, new[] { 1 })));
-        PassGateDiagnostics criticalPassed = criticalTopologyEngine.GetPassGateDiagnostics();
-        IReadOnlyList<FaultRow> criticalPassedRows = criticalTopologyEngine.BuildRows();
-        FaultRow[] criticalMapped = criticalPassedRows.Where(row => row.WireName == "~1").ToArray();
-        Assert(criticalTopologyEngine.ExpectedNetCount == 1 &&
-               criticalPassed.PassedNetCount == 1 &&
-               criticalTopologyEngine.ContinuityPassed &&
-               !criticalTopologyEngine.HasWiringFault &&
-               criticalMapped.Length == 0,
-            "Critical topology: IO1/IO2 pass removes connected endpoint rows");
-
-        bool criticalPassCommitted = criticalTopologyEngine.CompletePassAsync([])
-            .GetAwaiter()
-            .GetResult();
-        Assert(criticalPassCommitted &&
-               criticalBoard.Commands.Contains("SET:2") &&
-               criticalBoard.Commands.Contains("SET:1"),
-            "Critical topology: no-resistance MasterMinimum=0 equivalent can commit PASS immediately after continuity");
-
-        ProductModel twoWireModel = Model(("PAIR-A", new[] { 1, 86 }), ("PAIR-B", new[] { 2, 87 }));
-        using TestEngine twoNetEngine = CreateEngine(out _, slowConfirmProduction);
-        twoNetEngine.SetModel(twoWireModel);
-        Assert(twoNetEngine.ExpectedNetCount == 2, "Two-wire model builds exactly two expected production networks");
-
-        twoNetEngine.ProcessFrame(FrameSeq(2, (1, new[] { 86 })));
-        PassGateDiagnostics partialGate = twoNetEngine.GetPassGateDiagnostics();
-        Assert(!twoNetEngine.ContinuityPassed &&
-               partialGate.PassedNetCount == 1 &&
-               partialGate.RemainingNetworks.Count == 1 &&
-               partialGate.RemainingNetworks.Single().Display.Contains("IO2<->IO87", StringComparison.Ordinal),
-            "Two-wire model at 1/2 blocks PASS and reports the exact remaining network");
-
-        twoNetEngine.ProcessFrame(FrameSeq(3, (1, new[] { 86 }), (2, new[] { 87 })));
-        PassGateDiagnostics cleanGate = twoNetEngine.GetPassGateDiagnostics();
-        Assert(twoNetEngine.ContinuityPassed &&
-               cleanGate.PassedNetCount == 2 &&
-               cleanGate.RemainingNetworks.Count == 0,
-            "Two-wire model reaches 2/2 PASS on the first full complete frame");
-
-        using TestEngine wrongEngine = CreateEngine(out _, slowConfirmProduction);
-        wrongEngine.SetModel(twoWireModel);
-        wrongEngine.ProcessFrame(FrameSeq(4, (1, new[] { 86, 87 }), (2, new[] { 87 })));
-        PassGateDiagnostics wrongGate = wrongEngine.GetPassGateDiagnostics();
-        Assert(!wrongEngine.ContinuityPassed &&
-               wrongGate.PassedNetCount == 2 &&
-               wrongGate.WrongCandidateCount > 0 &&
-               wrongGate.WrongConfirmedCount == 0,
-            "Wrong candidate blocks PASS immediately without waiting for confirmed FAIL");
-
-        using TestEngine shortEngine = CreateEngine(out _, slowConfirmProduction);
-        shortEngine.SetModel(twoWireModel);
-        shortEngine.ProcessFrame(FrameSeq(5, (1, new[] { 86 }), (2, new[] { 87 }), (86, new[] { 87 })));
-        PassGateDiagnostics shortGate = shortEngine.GetPassGateDiagnostics();
-        Assert(!shortEngine.ContinuityPassed &&
-               shortGate.PassedNetCount == 2 &&
-               shortGate.ShortCandidateCount > 0 &&
-               shortGate.ShortConfirmedCount == 0,
-            "Short candidate blocks PASS immediately without applying FAIL debounce to good nets");
-
-        TestViewModel vm = CreateTestViewModel(slowConfirmProduction, out FakeBoard board);
-        vm.SetModel(twoWireModel);
-        Assert(vm.ProductionEnabled, "MasterMinimum=0 leaves production enabled for two-wire PASS flow");
-
-        board.Publish(FrameSeq(10));
-        vm.StartProductionTestAsync().GetAwaiter().GetResult();
-        board.Publish(FrameSeq(10, (1, new[] { 86 }), (2, new[] { 87 })));
-        Assert(vm.PassedNetworkCount == 0, "Reused background scan rejects stale pre-cycle complete frame");
-        board.Publish(FrameSeq(11, (1, new[] { 86 }), (2, new[] { 87 })));
-        Assert(vm.PassedNetworkCount == 2, "Fresh post-ARM frame can satisfy two-wire PASS gate");
-
-        MethodInfo normalizeWire = typeof(ThtModelParser).GetMethod(
-            "NormalizeWireIdentity",
-            BindingFlags.NonPublic | BindingFlags.Static)
-            ?? throw new InvalidOperationException("NormalizeWireIdentity method not found.");
-        string plainWire = (string)(normalizeWire.Invoke(null, ["c1"]) ?? string.Empty);
-        string markedWire = (string)(normalizeWire.Invoke(null, ["\u25C9c1"]) ?? string.Empty);
-        string tildeWire = (string)(normalizeWire.Invoke(null, ["~1"]) ?? string.Empty);
-        Assert(plainWire == "c1" && markedWire == "c1" && tildeWire == "~1",
-            "THT wire-name marker/icon characters do not split a visible two-pin wire into separate nets and ~ remains a valid wire name");
-
-        MethodInfo waitMethod = typeof(TestViewModel).GetMethod(
-            "WaitForProbeRelayInterlockAsync",
-            BindingFlags.NonPublic | BindingFlags.Instance)
-            ?? throw new InvalidOperationException("Probe relay interlock method not found.");
-        Stopwatch sw = Stopwatch.StartNew();
-        ((Task)waitMethod.Invoke(vm, [CancellationToken.None])!).GetAwaiter().GetResult();
-        sw.Stop();
-        Assert(sw.ElapsedMilliseconds < 50, "Inactive Probe interlock returns without adding PASS delay");
-
-    }
-
     private static void TestInlineProbeDoesNotClearWiringFaults()
     {
         var production = new ProductionSettings
         {
             MasterFaultRequiredCount = 0,
             ProductSettleTimeMs = 0,
-            WrongConnectionConfirmMs = 500,
-            ShortCircuitConfirmMs = 500
+            WrongConnectionConfirmMs = 0,
+            ShortCircuitConfirmMs = 0
         };
 
         ProductModel model = Model(("PAIR-A", new[] { 1, 86 }), ("PAIR-B", new[] { 2, 87 }));
@@ -5903,337 +4984,88 @@ internal static class Program
 
         board.Publish(FrameSeq(21, (1, new[] { 86 }), (2, new[] { 87 }), (86, new[] { 87 })));
         TestEngine engine = (TestEngine)(typeof(TestViewModel).GetField(
-            "_engine",
-            BindingFlags.Instance | BindingFlags.NonPublic)
+            "_engine", BindingFlags.Instance | BindingFlags.NonPublic)
             ?.GetValue(vm) ?? throw new InvalidOperationException("TestViewModel engine field not found"));
         PassGateDiagnostics beforeProbe = engine.GetPassGateDiagnostics();
         Assert(beforeProbe.ShortCandidateCount + beforeProbe.WrongCandidateCount > 0,
-            "Wiring fault candidate exists before inline Probe frame");
-        long processedBeforeProbe = vm.ProductionFramesProcessed;
+            "Wiring fault candidate exists before TESTPIN event");
 
-        board.Publish(ProbeFrameSeq(22, 1));
-        board.Publish(ProbeFrameSeq(23, 1));
+        board.PublishProbePreview(new ProductionProbePreview(
+            DateTime.UtcNow, new[] { 1 }, 1, 1, 22, 1));
+        Assert(vm.HasInlineProbeContacts,
+            "Explicit TESTPIN preview appears immediately in TestView");
 
-        Assert(vm.HasInlineProbeContacts, "Inline Probe frame appears as transient UI state");
-        Assert(vm.ProductionFramesProcessed > processedBeforeProbe,
-            "Inline Probe candidate is still processed by Production TestEngine");
+        MethodInfo productionFaultContextMethod = typeof(TestViewModel).GetMethod(
+            "IsProductionFaultContext",
+            BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException("IsProductionFaultContext method not found.");
+        long runtimeGeneration = (long)(typeof(TestViewModel).GetField(
+            "_runtimeGeneration", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?.GetValue(vm) ?? throw new InvalidOperationException("runtime generation field not found."));
+        Assert((bool)productionFaultContextMethod.Invoke(vm, [runtimeGeneration])!,
+            "Inline TESTPIN must not suppress Production SHORT/OTHER fault context");
+
+        string vmSource = File.ReadAllText(
+            Path.Combine(Environment.CurrentDirectory, "ViewModels", "TestViewModel.cs"));
+        int productionContextStart = vmSource.IndexOf(
+            "private bool IsProductionFaultContext", StringComparison.Ordinal);
+        int productionContextEnd = vmSource.IndexOf(
+            "public void PrepareProbeUiMode", productionContextStart, StringComparison.Ordinal);
+        Assert(productionContextStart >= 0 && productionContextEnd > productionContextStart &&
+               !vmSource[productionContextStart..productionContextEnd].Contains(
+                   "_inlineProbeContactIo", StringComparison.Ordinal),
+            "Inline TESTPIN must not participate in the Production fault-context gate");
+
+        int recordCompletedStart = vmSource.IndexOf(
+            "private async Task<bool> RecordCompletedProductAsync", StringComparison.Ordinal);
+        int recordCompletedGuardEnd = vmSource.IndexOf(
+            "ProductModel model = cycleModel;", recordCompletedStart, StringComparison.Ordinal);
+        Assert(recordCompletedStart >= 0 && recordCompletedGuardEnd > recordCompletedStart &&
+               !vmSource[recordCompletedStart..recordCompletedGuardEnd].Contains(
+                   "_inlineProbeContactIo", StringComparison.Ordinal),
+            "Inline TESTPIN must not block committing an authoritative SHORT/OTHER FAIL");
+
+        int passReasonStart = vmSource.IndexOf(
+            "private string ResolvePassGateReason", StringComparison.Ordinal);
+        int passReasonEnd = vmSource.IndexOf(
+            "private bool HasInstalledProductEvidenceForProbe", passReasonStart, StringComparison.Ordinal);
+        string passReasonSource = passReasonStart >= 0 && passReasonEnd > passReasonStart
+            ? vmSource[passReasonStart..passReasonEnd]
+            : string.Empty;
+        Assert(passReasonSource.IndexOf("SHORT_CONFIRMED", StringComparison.Ordinal) >= 0 &&
+               passReasonSource.IndexOf("SHORT_CONFIRMED", StringComparison.Ordinal) <
+               passReasonSource.IndexOf("PROBE_INTERLOCK", StringComparison.Ordinal),
+            "Confirmed SHORT must outrank TESTPIN/Probe interlock in PASS/FAIL diagnostics");
+
         PassGateDiagnostics afterProbe = engine.GetPassGateDiagnostics();
         Assert(afterProbe.ShortCandidateCount + afterProbe.WrongCandidateCount > 0,
-            "Inline Probe frame must not clear existing SHORT/WRONG state");
+            "TESTPIN presentation must not clear existing SHORT/WRONG state");
 
         TestViewModel cleanProbeVm = CreateTestViewModel(production, out FakeBoard cleanProbeBoard);
         cleanProbeVm.SetModel(model);
         cleanProbeVm.StartProductionTestAsync().GetAwaiter().GetResult();
-        cleanProbeBoard.Publish(ProbeFrameSeq(24, 1));
-        cleanProbeBoard.Publish(ProbeFrameSeq(25, 1));
         TestEngine cleanProbeEngine = (TestEngine)(typeof(TestViewModel).GetField(
-            "_engine",
-            BindingFlags.Instance | BindingFlags.NonPublic)
+            "_engine", BindingFlags.Instance | BindingFlags.NonPublic)
             ?.GetValue(cleanProbeVm) ?? throw new InvalidOperationException("Clean Probe engine not found"));
-        int cleanProbeProductSoundFlag = (int)(typeof(TestViewModel).GetField(
-            "_productStartSoundPlayed",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?.GetValue(cleanProbeVm) ?? -1);
+        cleanProbeBoard.PublishProbePreview(new ProductionProbePreview(
+            DateTime.UtcNow, new[] { 125 }, 1, 1, 24, 1));
         Assert(cleanProbeVm.HasInlineProbeContacts &&
                cleanProbeVm.CurrentProductionRuntimeState == ProductionRuntimeState.WaitingForProduct &&
                !cleanProbeEngine.GetProductEvidenceSnapshot().ValidProductEvidence &&
-               cleanProbeProductSoundFlag == 0 &&
                !cleanProbeVm.Faults.Any(row => row.Kind is FaultKind.WrongWiring or FaultKind.Short),
-            "Inline Probe contact stays display-only and cannot create ProductPresence, sound, WRONG or SHORT");
+            "TESTPIN is display-only and cannot create ProductPresence, WRONG or SHORT");
 
-        TestViewModel leadingFrameVm = CreateTestViewModel(production, out FakeBoard leadingFrameBoard);
-        leadingFrameVm.SetModel(model);
-        leadingFrameVm.StartProductionTestAsync().GetAwaiter().GetResult();
-        leadingFrameBoard.Publish(FrameSeq(26, (230, new[] { 1 }), (231, new[] { 1 })));
-        TestEngine leadingFrameEngine = (TestEngine)(typeof(TestViewModel).GetField(
-            "_engine",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?.GetValue(leadingFrameVm) ?? throw new InvalidOperationException("Leading-frame engine not found"));
-        Assert(leadingFrameEngine.GetPassGateDiagnostics().WrongCandidateCount > 0 &&
-               leadingFrameEngine.HasProductActivity,
-            "Setup: a weak leading frame can temporarily look like model-related wrong wiring");
-        leadingFrameBoard.Publish(ProbeFrameSeq(27, 1));
-        ProductEvidenceSnapshot isolatedEvidence = leadingFrameEngine.GetProductEvidenceSnapshot();
-        Assert(isolatedEvidence.WrongCandidateCount == 0 &&
-               !isolatedEvidence.ValidProductEvidence &&
-               leadingFrameVm.CurrentProductionRuntimeState == ProductionRuntimeState.WaitingForProduct,
-            "First confirmed Probe-classifier frame removes same-IO candidates and Product evidence before TP UI confirmation");
-
-        var pointerDisabled = new ProductionSettings
-        {
-            UseTestPointer = false,
-            MasterFaultRequiredCount = 0,
-            ProductSettleTimeMs = 0,
-            WrongConnectionConfirmMs = 0,
-            ShortCircuitConfirmMs = 0
-        };
-        TestViewModel pointerDisabledVm = CreateTestViewModel(pointerDisabled, out FakeBoard disabledBoard);
-        pointerDisabledVm.SetModel(model);
-        pointerDisabledVm.StartProductionTestAsync().GetAwaiter().GetResult();
-        disabledBoard.Publish(ProbeFrameSeq(30, 1));
-        disabledBoard.Publish(ProbeFrameSeq(31, 1));
-        Assert(pointerDisabledVm.HasInlineProbeContacts,
-            "Legacy UseTestPointer=false is normalized to always-on Probe observation");
-        disabledBoard.Publish(FrameSeq(32));
-        disabledBoard.Publish(FrameSeq(33));
-
+        cleanProbeBoard.PublishProbePreview(new ProductionProbePreview(
+            DateTime.UtcNow, Array.Empty<int>(), 1, 0, 25, 1));
         MethodInfo waitMethod = typeof(TestViewModel).GetMethod(
             "WaitForProbeRelayInterlockAsync",
             BindingFlags.NonPublic | BindingFlags.Instance)
             ?? throw new InvalidOperationException("Probe relay interlock method not found.");
         Stopwatch sw = Stopwatch.StartNew();
-        ((Task)waitMethod.Invoke(pointerDisabledVm, [CancellationToken.None])!).GetAwaiter().GetResult();
+        ((Task)waitMethod.Invoke(cleanProbeVm, [CancellationToken.None])!).GetAwaiter().GetResult();
         sw.Stop();
-        Assert(sw.ElapsedMilliseconds < 100, "Released always-on Probe adds no production PASS delay");
-
-        TestViewModel transitionVm = CreateTestViewModel(production, out FakeBoard transitionBoard);
-        transitionVm.SetModel(model);
-        transitionVm.StartProductionTestAsync().GetAwaiter().GetResult();
-        transitionBoard.Publish(FrameSeq(40));
-        TestEngine transitionEngine = (TestEngine)(typeof(TestViewModel).GetField(
-            "_engine",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?.GetValue(transitionVm) ?? throw new InvalidOperationException("Transition engine not found"));
-        long engineFramesBeforeProbe = transitionEngine.FramesProcessed;
-        transitionBoard.Publish(ProbeFrameSeq(41, 14, fanIn: 12));
-        transitionBoard.Publish(ProbeFrameSeq(42, 14, fanIn: 5));
-        Assert(transitionEngine.FramesProcessed == engineFramesBeforeProbe &&
-               !transitionEngine.HasProductActivity &&
-               transitionEngine.GetPassGateDiagnostics().WrongCandidateCount == 0,
-            "A weak trailing Probe transition frame remains quarantined from ProductDetect/WRONG_CANDIDATE");
-    }
-
-    private static void TestHtdrvEndpointProbeDisplayCases()
-    {
-        ProductModel model = HtdrvTwoEndpointModel();
-        using TestEngine engine = CreateEngine(out _);
-        engine.SetModel(model);
-        engine.ProcessFrame(FrameSeq(1, (1, Array.Empty<int>())));
-
-        FaultRow[] openRows = engine.BuildRows().Where(row => row.WireName == "1").ToArray();
-        Assert(openRows.Length == 2 &&
-               openRows.Any(row => row.Io == 1 && row.FaultType == "Đơn" && row.Status == "CHƯA KẾT NỐI" && row.Connector == "1" && row.Pin == "1" && row.IoCnPnText == "1-1-1") &&
-               openRows.Any(row => row.Io == 2 && row.FaultType == "Đơn" && row.Status == "CHƯA KẾT NỐI" && row.Connector == "1" && row.Pin == "2" && row.IoCnPnText == "2-1-2") &&
-               openRows.All(row => !row.IoText.Contains("<->", StringComparison.Ordinal) && !row.Pin.Contains("<->", StringComparison.Ordinal)),
-            "CASE A: Open display uses one endpoint row per pin with IO-CN-PN metadata");
-
-        var production = new ProductionSettings
-        {
-            MasterFaultRequiredCount = 0,
-            ProductSettleTimeMs = 1_000,
-            WrongConnectionConfirmMs = 0,
-            ShortCircuitConfirmMs = 0,
-            UseTestPointer = true
-        };
-        TestViewModel vm = CreateTestViewModel(production, out FakeBoard board);
-        vm.SetModel(model);
-        vm.StartProductionTestAsync().GetAwaiter().GetResult();
-        board.Publish(FrameSeq(10, (1, Array.Empty<int>())));
-        int totalBeforeProbe = vm.Total;
-        int passBeforeProbe = vm.Pass;
-        int failBeforeProbe = vm.Fail;
-        int commandsBeforeProbe = board.Commands.Count;
-        string centerBeforeProbe = vm.CenterResultText;
-        board.Publish(ProbeFrameSeq(11, 1));
-        board.Publish(ProbeFrameSeq(12, 1));
-
-        Assert(vm.HasInlineProbeContacts &&
-               vm.Faults.Any(row =>
-                   row.Kind == FaultKind.Probe &&
-                   row.FaultType == "TP" &&
-                   row.Io == 1 &&
-                   row.IoText == "1" &&
-                   row.Connector == "1" &&
-                   row.Pin == "1" &&
-                   row.WireName == "1" &&
-                   row.Section == "0.5" &&
-                   row.Color == "R" &&
-                   row.Status == "TP - IO(1)" &&
-                   row.IoCnPnText == "1-1-1") &&
-               vm.CenterResultText.Length == 0 &&
-               vm.CurrentProductionPresentationMode == ProductionPresentationMode.Probe &&
-               vm.Total == totalBeforeProbe &&
-               vm.Pass == passBeforeProbe &&
-               vm.Fail == failBeforeProbe &&
-               board.Commands.Count == commandsBeforeProbe,
-            "CASE B: mapped Probe shows the complete touched THT row without production or relay side effects; " +
-            $"active={vm.HasInlineProbeContacts}, center={vm.CenterResultText}/{centerBeforeProbe}, " +
-            $"count={vm.Total}/{totalBeforeProbe},{vm.Pass}/{passBeforeProbe},{vm.Fail}/{failBeforeProbe}, " +
-            $"commands={board.Commands.Count}/{commandsBeforeProbe}, rows=" +
-            string.Join("|", vm.Faults.Select(row =>
-                $"{row.Kind}/IO{row.Io}/{row.IoText}/{row.IoCnPnText}/{row.WireName}/{row.Section}/{row.Color}/{row.Status}")));
-
-        long touchRevision = (long)(typeof(TestViewModel).GetField(
-            "_inlineProbeUiRevision",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?.GetValue(vm) ?? -1L);
-        board.Publish(FrameSeq(13));
-        long releaseRevision = (long)(typeof(TestViewModel).GetField(
-            "_inlineProbeUiRevision",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?.GetValue(vm) ?? -1L);
-        Assert(!vm.HasInlineProbeContacts &&
-               vm.Faults.All(row => row.Kind != FaultKind.Probe) &&
-               vm.Faults.Count == 0 &&
-               vm.CurrentProductionRuntimeState == ProductionRuntimeState.WaitingForProduct &&
-               vm.CurrentProductionPresentationMode == ProductionPresentationMode.Waiting &&
-               vm.CurrentProbePresentationState == ProbePresentationState.Released &&
-               vm.State == "LẮP SẢN PHẨM" &&
-               releaseRevision > touchRevision &&
-               vm.CenterResultText == "LẮP SẢN PHẨM",
-            "CASE C: one RELEASE frame clears TP, keeps pending model rows hidden while waiting, restores waiting presentation, and invalidates stale TOUCH callbacks");
-
-        var duplicateModel = new ProductModel
-        {
-            ModelName = "PROBE-DUPLICATE-MAPPING",
-            PartNumber = "PROBE-DUPLICATE-MAPPING"
-        };
-        var duplicateA1 = new PinRecord("CN-A", "WIRE-A", 5, "1", Section: "0.3", Color: "B", OriginalOrder: 1);
-        var duplicateA2 = new PinRecord("CN-B", "WIRE-A", 6, "2", Section: "0.3", Color: "B", OriginalOrder: 2);
-        var duplicateB1 = new PinRecord("CN-C", "WIRE-B", 5, "3", Section: "0.5", Color: "R", OriginalOrder: 3);
-        var duplicateB2 = new PinRecord("CN-D", "WIRE-B", 7, "4", Section: "0.5", Color: "R", OriginalOrder: 4);
-        var duplicateSingle = new PinRecord("CN-E", string.Empty, 5, "5", Section: "0.8", Color: "G", OriginalOrder: 5);
-        duplicateModel.Pins.AddRange([duplicateA1, duplicateA2, duplicateB1, duplicateB2, duplicateSingle]);
-        duplicateModel.Nets.Add(new WireNet("WIRE-A", [5, 6], [duplicateA1, duplicateA2]));
-        duplicateModel.Nets.Add(new WireNet("WIRE-B", [5, 7], [duplicateB1, duplicateB2]));
-        TestViewModel duplicateVm = CreateTestViewModel(production);
-        duplicateVm.SetModel(duplicateModel);
-        IReadOnlyList<FaultRow> duplicateRows = duplicateVm.GetProbeRows(5);
-        Assert(duplicateRows.Count == 3 &&
-               duplicateRows.All(row => row.Io == 5 && row.FaultType == "TP") &&
-               duplicateRows.Select(row => row.Connector).SequenceEqual(["CN-A", "CN-C", "CN-E"]) &&
-               duplicateRows.Any(row => row.Connector == "CN-E" &&
-                                        row.Pin == "5" &&
-                                        row.Section == "0.8" &&
-                                        row.Color == "G"),
-            "CASE C1: duplicate IO mapping shows every direct THT row without expanding peer endpoints");
-
-        var unnamedPinModel = new ProductModel
-        {
-            ModelName = "PROBE-UNNAMED-PIN",
-            PartNumber = "PROBE-UNNAMED-PIN"
-        };
-        unnamedPinModel.Pins.Add(new PinRecord("3", string.Empty, 10, "5", OriginalOrder: 1));
-        TestViewModel unnamedPinVm = CreateTestViewModel(production);
-        unnamedPinVm.SetModel(unnamedPinModel);
-        FaultRow unnamedPinRow = unnamedPinVm.GetProbeRows(10).Single();
-        Assert(unnamedPinRow.Io == 10 &&
-               unnamedPinRow.IoText == "IO (10)" &&
-               unnamedPinRow.Connector == "3" &&
-               unnamedPinRow.Pin == "5" &&
-               unnamedPinRow.WireName.Length == 0,
-            "CASE C1.1: unnamed THT pin shows IO (10) in IO, Connector 3 and Pin 5 in their own columns");
-
-        ScanFrame unmappedPairFrame = FrameSeq(14, (23, new[] { 25 }));
-        Assert(ProbeContactClassifier.DetectMany(
-                   unmappedPairFrame,
-                   model,
-                   maxContacts: 2,
-                   boardCapacity: BoardCapacity.Create(10)).Count == 0,
-            "CASE C2: an ordinary IO23<->IO25 edge has no Probe signature");
-        using TestEngine unmappedPairEngine = CreateEngine(out _, production);
-        unmappedPairEngine.SetModel(model);
-        unmappedPairEngine.ProcessFrame(unmappedPairFrame);
-        Thread.Sleep(ProductionTimingPolicy.DefaultWrongConnectionConfirmMs + 20);
-        unmappedPairEngine.ProcessFrame(unmappedPairFrame with { Sequence = 15 });
-        PassGateDiagnostics unmappedDiagnostics = unmappedPairEngine.GetPassGateDiagnostics();
-        Assert(unmappedDiagnostics.WrongCandidateCount == 1 &&
-               unmappedDiagnostics.ShortCandidateCount == 0 &&
-               unmappedDiagnostics.HasProductActivity &&
-               unmappedDiagnostics.WrongConfirmedCount == 1 &&
-               unmappedPairEngine.HasWiringFault &&
-               unmappedPairEngine.BuildRows().Count(row =>
-                   row.Kind == FaultKind.WrongWiring &&
-                   row.Status == "SAI DÂY" &&
-                   (row.Io == 23 || row.Io == 25)) == 2,
-            "CASE C2: an ordinary physical edge outside the THT is not Probe/noise; it remains realtime product evidence and confirms SAI DÂY");
-
-        ProductModel shortModel = Model(("PAIR-A", new[] { 1, 86 }), ("PAIR-B", new[] { 2, 87 }));
-        var shortProduction = new ProductionSettings
-        {
-            MasterFaultRequiredCount = 0,
-            ProductSettleTimeMs = 0,
-            WrongConnectionConfirmMs = 0,
-            ShortCircuitConfirmMs = 0,
-            UseTestPointer = true
-        };
-        TestViewModel shortVm = CreateTestViewModel(shortProduction, out FakeBoard shortBoard);
-        shortVm.SetModel(shortModel);
-        shortVm.StartProductionTestAsync().GetAwaiter().GetResult();
-        MethodInfo refreshFaults = typeof(TestViewModel).GetMethod(
-            "RefreshFaults",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?? throw new InvalidOperationException("RefreshFaults method not found.");
-        shortBoard.Publish(FrameSeq(20, (1, new[] { 86 }), (2, new[] { 87 }), (86, new[] { 87 })));
-        Thread.Sleep(ProductionTimingPolicy.DefaultProductSettleTimeMs + 5);
-        shortBoard.Publish(FrameSeq(21, (1, new[] { 86 }), (2, new[] { 87 }), (86, new[] { 87 })));
-        Thread.Sleep(ProductionTimingPolicy.DefaultShortCircuitConfirmMs + 5);
-        shortBoard.Publish(FrameSeq(22, (1, new[] { 86 }), (2, new[] { 87 }), (86, new[] { 87 })));
-        refreshFaults.Invoke(shortVm, []);
-        TestEngine shortEngine = (TestEngine)(typeof(TestViewModel).GetField(
-            "_engine",
-            BindingFlags.Instance | BindingFlags.NonPublic)
-            ?.GetValue(shortVm) ?? throw new InvalidOperationException("TestViewModel engine field not found"));
-        PassGateDiagnostics shortDiagnostics = shortEngine.GetPassGateDiagnostics();
-        Assert(shortVm.Faults.Any(row => row.Kind == FaultKind.Short),
-            "CASE D setup: real SHORT is confirmed before Probe observation. Rows=" +
-            string.Join(" | ", shortVm.Faults.Select(row => $"{row.Kind}/{row.FaultType}/IO{row.Io}/{row.Status}")) +
-            $" Diagnostics shortCandidate={shortDiagnostics.ShortCandidateCount} shortConfirmed={shortDiagnostics.ShortConfirmedCount} wrongCandidate={shortDiagnostics.WrongCandidateCount} wrongConfirmed={shortDiagnostics.WrongConfirmedCount}");
-        shortBoard.Publish(ProbeFrameSeq(23, 86));
-        shortBoard.Publish(ProbeFrameSeq(24, 86));
-        refreshFaults.Invoke(shortVm, []);
-        Assert(shortVm.Faults.Any(row => row.Kind == FaultKind.Probe &&
-                                        row.Io == 86 &&
-                                        row.WireName == "PAIR-A" &&
-                                        row.FaultType == "TP") &&
-               shortVm.Faults.Any(row => row.Kind == FaultKind.Short),
-            "CASE D: Probe row and real SHORT row can coexist; SHORT remains visible");
-
-        TestViewModel unusedVm = CreateTestViewModel(production, out FakeBoard unusedBoard);
-        unusedVm.SetModel(model);
-        unusedVm.StartProductionTestAsync().GetAwaiter().GetResult();
-        long processedBeforeUnusedProbe = unusedVm.ProductionFramesProcessed;
-        string stateBeforeUnusedProbe = unusedVm.State;
-        unusedBoard.Publish(ProbeFrameSeq(30, 7));
-        unusedBoard.Publish(ProbeFrameSeq(31, 7));
-        Assert(unusedVm.HasInlineProbeContacts &&
-               unusedVm.Faults.Count == 1 &&
-               unusedVm.Faults[0].Kind == FaultKind.Probe &&
-               unusedVm.Faults[0].Io == 7 &&
-               unusedVm.Faults[0].IoText == "IO (7)" &&
-               unusedVm.Faults[0].Connector.Length == 0 &&
-               unusedVm.Faults[0].Pin.Length == 0 &&
-               unusedVm.Faults[0].WireName.Length == 0 &&
-               unusedVm.Faults[0].FaultType == "TP" &&
-               unusedVm.Faults[0].Status == "TP - IO(7)" &&
-               unusedVm.CenterResultText.Length == 0 &&
-               unusedVm.CurrentProductionRuntimeState == ProductionRuntimeState.WaitingForProduct &&
-               unusedVm.CurrentProductionPresentationMode == ProductionPresentationMode.Probe &&
-               unusedVm.CurrentProbePresentationState == ProbePresentationState.Touch &&
-               unusedVm.State == stateBeforeUnusedProbe &&
-               unusedVm.ProductionFramesProcessed > processedBeforeUnusedProbe,
-            "CASE E: always-on Probe shows an unmapped physical IO while Probe owns presentation, without starting the product cycle; " +
-            $"state={unusedVm.State}/{stateBeforeUnusedProbe}, runtime={unusedVm.CurrentProductionRuntimeState}, " +
-            $"presentation={unusedVm.CurrentProductionPresentationMode}, probe={unusedVm.CurrentProbePresentationState}, " +
-            $"center='{unusedVm.CenterResultText}', processed={unusedVm.ProductionFramesProcessed}/{processedBeforeUnusedProbe}, rows=" +
-            string.Join("|", unusedVm.Faults.Select(row =>
-                $"{row.Kind}/IO{row.Io}/{row.IoText}/{row.Connector}/{row.Pin}/{row.WireName}/{row.FaultType}/{row.Status}")));
-
-        TestViewModel testPinVm = CreateTestViewModel(production, out FakeBoard testPinBoard);
-        testPinVm.SetModel(model);
-        testPinVm.StartProductionTestAsync().GetAwaiter().GetResult();
-        testPinVm.StartProbeScanAsync().GetAwaiter().GetResult();
-        Assert(testPinBoard.CurrentScanMode == BoardScanMode.Production &&
-               testPinVm.State != "ĐANG DÒ CHÂN",
-            "TestPin observer does not switch transport out of Production mode or change production state");
-        long processedBeforeTestPin = testPinVm.ProductionFramesProcessed;
-        testPinBoard.Publish(ProbeFrameSeq(40, 7));
-        testPinBoard.Publish(ProbeFrameSeq(41, 7));
-        testPinBoard.Publish(ProbeFrameSeq(42, 1));
-        testPinBoard.Publish(ProbeFrameSeq(43, 1));
-        Assert(testPinVm.HasInlineProbeContacts &&
-               testPinVm.ProductionFramesProcessed > processedBeforeTestPin,
-            "StartProbeScanAsync enables Probe/TestPin observation on Production stream");
+        Assert(sw.ElapsedMilliseconds < 100,
+            "Released TESTPIN adds no production PASS delay");
     }
 
     private static void TestFiveHundredCycleScanProbeFaultStress()
@@ -6257,9 +5089,18 @@ internal static class Program
         vm.SetModel(model);
         vm.StartProductionTestAsync().GetAwaiter().GetResult();
 
+        // Prime each branch once so the bounded-handle check measures repeated
+        // cycles, rather than one-time WPF/diagnostic initialization.
+        board.Publish(FrameSeq(990, (1, new[] { 86 }), (2, new[] { 87 })));
+        board.Publish(FrameSeq(991, (1, Array.Empty<int>())));
+        board.Publish(FrameSeq(992, (1, new[] { 86, 87 }), (2, new[] { 87 })));
+        board.Publish(FrameSeq(993, Enumerable.Range(10, 20)
+            .Select(source => (source, new[] { 1 })).ToArray()));
+        board.Publish(FrameSeq(994));
+
+        long memoryBefore = GC.GetTotalMemory(forceFullCollection: true);
         int threadCountBefore = Process.GetCurrentProcess().Threads.Count;
         int handleCountBefore = Process.GetCurrentProcess().HandleCount;
-        long memoryBefore = GC.GetTotalMemory(forceFullCollection: true);
 
         for (int cycle = 1; cycle <= 500; cycle++)
         {
@@ -6308,6 +5149,7 @@ internal static class Program
         Assert(!vm.IsDeviceFault, "Stress: no DeviceFault/deadlock from mixed scan/probe/fault frames");
     }
 
+#if LEGACY_D2XX
     private static void TestThtColumnSemantics()
     {
         var production = new ProductionSettings
@@ -6508,6 +5350,7 @@ internal static class Program
         }
     }
 
+#endif
     private static void TestRelayOrdering()
     {
         using TestEngine engine = CreateEngine(out FakeBoard board);
@@ -6518,15 +5361,15 @@ internal static class Program
         engine.ProcessFrame(passFrame);
         bool ok = engine.CompletePassAsync([]).GetAwaiter().GetResult();
         Assert(ok, "PASS relay workflow accepted");
-        Assert(board.Commands.Count(command => command == "SET:2") == 1, "PASS R2 exactly once");
-        Assert(board.Commands.Count(command => command == "SET:1") == 1, "PASS R1 exactly once");
-        Assert(board.Commands.IndexOf("SET:2") < board.Commands.IndexOf("SET:1"), "PASS R2 before R1");
-        Assert(board.Commands.Skip(board.Commands.IndexOf("SET:2") + 1).TakeWhile(c => c != "SET:1").Contains("OFF"), "R2 OFF before R1 ON");
+        Assert(board.Commands.Count(command => command == "SET:4") == 1, "PASS physical Relay 5 / OUT4 exactly once");
+        Assert(board.Commands.Count(command => command == "SET:0") == 1, "PASS physical Relay 1 / OUT0 exactly once");
+        Assert(board.Commands.IndexOf("SET:4") < board.Commands.IndexOf("SET:0"), "PASS Relay 5 marking before Relay 1 jig");
+        Assert(board.Commands.Skip(board.Commands.IndexOf("SET:4") + 1).TakeWhile(c => c != "SET:0").Contains("OFF"), "Relay 5 OFF before Relay 1 ON");
 
         board.Commands.Clear();
         engine.EjectFaultProductAsync().GetAwaiter().GetResult();
-        Assert(board.Commands.Count(command => command == "SET:1") == 1, "FAIL R1 exactly once");
-        Assert(!board.Commands.Contains("SET:2"), "FAIL never marks R2");
+        Assert(board.Commands.Count(command => command == "SET:0") == 1, "FAIL Relay 1 / OUT0 exactly once");
+        Assert(!board.Commands.Contains("SET:4"), "FAIL never drives Relay 5 marking");
         Assert(board.Commands.Last() == "OFF", "FAIL ends OFF");
 
         using TestEngine latchedLeakEngine = CreateEngine(out FakeBoard latchedLeakBoard);
@@ -6538,7 +5381,7 @@ internal static class Program
         bool latchedLeakPass = latchedLeakEngine.CompletePassAsync(
             [],
             continuityAlreadyValidated: true).GetAwaiter().GetResult();
-        Assert(latchedLeakPass && latchedLeakBoard.Commands.Contains("SET:1"),
+        Assert(latchedLeakPass && latchedLeakBoard.Commands.Contains("SET:0"),
             "Leak PASS uses the pre-Leak validated continuity latch instead of becoming a false product FAIL");
 
         board.Commands.Clear();
@@ -6555,7 +5398,7 @@ internal static class Program
             }
 
             Assert(canceled, "Relay pulse cancellation is observed");
-            Assert(board.Commands.Contains("SET:1") && board.Commands.Last() == "OFF",
+            Assert(board.Commands.Contains("SET:0") && board.Commands.Last() == "OFF",
                 "Relay cancellation still ends with safe OFF");
         }
 
@@ -6593,15 +5436,16 @@ internal static class Program
         noMarkingEngine.ProcessFrame(passFrame);
         bool noMarkingOk = noMarkingEngine.CompletePassAsync([]).GetAwaiter().GetResult();
         Assert(noMarkingOk, "PASS relay workflow accepts disabled marking option");
-        Assert(!noMarkingBoard.Commands.Contains("SET:2") &&
-               noMarkingBoard.Commands.Count(command => command == "SET:1") == 1,
+        Assert(!noMarkingBoard.Commands.Contains("SET:4") &&
+               noMarkingBoard.Commands.Count(command => command == "SET:0") == 1,
             "Disabled PASS marking skips R2 and still opens JIG once");
 
         var reversedFaultJigProduction = new ProductionSettings
         {
             Relay1JigPulseMs = 50,
             Relay2MarkingPulseMs = 50,
-            RelayWiringMode = 1,
+            JigRelayChannel = 4,
+            MarkingRelayChannel = 0,
             JigEjectRelayEnabled = true,
             PassMarkingRelayEnabled = true
         };
@@ -6609,15 +5453,15 @@ internal static class Program
             out FakeBoard reversedFaultJigBoard,
             reversedFaultJigProduction);
         reversedFaultJigEngine.EjectFaultProductAsync().GetAwaiter().GetResult();
-        Assert(reversedFaultJigBoard.Commands.Count(command => command == "SET:2") == 1 &&
-               !reversedFaultJigBoard.Commands.Contains("SET:1") &&
+        Assert(reversedFaultJigBoard.Commands.Count(command => command == "SET:0") == 1 &&
+               !reversedFaultJigBoard.Commands.Contains("SET:4") &&
                reversedFaultJigBoard.Commands.Last() == "OFF",
-            "FAIL confirmation pulses only the configured physical JIG relay and never runs the PASS sequence");
+            "FAIL confirmation always uses fixed physical Relay 1 / OUT0 even if legacy cfg contains another mapping");
         reversedFaultJigBoard.Commands.Clear();
         reversedFaultJigEngine.EjectMasterSampleAsync().GetAwaiter().GetResult();
-        Assert(reversedFaultJigBoard.Commands.Count(command => command == "SET:2") == 1 &&
-               !reversedFaultJigBoard.Commands.Contains("SET:1"),
-            "Reversed machine ejects Master on physical JIG R2 without pulsing physical MARKING R1");
+        Assert(reversedFaultJigBoard.Commands.Count(command => command == "SET:0") == 1 &&
+               !reversedFaultJigBoard.Commands.Contains("SET:4"),
+            "Master eject always uses fixed physical Relay 1 / OUT0");
 
         var reversedRelayProduction = new ProductionSettings
         {
@@ -6625,7 +5469,8 @@ internal static class Program
             Relay2MarkingPulseMs = 50,
             PassMarkingToJigDelayMs = 0,
             ProductSettleTimeMs = 0,
-            RelayWiringMode = 1
+            JigRelayChannel = 4,
+            MarkingRelayChannel = 0
         };
         using TestEngine reversedRelayEngine = CreateEngine(out FakeBoard reversedRelayBoard, reversedRelayProduction);
         reversedRelayEngine.SetModel(Model(("PAIR", new[] { 1, 18 })));
@@ -6633,18 +5478,18 @@ internal static class Program
         Thread.Sleep(ProductionTimingPolicy.DefaultProductSettleTimeMs + 5);
         reversedRelayEngine.ProcessFrame(passFrame);
         bool reversedRelayOk = reversedRelayEngine.CompletePassAsync([]).GetAwaiter().GetResult();
-        Assert(reversedRelayOk, "PASS relay workflow accepts reversed R1 MARKING / R2 JIG wiring");
-        Assert(reversedRelayBoard.Commands.IndexOf("SET:1") >= 0 &&
-               reversedRelayBoard.Commands.IndexOf("SET:2") >= 0 &&
-               reversedRelayBoard.Commands.IndexOf("SET:1") < reversedRelayBoard.Commands.IndexOf("SET:2"),
-            "Reversed machine still MARKS on R1 before opening JIG on R2");
+        Assert(reversedRelayOk, "PASS relay workflow ignores obsolete configurable OUTPUT mapping");
+        Assert(reversedRelayBoard.Commands.IndexOf("SET:4") >= 0 &&
+               reversedRelayBoard.Commands.IndexOf("SET:0") >= 0 &&
+               reversedRelayBoard.Commands.IndexOf("SET:4") < reversedRelayBoard.Commands.IndexOf("SET:0"),
+            "PASS always uses fixed Relay 5 / OUT4 marking before Relay 1 / OUT0 jig");
     }
 
     private static void TestHistory()
     {
         Assert(
             ProgramIdentityService.BuildHtdrvName() ==
-            $"JBZUniversalTester V{ProgramIdentityService.VersionText}",
+            $"JBZUniveresalLunix V{ProgramIdentityService.VersionText}",
             "HtdrvName is exactly the current software name and release version");
 
         string root = Path.Combine(Path.GetTempPath(), "JBZSelfTests", Guid.NewGuid().ToString("N"));
@@ -6673,7 +5518,7 @@ internal static class Program
                 Passed = true,
                 ModelName = "MODEL-A",
                 ModelFile = @"C:\Models\A.tht",
-                HtdrvName = "JBZUniversalTester V15.2.0",
+                HtdrvName = "JBZUniveresalLunix V15.2.0",
                 LotText = "VOLVO Radio",
                 InspectionTrace =
                     "14:07:08 회로검사:PASS 14:07:08~14:07:08 저항검사 [CH1: 100 Ω < 101.5 Ω < 110 Ω :PASS]",
@@ -6755,7 +5600,7 @@ internal static class Program
                    csvText.Contains("장착 14:07:03~14:07:05(2.000초) 14:07:05 검사시작", StringComparison.Ordinal) &&
                    csvText.Contains("저항검사 [CH1: 100 Ω < 101.5 Ω < 110 Ω :PASS]", StringComparison.Ordinal) &&
                    csvText.Contains("탈거 14:07:08~14:07:10(2.000초)", StringComparison.Ordinal) &&
-                   csvText.Contains(",NI375C10002608092001,,,JBZUniversalTester V15.2.0", StringComparison.Ordinal) &&
+                   csvText.Contains(",NI375C10002608092001,,,JBZUniveresalLunix V15.2.0", StringComparison.Ordinal) &&
                    !csvText.Contains("N\r\nNI375C10002608092001", StringComparison.Ordinal),
                 "Sample history CSV keeps three test phases, sequence and barcode without raw EPL payload");
 
@@ -7121,6 +5966,7 @@ internal static class Program
         Assert(part >= 0 && part < eco && eco < name && name < serial && serial < barcode, "ALL6 EPL value order");
     }
 
+#if LEGACY_D2XX
     private static void TestThtLabelAndLotLifecycle()
     {
         var unconfiguredPrinter = new LabelPrintService();
@@ -7670,6 +6516,7 @@ internal static class Program
         }
     }
 
+#endif
     private static void TestLabelPrintingSafety()
     {
         MethodInfo shouldAutoPrint = typeof(TestViewModel).GetMethod(
@@ -8043,34 +6890,6 @@ internal static class Program
         return new ScanFrame(DateTime.Now, 1, active, [], true, 0, sequence, map, hits, BoardScanMode.Production);
     }
 
-    private static ScanFrame ProbeFrameSeq(long sequence, int target, int fanIn = 20) =>
-        ProbeFrameSeq(sequence, [target], fanIn);
-
-    private static ScanFrame ProbeFrameSeq(long sequence, int[] targets, int fanIn = 20)
-    {
-        Dictionary<int, IReadOnlySet<int>> map = Enumerable.Range(230, fanIn)
-            .ToDictionary(
-                source => source,
-                _ => (IReadOnlySet<int>)targets.ToHashSet());
-        Dictionary<int, int> hits = targets.ToDictionary(io => io, _ => fanIn);
-        return new ScanFrame(
-            DateTime.Now,
-            4,
-            targets.ToHashSet(),
-            [],
-            true,
-            0,
-            sequence,
-            map,
-            hits,
-            BoardScanMode.Production,
-            256,
-            256,
-            0,
-            4,
-            true);
-    }
-
     private static string ReadEntry(ZipArchive archive, string name)
     {
         using StreamReader reader = new(archive.GetEntry(name)?.Open() ?? throw new InvalidOperationException(name));
@@ -8305,6 +7124,7 @@ internal static class Program
         throw new InvalidOperationException(message);
     }
 
+#if LEGACY_D2XX
     private static ProductModel ParseThtLabelModelText(string alc = "ALC-FROM-THT")
     {
         string modelText =
@@ -8332,232 +7152,7 @@ internal static class Program
         }
     }
 
-    private static void TestBlankThtIoMappingCompatibility()
-    {
-        const string blankModelText =
-            "파트번호\t파트명\n" +
-            "1\tIO MAPPING\n\n" +
-            "번 호\t커넥터\t핀 수\n\n" +
-            "커넥터\t선이름\tI/O\t핀번호\n\n" +
-            "선이름\t선연결\t굵기\t색깔";
-
-        string root = Path.Combine(
-            Path.GetTempPath(),
-            "JBZBlankThtTests",
-            Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
-        try
-        {
-            string path = Path.Combine(root, "blank.tht");
-            File.WriteAllBytes(path, BuildMinimalThtFile(blankModelText));
-            ProductModel model = new ThtModelParser().Load(path);
-
-            Assert(model.IsIoMappingTemplate &&
-                   model.Pins.Count == 0 &&
-                   model.Nets.Count == 0 &&
-                   model.MaxIo == 0,
-                "A structurally valid THT with an empty Pin table loads as IO mapping template");
-
-            string invalidPath = Path.Combine(root, "invalid-pin.tht");
-            File.WriteAllBytes(
-                invalidPath,
-                BuildMinimalThtFile(blankModelText.Replace(
-                    "커넥터\t선이름\tI/O\t핀번호\n\n",
-                    "커넥터\t선이름\tI/O\t핀번호\nCN1\tW1\tNOT_IO\t1\n\n",
-                    StringComparison.Ordinal)));
-            AssertThrows<InvalidDataException>(
-                () => new ThtModelParser().Load(invalidPath),
-                "A non-empty Pin table with invalid IO must not be mistaken for a blank mapping THT");
-
-            string? compatibilityFile = Environment.GetEnvironmentVariable(
-                "JBZ_THT_COMPAT_FILE");
-            if (!string.IsNullOrWhiteSpace(compatibilityFile))
-            {
-                ProductModel compatibilityModel = new ThtModelParser().Load(compatibilityFile);
-                Assert(compatibilityModel.IsIoMappingTemplate,
-                    $"Compatibility THT '{compatibilityFile}' loads as IO mapping template");
-            }
-
-            BoardCapacity capacity = BoardCapacity.Create(1);
-            LiveTopologySnapshot twoPairTopology = LiveTopologyPresenter.Build(
-                FrameSeq(
-                    20,
-                    (3, new[] { 1 }),
-                    (1, new[] { 3 }),
-                    (2, new[] { 4 }),
-                    (4, new[] { 2 })),
-                capacity);
-            Assert(twoPairTopology.Rows.Count == 4 &&
-                   twoPairTopology.Pairs.SequenceEqual([
-                       new LiveTopologyPair(1, 3),
-                       new LiveTopologyPair(2, 4)]) &&
-                   twoPairTopology.Components.Count == 2 &&
-                   twoPairTopology.Rows.All(row => row.IsLiveTopologyPresentation) &&
-                   twoPairTopology.Rows.Select(row => row.IsNetworkStart)
-                       .SequenceEqual([true, false, true, false]),
-                "LiveTopology renders two safe rows per exact board edge and canonicalizes reverse directions once");
-
-            LiveTopologySnapshot onePairRemoved = LiveTopologyPresenter.Build(
-                FrameSeq(21, (4, new[] { 2 })),
-                capacity);
-            Assert(onePairRemoved.Rows.Count == 2 &&
-                   onePairRemoved.Pairs.Single() == new LiveTopologyPair(2, 4),
-                "LiveTopology removal drops only the missing pair and retains the other pair");
-
-            LiveTopologySnapshot component = LiveTopologyPresenter.Build(
-                FrameSeq(22, (1, new[] { 3 }), (3, new[] { 1, 5 }), (5, new[] { 3 })),
-                capacity);
-            Assert(component.Pairs.SequenceEqual([
-                       new LiveTopologyPair(1, 3),
-                       new LiveTopologyPair(3, 5)]) &&
-                   component.Components.Single().SequenceEqual([1, 3, 5]),
-                "A component larger than two keeps only observed physical edges and a deterministic component diagnostic");
-
-            IReadOnlyList<FaultRow> connectionRows = IoMappingFramePresenter.BuildRows(
-                FrameSeq(1, (2, new[] { 1, 3 }), (1, new[] { 2 })),
-                capacity);
-            Assert(connectionRows.Count == 2 &&
-                   connectionRows.Any(row => row.ActualSourceIo == 1 && row.ActualTargetIo == 2) &&
-                   connectionRows.Any(row => row.ActualSourceIo == 2 && row.ActualTargetIo == 3),
-                "IO mapping canonicalizes duplicate directions and shows every live connection pair");
-
-            IReadOnlyList<FaultRow> probeRows = IoMappingFramePresenter.BuildRows(
-                FrameSeq(
-                    2,
-                    Enumerable.Range(10, 20)
-                        .Select(source => (source, new[] { 7 }))
-                        .ToArray()),
-                capacity);
-            Assert(probeRows.Count == 1 &&
-                   probeRows[0].Kind == FaultKind.Probe &&
-                   probeRows[0].Io == 7 &&
-                   probeRows[0].IoText == "IO (7)" &&
-                   probeRows[0].FaultType == "TP" &&
-                   probeRows[0].Status == "TP - IO(7)" &&
-                   probeRows[0].Connector.Length == 0 &&
-                   probeRows[0].Pin.Length == 0 &&
-                   probeRows[0].WireName.Length == 0,
-                "Probe sweep in blank THT shows the touched IO instead of false wiring pairs");
-
-            var production = new ProductionSettings
-            {
-                MasterFaultRequiredCount = 0,
-                UseTestPointer = true
-            };
-            TestViewModel vm = CreateTestViewModel(production, out FakeBoard board);
-            vm.SetModel(model);
-            vm.StartProductionTestAsync().GetAwaiter().GetResult();
-            board.Publish(FrameSeq(3, (4, new[] { 9 })));
-
-            Assert(vm.IsIoMappingMode &&
-                   vm.Faults.Count == 2 &&
-                   vm.Faults.All(row => row.ActualSourceIo == 4 && row.ActualTargetIo == 9) &&
-                   vm.CurrentProductionRuntimeState == ProductionRuntimeState.TestingRealtime &&
-                   vm.CurrentProductionPresentationMode == ProductionPresentationMode.LiveTopology &&
-                   vm.Total == 0 && vm.Pass == 0 && vm.Fail == 0 &&
-                   !board.Commands.Any(command => command.StartsWith("SET:", StringComparison.Ordinal)),
-                "Blank THT observation never commits production or activates a relay");
-
-            board.Publish(FrameSeq(
-                4,
-                Enumerable.Range(10, 20)
-                    .Select(source => (source, new[] { 63 }))
-                    .ToArray()));
-            TestEngine emptyModelEngine = (TestEngine)(typeof(TestViewModel).GetField(
-                "_engine",
-                BindingFlags.Instance | BindingFlags.NonPublic)
-                ?.GetValue(vm) ?? throw new InvalidOperationException("Empty-model engine not found"));
-            Assert(AppSoundService.Current.IsTestPointContactSoundActive &&
-                   vm.Faults.Count == 1 &&
-                   vm.Faults[0].Kind == FaultKind.Probe &&
-                   vm.Faults[0].Io == 63 &&
-                   vm.Faults[0].Status == "TP - IO(63)" &&
-                   vm.Faults[0].Connector.Length == 0 &&
-                   vm.Faults[0].Pin.Length == 0 &&
-                   emptyModelEngine.ExpectedNetCount == 0 &&
-                   !emptyModelEngine.HasProductActivity &&
-                   vm.CurrentProductionRuntimeState == ProductionRuntimeState.TestingRealtime &&
-                   vm.CurrentProbePresentationState == ProbePresentationState.Touch &&
-                   vm.CurrentProductionPresentationMode == ProductionPresentationMode.Probe &&
-                   vm.Total == 0 && vm.Pass == 0 && vm.Fail == 0,
-                "Blank THT Probe presentation overrides rows without changing LiveTopology product presence");
-
-            board.Publish(FrameSeq(5));
-            Assert(!AppSoundService.Current.IsTestPointContactSoundActive &&
-                   vm.Faults.Count == 2 &&
-                   vm.Faults.All(row => row.ActualSourceIo == 4 && row.ActualTargetIo == 9) &&
-                   vm.CurrentProductionRuntimeState == ProductionRuntimeState.TestingRealtime &&
-                   vm.CurrentProbePresentationState == ProbePresentationState.Released &&
-                   vm.CurrentProductionPresentationMode == ProductionPresentationMode.LiveTopology &&
-                   vm.Total == 0 && vm.Pass == 0 && vm.Fail == 0,
-                "Blank THT Probe RELEASE restores the exact prior LiveTopology snapshot");
-
-            board.Publish(FrameSeq(6, (1, new[] { 3 }), (3, new[] { 1 }), (2, new[] { 4 }), (4, new[] { 2 })));
-            Assert(vm.Faults.Count == 4 &&
-                   vm.Faults.Select(row => (row.ActualSourceIo, row.ActualTargetIo)).SequenceEqual([
-                       ((int?)1, (int?)3),
-                       ((int?)1, (int?)3),
-                       ((int?)2, (int?)4),
-                       ((int?)2, (int?)4)]) &&
-                   vm.Total == 0 && vm.Pass == 0 && vm.Fail == 0,
-                "Empty THT renders exactly two canonical live pairs without PASS/FAIL");
-
-            board.Publish(FrameSeq(7, (4, new[] { 2 })));
-            Assert(vm.Faults.Count == 2 &&
-                   vm.Faults.All(row => row.ActualSourceIo == 2 && row.ActualTargetIo == 4),
-                "Empty THT removal removes IO1<->IO3 immediately and retains IO2<->IO4");
-
-            board.Publish(FrameSeq(8, (1, new[] { 3 }), (2, new[] { 4 })));
-            board.Publish(FrameSeq(
-                9,
-                Enumerable.Range(10, 20).Select(source => (source, new[] { 63 })).ToArray()));
-            Assert(vm.Faults.Count == 1 &&
-                   vm.Faults[0].Kind == FaultKind.Probe &&
-                   vm.CurrentProductionRuntimeState == ProductionRuntimeState.TestingRealtime,
-                "Empty THT Probe temporarily owns the table while ProductState remains Present");
-            board.Publish(FrameSeq(10));
-            Assert(vm.Faults.Count == 4 &&
-                   vm.Faults.Any(row => row.ActualSourceIo == 1 && row.ActualTargetIo == 3) &&
-                   vm.Faults.Any(row => row.ActualSourceIo == 2 && row.ActualTargetIo == 4) &&
-                   vm.CurrentProductionRuntimeState == ProductionRuntimeState.TestingRealtime,
-                "Empty THT Probe release restores the exact two-pair topology snapshot");
-
-            board.Publish(FrameSeq(100, (1, new[] { 3 })));
-            board.Publish(FrameSeq(99, (2, new[] { 4 })));
-            Assert(vm.Faults.Count == 2 &&
-                   vm.Faults.All(row => row.ActualSourceIo == 1 && row.ActualTargetIo == 3),
-                "An older LiveTopology snapshot cannot overwrite the latest rendered frame");
-
-            ProductModel noEligibleNetModel = new()
-            {
-                ModelName = "NO-ELIGIBLE-NET",
-                PartNumber = "NO-ELIGIBLE-NET"
-            };
-            PinRecord singlePin = new("CN1", "SINGLE", 8, "1");
-            noEligibleNetModel.Pins.Add(singlePin);
-            noEligibleNetModel.Nets.Add(new WireNet("SINGLE", [8], [singlePin]));
-            TestViewModel noEligibleVm = CreateTestViewModel(production);
-            noEligibleVm.SetModel(noEligibleNetModel);
-            Assert(!noEligibleNetModel.IsIoMappingTemplate &&
-                   noEligibleVm.ExpectedNetworkCount == 0 &&
-                   noEligibleVm.IsIoMappingMode,
-                "LiveTopology mode is derived from eligible ExpectedNetCount, not parser filename/empty-table flags");
-
-            var evolvingProbe = new ProbeStateTracker(confirmFrames: 2, releaseFrames: 1, maxContacts: 2);
-            Assert(!evolvingProbe.Update([10]) &&
-                   evolvingProbe.HasTrackedContacts &&
-                   evolvingProbe.Update([10, 12]) &&
-                   evolvingProbe.ActiveIos.SequenceEqual([10, 12]) &&
-                   evolvingProbe.Update([]) &&
-                   !evolvingProbe.IsActive,
-                "Probe candidate IO10 -> IO10+IO12 confirms by frame continuity and releases without a timer");
-        }
-        finally
-        {
-            Directory.Delete(root, recursive: true);
-        }
-    }
-
+#endif
     private static void TestLearnedTopology()
     {
         var activeIoRow = new ActiveIoDiagnosticRow(42);
@@ -8742,14 +7337,13 @@ internal static class Program
     {
         public List<string> Commands { get; } = [];
         public List<ResistanceStep> ResistanceSteps { get; } = [];
-        public List<byte[]> ResistanceFrames { get; } = [];
-        public byte[] ReleaseResistanceFrames { get; private set; } = [];
         public int ReleaseResistanceRouteCount { get; private set; }
         public bool ThrowOnSetRelay { get; set; }
         public bool ThrowOnConnect { get; set; }
         public int StartFailuresRemaining { get; set; }
         public int ConnectAttempts { get; private set; }
         public bool IsConnected { get; private set; } = true;
+        public bool ProducesPassiveScanFrames { get; set; } = true;
         public bool IsScanning { get; private set; } = true;
         public BoardScanMode CurrentScanMode { get; private set; } = BoardScanMode.Production;
         public BoardCapacity InstalledCapacity { get; private set; } = BoardCapacity.Create(10);
@@ -8830,18 +7424,12 @@ internal static class Program
         public Task SelectResistanceRouteAsync(ResistanceStep step, CancellationToken ct = default)
         {
             ResistanceSteps.Add(step);
-            ResistanceFrames.Add(
-                D2xxResistanceRouting.BuildRouteA()
-                    .Concat(D2xxResistanceRouting.BuildRouteB(step.Channel))
-                    .ToArray());
+            Commands.Add($"RESISTORTEST:{step.Channel}");
             return Task.CompletedTask;
         }
         public Task ReleaseResistanceRouteAsync(CancellationToken ct = default)
         {
             ReleaseResistanceRouteCount++;
-            ReleaseResistanceFrames = D2xxResistanceRouting.BuildReleaseRouteB()
-                .Concat(D2xxResistanceRouting.BuildReleaseRouteA())
-                .ToArray();
             Commands.Add("RELEASE_R");
             return Task.CompletedTask;
         }

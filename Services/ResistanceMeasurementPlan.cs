@@ -1,6 +1,6 @@
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 /// <summary>
 /// Canonical R1-R10 production measurement plan. Slot order, enabled/channel
@@ -11,6 +11,8 @@ public static class ResistanceMeasurementPlan
 {
     public const int SlotCount = 10;
     public const int DisabledChannel = 0;
+    public const int MinChannel = 1;
+    public const int MaxChannel = 10;
 
     public static ResistanceChannelSetting[] Normalize(
         IEnumerable<ResistanceChannelSetting?>? configured,
@@ -73,7 +75,7 @@ public static class ResistanceMeasurementPlan
             int channel = Math.Clamp(
                 selected.Channel,
                 DisabledChannel,
-                D2xxResistanceRouting.MaxChannel);
+                MaxChannel);
             double minOhm = NormalizeMinimum(selected.MinOhm);
             double maxOhm = NormalizeMaximum(selected.MaxOhm, minOhm);
 
@@ -105,8 +107,8 @@ public static class ResistanceMeasurementPlan
 
         return Normalize(settings.ResistanceChannels)
             .Where(slot => slot.Enabled &&
-                slot.Channel is >= D2xxResistanceRouting.MinChannel and
-                    <= D2xxResistanceRouting.MaxChannel)
+                slot.Channel is >= MinChannel and
+                    <= MaxChannel)
             .Select(slot => new ResistanceStep(
                 slot.Name,
                 slot.Channel,
@@ -127,7 +129,7 @@ public static class ResistanceMeasurementPlan
         int selectedChannel)
     {
         ArgumentNullException.ThrowIfNull(settings);
-        if (selectedChannel is < DisabledChannel or > D2xxResistanceRouting.MaxChannel)
+        if (selectedChannel is < DisabledChannel or > MaxChannel)
             throw new ArgumentOutOfRangeException(nameof(selectedChannel));
 
         if (selectedChannel == DisabledChannel)
@@ -166,7 +168,7 @@ public static class ResistanceMeasurementPlan
     }
 
     private static bool IsValidWithoutNormalization(ResistanceChannelSetting item) =>
-        item.Channel is >= DisabledChannel and <= D2xxResistanceRouting.MaxChannel &&
+        item.Channel is >= DisabledChannel and <= MaxChannel &&
         double.IsFinite(item.MinOhm) &&
         double.IsFinite(item.MaxOhm) &&
         item.MinOhm >= 0 &&

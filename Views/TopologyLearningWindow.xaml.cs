@@ -4,12 +4,12 @@ using System.IO;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Threading;
-using JBZUniversalTester.Models;
-using JBZUniversalTester.Services;
-using JBZUniversalTester.ViewModels;
+using JBZUniveresalLunix.Models;
+using JBZUniveresalLunix.Services;
+using JBZUniveresalLunix.ViewModels;
 using Microsoft.Win32;
 
-namespace JBZUniversalTester.Views;
+namespace JBZUniveresalLunix.Views;
 
 public partial class TopologyLearningWindow : Window
 {

@@ -1,7 +1,7 @@
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 using System.IO;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public static class StartupBootstrapService
 {

@@ -1,4 +1,4 @@
-﻿param(
+param(
     [ValidateSet("win-x86", "win-x64")]
     [string]$Runtime = "win-x86",
 
@@ -36,7 +36,7 @@ function Find-Project {
 
     $preferred = @(
         $projects | Where-Object {
-            $_.Name -ieq "JBZUniversalTester.csproj"
+            $_.Name -ieq "JBZUniveresalLunix.csproj"
         }
     )
 
@@ -83,7 +83,7 @@ try {
 
     # Runtime V16 uses one stable executable name. Version remains in file
     # metadata and in the versioned publish directory.
-    $appName = "JBZUniversalTester"
+    $appName = "JBZUniveresalLunix"
     $publishRoot = Join-Path $projectDir $OutputFolder
     $publishDir = Join-Path $publishRoot ("V" + $productVersion)
     $logPath = Join-Path $projectDir ("publish_V" + $productVersion + ".log")

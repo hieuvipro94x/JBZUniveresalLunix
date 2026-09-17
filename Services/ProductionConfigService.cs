@@ -1,10 +1,10 @@
-﻿using System.IO;
+using System.IO;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public static class ProductionConfigService
 {
@@ -166,6 +166,7 @@ public static class ProductionConfigService
             $"[ShowConnector]{Bool(settings.ShowConnector)}",
 
             $"[LastThtPath]{settings.LastThtPath}",
+            $"[BoardPortName]{settings.BoardPortName}",
             $"[LastThtPartKey]{settings.LastThtPartKey}",
             $"[AutoPrintLabelOnPass]{Bool(settings.AutoPrintLabelOnPass)}",
             $"[HistoryDirectory]{settings.HistoryDirectory}",
@@ -585,6 +586,7 @@ public static class ProductionConfigService
         settings.ShowConnector = B(map, "ShowConnector", settings.ShowConnector);
 
         settings.LastThtPath = S(map, "LastThtPath", settings.LastThtPath);
+        settings.BoardPortName = S(map, "BoardPortName", settings.BoardPortName).Trim();
         settings.LastThtPartKey = S(map, "LastThtPartKey", settings.LastThtPartKey);
         settings.AutoPrintLabelOnPass = B(map, "AutoPrintLabelOnPass", settings.AutoPrintLabelOnPass);
         settings.HistoryDirectory = S(map, "HistoryDirectory", settings.HistoryDirectory);
@@ -680,8 +682,10 @@ public static class ProductionConfigService
 
     private static void Normalize(ProductionSettings settings)
     {
-        if (!Enum.IsDefined(typeof(BoardMode), settings.BoardMode))
-            settings.BoardMode = BoardMode.Auto;
+        // V16.0.352+: production runtime supports only Universal Tester New UART.
+        // Old Auto/D2xx values remain parseable for config migration but never
+        // select a legacy backend.
+        settings.BoardMode = BoardMode.JbzSerial;
 
         settings.Label ??= new LabelSettings();
         settings.ResistanceChannels ??= [];

@@ -5,7 +5,7 @@ using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
 
-namespace JBZUniversalTester.Views;
+namespace JBZUniveresalLunix.Views;
 
 /// <summary>
 /// Keeps one owner-bound native OpenFileDialog at a fixed size after layout.

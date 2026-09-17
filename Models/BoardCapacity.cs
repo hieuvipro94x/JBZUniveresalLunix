@@ -1,4 +1,4 @@
-namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 /// <summary>
 /// Nguồn sự thật duy nhất cho phạm vi card/I/O của bo JBZ.

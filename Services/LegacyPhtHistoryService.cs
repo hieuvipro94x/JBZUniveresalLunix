@@ -1,9 +1,9 @@
 using System.Globalization;
 using System.IO;
 using System.Text;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 /// <summary>
 /// Appends records compatible with the original PHT20 history files. PASS uses

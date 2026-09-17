@@ -2,9 +2,9 @@ using System;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
-using JBZUniversalTester.Services;
+using JBZUniveresalLunix.Services;
 
-namespace JBZUniversalTester.Core;
+namespace JBZUniveresalLunix.Core;
 
 public sealed class AsyncRelayCommand : ICommand
 {

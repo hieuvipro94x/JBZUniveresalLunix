@@ -1,7 +1,7 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Text.Json;
 
-namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 public sealed record FaultDisplayLine(string Label, string Value);
 

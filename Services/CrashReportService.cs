@@ -1,8 +1,8 @@
 using System.IO;
 using System.Text;
-using JBZUniversalTester.Versioning;
+using JBZUniveresalLunix.Versioning;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 /// <summary>
 /// Minimal crash-safe writer. The Crash directory and RPT are created lazily,

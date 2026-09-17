@@ -1,0 +1,141 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="Version.props" />
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Canonical portable runtime keeps one stable executable name. -->
+    <RootNamespace>JBZUniveresalLunix</RootNamespace>
+    <AssemblyName>JBZUniveresalLunix</AssemblyName>
+
+    <!-- Phần mềm 32-bit -->
+    <PlatformTarget>x86</PlatformTarget>
+    <RuntimeIdentifier>win-x86</RuntimeIdentifier>
+
+    <ApplicationIcon>logo.ico</ApplicationIcon>
+
+    <!-- Xuất bản thành một EXE -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <UseAppHost>true</UseAppHost>
+
+    <!-- Máy đích phải có .NET 8 Desktop Runtime x86 -->
+    <SelfContained>false</SelfContained>
+    <PublishSelfContained>false</PublishSelfContained>
+
+    <!-- Nhúng thư viện native vào bundle -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+
+    <!-- Framework-dependent không hỗ trợ nén bundle -->
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
+
+    <!-- Giảm dung lượng -->
+    <!-- Giảm JIT/cold-start trên máy sản xuất CPU yếu; đổi lại file publish lớn hơn. -->
+    <PublishReadyToRun>true</PublishReadyToRun>
+
+    <!-- Không trim ứng dụng WPF -->
+    <PublishTrimmed>false</PublishTrimmed>
+
+    <!-- Không tạo PDB trong bản Release -->
+    <DebugType Condition="'$(Configuration)' == 'Release'">None</DebugType>
+    <DebugSymbols Condition="'$(Configuration)' == 'Release'">false</DebugSymbols>
+
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+
+    <Platforms>AnyCPU;x86</Platforms>
+  </PropertyGroup>
+
+  <!-- Keep WPF type resolution unchanged; WinForms is used only for the classic file dialog. -->
+  <ItemGroup>
+    <Using Remove="System.Drawing" />
+    <Using Remove="System.Windows.Forms" />
+  </ItemGroup>
+
+  <!-- V12.9: chan build neu Version.props bi cap nhat lech. -->
+  <Target Name="ValidateVersionConfiguration" BeforeTargets="BeforeBuild">
+    <PropertyGroup>
+      <ExpectedVersionFileTag>$([System.String]::Copy('$(Version)').Replace('.', '_'))</ExpectedVersionFileTag>
+    </PropertyGroup>
+    <Error Condition="'$(Version)' == ''" Text="Version.props: Version khong duoc de trong." />
+    <Error Condition="'$(AssemblyVersion)' == ''" Text="Version.props: AssemblyVersion khong duoc de trong." />
+    <Error Condition="'$(FileVersion)' == ''" Text="Version.props: FileVersion khong duoc de trong." />
+    <Error Condition="'$(AssemblyVersion)' != '$(Version).0'" Text="Version.props khong dong bo: AssemblyVersion=$(AssemblyVersion), can la $(Version).0." />
+    <Error Condition="'$(FileVersion)' != '$(Version).0'" Text="Version.props khong dong bo: FileVersion=$(FileVersion), can la $(Version).0." />
+    <Error Condition="'$(InformationalVersion)' != '$(Version)'" Text="Version.props khong dong bo: InformationalVersion=$(InformationalVersion), can la $(Version)." />
+    <Error Condition="'$(VersionFileTag)' != '$(ExpectedVersionFileTag)'" Text="Version.props khong dong bo: VersionFileTag=$(VersionFileTag), can la $(ExpectedVersionFileTag)." />
+  </Target>
+
+  <!-- Icon -->
+  <ItemGroup>
+    <None Remove="Assets\reset_probe_cycle.png" />
+    <None Remove="logo.ico" />
+    <Resource Include="Assets\reset_probe_cycle.png" />
+    <Resource Include="logo.ico" />
+  </ItemGroup>
+
+  <!-- SQLite -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.12" />
+    <PackageReference Include="System.IO.Ports" Version="10.0.10" />
+  </ItemGroup>
+
+  <!-- Self-tests là project console riêng, không được compile vào WPF app. -->
+  <ItemGroup>
+    <Compile Remove="Tests\**\*.cs" />
+    <Compile Remove="HardwareVerification\**\*.cs" />
+  </ItemGroup>
+
+  <!-- Built-in label templates stay inside the single EXE. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Labels\TEM_TO.txt">
+      <LogicalName>JBZUniveresalLunix.Labels.TEM_TO.txt</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Labels\TEM_BE.txt">
+      <LogicalName>JBZUniveresalLunix.Labels.TEM_BE.txt</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Labels\TEM_BE_QR.txt">
+      <LogicalName>JBZUniveresalLunix.Labels.TEM_BE_QR.txt</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <!-- Nhúng âm thanh vào EXE -->
+  <ItemGroup>
+    <None Remove="Assets\Sounds\CLICK.wav" />
+    <None Remove="Assets\Sounds\COMPUTER.wav" />
+    <None Remove="Assets\Sounds\DINGDONG.wav" />
+    <None Remove="Assets\Sounds\START.wav" />
+    <None Remove="Assets\Sounds\TESTPOINT.wav" />
+    <None Remove="Assets\Sounds\DRIP.wav" />
+
+    <EmbeddedResource Include="Assets\Sounds\CLICK.wav">
+      <LogicalName>JBZUniveresalLunix.Assets.Sounds.CLICK.wav</LogicalName>
+    </EmbeddedResource>
+
+    <EmbeddedResource Include="Assets\Sounds\COMPUTER.wav">
+      <LogicalName>JBZUniveresalLunix.Assets.Sounds.COMPUTER.wav</LogicalName>
+    </EmbeddedResource>
+
+    <EmbeddedResource Include="Assets\Sounds\DINGDONG.wav">
+      <LogicalName>JBZUniveresalLunix.Assets.Sounds.DINGDONG.wav</LogicalName>
+    </EmbeddedResource>
+
+    <EmbeddedResource Include="Assets\Sounds\START.wav">
+      <LogicalName>JBZUniveresalLunix.Assets.Sounds.START.wav</LogicalName>
+    </EmbeddedResource>
+
+    <EmbeddedResource Include="Assets\Sounds\TESTPOINT.wav">
+      <LogicalName>JBZUniveresalLunix.Assets.Sounds.TESTPOINT.wav</LogicalName>
+    </EmbeddedResource>
+
+    <EmbeddedResource Include="Assets\Sounds\DRIP.wav">
+      <LogicalName>JBZUniveresalLunix.Assets.Sounds.DRIP.wav</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>

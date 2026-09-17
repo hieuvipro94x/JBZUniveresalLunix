@@ -1,4 +1,4 @@
-﻿namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 public sealed class TestHistoryRecord
 {
@@ -346,27 +346,27 @@ public sealed record LabelPrintRequest(
             history.CycleId);
 
         string templateType =
-            JBZUniversalTester.Services.LabelProfileResolver.NormalizeTemplateType(settings.TemplateType);
+            JBZUniveresalLunix.Services.LabelProfileResolver.NormalizeTemplateType(settings.TemplateType);
         bool isSmallLabel = templateType == LabelSettings.SmallTemplate;
         bool isSmallQrLabel = templateType == LabelSettings.SmallQrTemplate;
-        LabelIdentity identity = JBZUniversalTester.Services.EplLabelService.BuildIdentity(
+        LabelIdentity identity = JBZUniveresalLunix.Services.EplLabelService.BuildIdentity(
             data,
             includeAlcLotSuffix: !isSmallLabel && !isSmallQrLabel);
         data = data with { Barcode = identity.BarcodeValue, BarcodePrint = identity.BarcodeValue };
         IReadOnlyDictionary<string, string> variables =
-            JBZUniversalTester.Services.LabelVariableResolver.Resolve(model, data, settings);
+            JBZUniveresalLunix.Services.LabelVariableResolver.Resolve(model, data, settings);
 
         if (isSmallLabel)
         {
             string barcode = variables["SMALL_LABEL_BARCODE"];
             data = data with { Barcode = barcode, BarcodePrint = barcode };
-            variables = JBZUniversalTester.Services.LabelVariableResolver.Resolve(model, data, settings);
+            variables = JBZUniveresalLunix.Services.LabelVariableResolver.Resolve(model, data, settings);
         }
         else if (isSmallQrLabel)
         {
             string barcode = variables["SMALL_QR_BARCODE"];
             data = data with { Barcode = barcode, BarcodePrint = barcode };
-            variables = JBZUniversalTester.Services.LabelVariableResolver.Resolve(model, data, settings);
+            variables = JBZUniveresalLunix.Services.LabelVariableResolver.Resolve(model, data, settings);
         }
         else if (!string.IsNullOrWhiteSpace(model.LabelTemplate.BarcodeTemplate))
         {
@@ -384,18 +384,18 @@ public sealed record LabelPrintRequest(
                 barcodeVariables["SEQUENCE"] = barcodeLot;
             }
 
-            string barcode = JBZUniversalTester.Services.LabelTemplateRenderer.Render(
+            string barcode = JBZUniveresalLunix.Services.LabelTemplateRenderer.Render(
                 model.LabelTemplate.BarcodeTemplate,
                 barcodeVariables,
                 model.PartNumber,
                 model.LabelTemplate.ProfileId);
             data = data with { Barcode = barcode, BarcodePrint = barcode };
-            variables = JBZUniversalTester.Services.LabelVariableResolver.Resolve(model, data, settings);
+            variables = JBZUniveresalLunix.Services.LabelVariableResolver.Resolve(model, data, settings);
         }
 
-        LabelProfile profile = JBZUniversalTester.Services.LabelProfileResolver.Resolve(model, settings);
-        string template = JBZUniversalTester.Services.LabelTemplateProvider.Load(profile, model.LabelTemplate.RawTemplate);
-        string payload = JBZUniversalTester.Services.LabelTemplateRenderer.Render(
+        LabelProfile profile = JBZUniveresalLunix.Services.LabelProfileResolver.Resolve(model, settings);
+        string template = JBZUniveresalLunix.Services.LabelTemplateProvider.Load(profile, model.LabelTemplate.RawTemplate);
+        string payload = JBZUniveresalLunix.Services.LabelTemplateRenderer.Render(
             profile, template, variables, model.PartNumber);
 
         // Máy in EPL đời cũ có thể nhận byte (đèn COM nháy) nhưng vẫn giữ job
@@ -405,22 +405,22 @@ public sealed record LabelPrintRequest(
         // Chỉ chuẩn hóa profile QR đã xác minh bị trộn CRLF/LF; không thay đổi
         // payload của TEM_BE, TEM_TO hoặc template tùy chỉnh khác.
         if (isSmallQrLabel)
-            payload = JBZUniversalTester.Services.LabelTemplateRenderer.NormalizeEplJob(payload);
+            payload = JBZUniveresalLunix.Services.LabelTemplateRenderer.NormalizeEplJob(payload);
 
         if (isSmallLabel)
         {
-            JBZUniversalTester.Services.AsyncFileLogService.Current.Application(
+            JBZUniveresalLunix.Services.AsyncFileLogService.Current.Application(
                 $"[LABEL] Type={LabelSettings.SmallTemplate} PartNumber={data.PartNumber} " +
                 $"YearCode={variables["YEAR_CODE"]} MonthCode={variables["MONTH_CODE"]} " +
                 $"DayCode={variables["DAY_CODE"]} Lot={variables["LOT_NO"]} Barcode={data.Barcode}",
-                JBZUniversalTester.Services.AppLogLevel.Diagnostic);
+                JBZUniveresalLunix.Services.AppLogLevel.Diagnostic);
         }
         else if (isSmallQrLabel)
         {
-            JBZUniversalTester.Services.AsyncFileLogService.Current.Application(
+            JBZUniveresalLunix.Services.AsyncFileLogService.Current.Application(
                 $"[LABEL] Type={LabelSettings.SmallQrTemplate} PartNumber={data.PartNumber} " +
                 $"Date={variables["DATE_YYMMDD"]} Lot={variables["LOT_NO"]} QR={data.Barcode}",
-                JBZUniversalTester.Services.AppLogLevel.Diagnostic);
+                JBZUniveresalLunix.Services.AppLogLevel.Diagnostic);
         }
 
         return new LabelPrintRequest(

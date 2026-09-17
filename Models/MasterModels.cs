@@ -1,4 +1,4 @@
-﻿namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 /// <summary>
 /// Chuỗi xác nhận master hoàn toàn tự động. Production chỉ được mở khi state=Completed.

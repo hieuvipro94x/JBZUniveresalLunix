@@ -1,8 +1,8 @@
 using System.IO;
 using System.Text.RegularExpressions;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public static partial class LabelTemplateRenderer
 {

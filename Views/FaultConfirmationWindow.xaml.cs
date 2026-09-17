@@ -1,7 +1,7 @@
-﻿using System.Windows;
-using JBZUniversalTester.Models;
+using System.Windows;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Views;
+namespace JBZUniveresalLunix.Views;
 
 public partial class FaultConfirmationWindow : Window
 {
@@ -255,7 +255,7 @@ public partial class FaultConfirmationWindow : Window
                 return;
             }
 
-            if (!JBZUniversalTester.Services.AdminAuthenticationService.Verify(
+            if (!JBZUniveresalLunix.Services.AdminAuthenticationService.Verify(
                     _requiredDiscardPassword,
                     DiscardPasswordBox.Password))
             {

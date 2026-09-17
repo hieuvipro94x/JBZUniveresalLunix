@@ -1,8 +1,8 @@
 using System.IO;
 using System.Security.Cryptography;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public static class ModelFileIdentityService
 {

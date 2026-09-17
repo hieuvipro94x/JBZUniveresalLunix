@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 chcp 65001 >nul
-title JBZUniversalTester - Tiep tuc phien lam viec
+title JBZUniveresalLunix - Tiep tuc phien lam viec
 
 set "ROOT=%~dp0"
 pushd "%ROOT%" >nul 2>&1
@@ -13,7 +13,7 @@ if errorlevel 1 (
 
 cls
 echo ============================================================
-echo JBZUniversalTester - BAN GIAO PHIEN LAM VIEC 2026-08-28
+echo JBZUniveresalLunix - BAN GIAO PHIEN LAM VIEC 2026-08-28
 echo ============================================================
 echo.
 echo PHIEN BAN BAN GIAO: V16.0.117
@@ -35,7 +35,7 @@ echo - CSV/XLSX xuat toan bo du lieu theo bo loc, khong bi gioi han
 echo   boi 20.000 dong DataGrid hoac gioi han 50.000 dong cu.
 echo - Thu tu xuat: Ma hang tang dan, Started tang dan, Id tang dan.
 echo - Cot Chuong trinh snapshot ten va version dang chay theo dang:
-echo   JBZUniversalTester Vx.x.x.
+echo   JBZUniveresalLunix Vx.x.x.
 echo - BUILD_ONE_FILE.cmd da doi sang co che version thong minh:
 echo   source doi va chua tang version thi tu tang mot lan;
 echo   version da tang thi giu nguyen; build lai thi khong tang.

@@ -101,3 +101,48 @@ Desktop.ini
 *.backup
 *.old
 *.orig
+
+# ============================================================
+# JBZUniveresalLunix - chỉ giữ source hiện hành
+# ============================================================
+
+# Các bản BUILD_ONE_FILE thử nghiệm / gói trung gian
+/BUILD_ONE_FILE_JBZUniveresalLunix_V*.cmd
+/BUILD_ONE_FILE_JBZUniversalTester_V*.cmd
+/BUILD_ONE_FILE_TWO_PROJECTS*.zip
+
+# Tài liệu, trace và dữ liệu phân tích chỉ dùng trong quá trình chuyển đổi
+/docs/
+/JBZ_Windows/
+/JBZ_Windows*.zip
+/Trace phan mem FirmwareDowloader*.gz
+/AUDIT_REPORT.md
+/AUTO_START_KEYSIGHT_NOTES.txt
+/CODEX_HANDOFF_*.md
+/LOGIC_FIX_NOTES.txt
+/PROTOCOL_FIX_NOTES.txt
+/V15_CHANGELOG.txt
+/V15_1_CHANGELOG.txt
+/V16_CHANGELOG.txt
+/SAVE_CODEX_CHECKPOINT*.ps1
+/TestViewModel_LeakRealtime_SAFE.diff
+/sample.d2xx.jbzproduct.json
+
+# Source D2XX / transport cũ - không đưa trở lại repo UART
+/Models/ProductBundle.cs
+/Services/BoardAddressMapper.cs
+/Services/BoardIoDecoder.cs
+/Services/D2xxBoardTransport.cs
+/Services/D2xxResistanceRouting.cs
+/Services/IoMappingFramePresenter.cs
+/Services/ManualProbeSession.cs
+/Services/ProbeContactClassifier.cs
+/Services/ProbeStateTracker.cs
+/Services/ThtModelParser.cs
+/Services/UnifiedBoardTransport.cs
+
+# Tên project cũ - repo mới chỉ dùng JBZUniveresalLunix
+/JBZUniversalTester.csproj
+/JBZUniversalTester.slnx
+/HardwareVerification/JBZUniversalTester.HardwareVerification.csproj
+/Tests/JBZUniversalTester.SelfTests.csproj

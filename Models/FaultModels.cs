@@ -1,6 +1,6 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 
-namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 public enum ProductFaultType
 {

@@ -1,3 +1,0 @@
-type	name	lang	rva	size	file
-RT_VERSION	1	1033	0x76A0A0	744	resources/RT_VERSION_1_1033.bin
-RT_MANIFEST	2	1033	0x76A388	346	resources/RT_MANIFEST_2_1033.bin

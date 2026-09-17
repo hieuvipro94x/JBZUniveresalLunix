@@ -3,7 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
-namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 public sealed record PartIdentitySnapshot(
     string PartKey,

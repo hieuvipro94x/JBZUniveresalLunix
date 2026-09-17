@@ -3,7 +3,7 @@ using System.Globalization;
 using System.Windows;
 using System.Windows.Data;
 
-namespace JBZUniversalTester.Converters;
+namespace JBZUniveresalLunix.Converters;
 
 public sealed class IntEqualsToVisibilityConverter : IValueConverter
 {

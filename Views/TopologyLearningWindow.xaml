@@ -1,4 +1,4 @@
-<Window x:Class="JBZUniversalTester.Views.TopologyLearningWindow"
+<Window x:Class="JBZUniveresalLunix.Views.TopologyLearningWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Quét IO / Học cấu hình" Width="1120" Height="720"

@@ -1,10 +1,10 @@
-﻿using System.Collections.ObjectModel;
+using System.Collections.ObjectModel;
 using System.IO;
-using JBZUniversalTester.Core;
-using JBZUniversalTester.Models;
-using JBZUniversalTester.Services;
+using JBZUniveresalLunix.Core;
+using JBZUniveresalLunix.Models;
+using JBZUniveresalLunix.Services;
 
-namespace JBZUniversalTester.ViewModels;
+namespace JBZUniveresalLunix.ViewModels;
 
 public sealed class ProductionSettingsViewModel : ObservableObject
 {
@@ -13,8 +13,8 @@ public sealed class ProductionSettingsViewModel : ObservableObject
     private readonly string _modelPath;
     private readonly string _lotProductKey;
     private bool _manualRuntimeActive;
-    private string _manualRelay1Status = "OFF";
-    private string _manualRelay2Status = "OFF";
+    private string _manualRelay0Status = "OFF";
+    private string _manualRelay4Status = "OFF";
     private string _manualStatus = "Manual OFF";
     private int _selectedManualResistanceChannel;
     private bool _manualResistanceRunning;
@@ -81,16 +81,19 @@ public sealed class ProductionSettingsViewModel : ObservableObject
         }
     }
 
-    public string ManualRelay1Status
+    public string ManualRelay0Status
     {
-        get => _manualRelay1Status;
-        private set => Set(ref _manualRelay1Status, value);
+        get => _manualRelay0Status;
+        private set => Set(ref _manualRelay0Status, value);
     }
 
-    public string ManualRelay2Status
+
+
+
+    public string ManualRelay4Status
     {
-        get => _manualRelay2Status;
-        private set => Set(ref _manualRelay2Status, value);
+        get => _manualRelay4Status;
+        private set => Set(ref _manualRelay4Status, value);
     }
 
     public string ManualStatus
@@ -105,7 +108,7 @@ public sealed class ProductionSettingsViewModel : ObservableObject
         set => Set(ref _selectedManualResistanceChannel, Math.Clamp(
             value,
             ResistanceMeasurementPlan.DisabledChannel,
-            D2xxResistanceRouting.MaxChannel));
+            ResistanceMeasurementPlan.MaxChannel));
     }
 
     public string ManualResistanceStatus
@@ -120,10 +123,8 @@ public sealed class ProductionSettingsViewModel : ObservableObject
         private set => Set(ref _manualWaterProofStatus, value);
     }
 
-    public AsyncRelayCommand ManualRelay1OnCommand { get; }
-    public AsyncRelayCommand ManualRelay1OffCommand { get; }
-    public AsyncRelayCommand ManualRelay2OnCommand { get; }
-    public AsyncRelayCommand ManualRelay2OffCommand { get; }
+    public AsyncRelayCommand ManualRelay0OnCommand { get; }
+    public AsyncRelayCommand ManualRelay4OnCommand { get; }
     public AsyncRelayCommand ManualResetCommand { get; }
     public AsyncRelayCommand ManualMeasureResistanceCommand { get; }
     public AsyncRelayCommand ManualWaterProofTestCommand { get; }
@@ -160,17 +161,11 @@ public sealed class ProductionSettingsViewModel : ObservableObject
         _masterFaultRequiredCount = ProductionConfigService.GetMasterFaultRequiredCountForPath(
             Settings, _modelPath);
 
-        ManualRelay1OnCommand = new AsyncRelayCommand(
-            async () => await RunManualRelayCommandAsync(1, true),
+        ManualRelay0OnCommand = new AsyncRelayCommand(
+            async () => await RunManualRelayCommandAsync(0, true),
             CanUseManualControls);
-        ManualRelay1OffCommand = new AsyncRelayCommand(
-            async () => await RunManualRelayCommandAsync(1, false),
-            CanUseManualControls);
-        ManualRelay2OnCommand = new AsyncRelayCommand(
-            async () => await RunManualRelayCommandAsync(2, true),
-            CanUseManualControls);
-        ManualRelay2OffCommand = new AsyncRelayCommand(
-            async () => await RunManualRelayCommandAsync(2, false),
+        ManualRelay4OnCommand = new AsyncRelayCommand(
+            async () => await RunManualRelayCommandAsync(4, true),
             CanUseManualControls);
         ManualResetCommand = new AsyncRelayCommand(
             RunManualResetAsync,
@@ -196,7 +191,7 @@ public sealed class ProductionSettingsViewModel : ObservableObject
 
         try
         {
-            return new ThtModelParser().Load(thtPath.Trim()).Connectors
+            return new JbzModelParser().Load(thtPath.Trim()).Connectors
                 .Select(connector => connector.ConnectorId)
                 .Where(connector => !string.IsNullOrWhiteSpace(connector))
                 .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -218,8 +213,7 @@ public sealed class ProductionSettingsViewModel : ObservableObject
             : "Manual OFF";
         if (!active)
         {
-            ManualRelay1Status = "OFF";
-            ManualRelay2Status = "OFF";
+            ApplyManualOutputStatus(-1);
         }
     }
 
@@ -394,28 +388,32 @@ public sealed class ProductionSettingsViewModel : ObservableObject
             return;
 
         ManualStatus = turnOn
-            ? $"Đang bật Relay {relay}..."
-            : $"Đang tắt Relay {relay}...";
+            ? $"Đang bật OUTPUT {relay}..."
+            : $"Đang tắt {(relay == 0 ? "RELAY 1 / OUT0" : "RELAY 5 / OUT4")}...";
 
         try
         {
             int activeRelay = await _test.SetManualRelayAsync(relay, turnOn);
             ManualRuntimeActive = _test.IsManualModeActive;
-            ManualRelay1Status = activeRelay == 1 ? "ON" : "OFF";
-            ManualRelay2Status = activeRelay == 2 ? "ON" : "OFF";
-            ManualStatus = activeRelay == 0
-                ? "MANUAL - tất cả relay OFF"
-                : $"MANUAL - Relay {activeRelay} ON";
+            ApplyManualOutputStatus(activeRelay);
+            ManualStatus = activeRelay < 0
+                ? "MANUAL - cả 2 relay OFF"
+                : $"MANUAL - OUTPUT {activeRelay} ON";
             RefreshManualCommands();
         }
         catch
         {
-            ManualRelay1Status = "OFF";
-            ManualRelay2Status = "OFF";
+            ApplyManualOutputStatus(-1);
             ManualStatus = "MANUAL FAULT - kiểm tra DeviceFault";
             RefreshManualCommands();
             throw;
         }
+    }
+
+    private void ApplyManualOutputStatus(int activeChannel)
+    {
+        ManualRelay0Status = activeChannel == JbzBoardTransportAdapter.Relay1OutputChannel ? "ON" : "OFF";
+        ManualRelay4Status = activeChannel == JbzBoardTransportAdapter.Relay5OutputChannel ? "ON" : "OFF";
     }
 
     private async Task RunManualResetAsync()
@@ -428,15 +426,13 @@ public sealed class ProductionSettingsViewModel : ObservableObject
         {
             await _test.ResetManualOutputsAsync();
             ManualRuntimeActive = _test.IsManualModeActive;
-            ManualRelay1Status = "OFF";
-            ManualRelay2Status = "OFF";
-            ManualStatus = "MANUAL - reset complete, relay OFF";
+            ApplyManualOutputStatus(-1);
+            ManualStatus = "MANUAL - reset complete, cả 2 relay OFF";
             RefreshManualCommands();
         }
         catch
         {
-            ManualRelay1Status = "OFF";
-            ManualRelay2Status = "OFF";
+            ApplyManualOutputStatus(-1);
             ManualStatus = "MANUAL FAULT - kiểm tra DeviceFault";
             RefreshManualCommands();
             throw;
@@ -555,7 +551,7 @@ public sealed class ProductionSettingsViewModel : ObservableObject
         Settings.ExpansionCardCount = Math.Clamp(
             Settings.ExpansionCardCount,
             1,
-            BoardIoDecoder.MaxExpansionCardCount);
+            BoardCapacity.MaxExpansionCardCount);
         Settings.StartCardNumber = Math.Clamp(
             Settings.StartCardNumber,
             1,
@@ -586,10 +582,8 @@ public sealed class ProductionSettingsViewModel : ObservableObject
 
     private void RefreshManualCommands()
     {
-        ManualRelay1OnCommand?.RaiseCanExecuteChanged();
-        ManualRelay1OffCommand?.RaiseCanExecuteChanged();
-        ManualRelay2OnCommand?.RaiseCanExecuteChanged();
-        ManualRelay2OffCommand?.RaiseCanExecuteChanged();
+        ManualRelay0OnCommand?.RaiseCanExecuteChanged();
+        ManualRelay4OnCommand?.RaiseCanExecuteChanged();
         ManualResetCommand?.RaiseCanExecuteChanged();
         ManualMeasureResistanceCommand?.RaiseCanExecuteChanged();
         ManualWaterProofTestCommand?.RaiseCanExecuteChanged();
@@ -620,7 +614,7 @@ public sealed class ResistanceChannelEditor : ObservableObject
         set => Set(ref _channelSelection, Math.Clamp(
             value,
             0,
-            D2xxResistanceRouting.MaxChannel));
+            ResistanceMeasurementPlan.MaxChannel));
     }
 
     public double MinOhm
@@ -643,7 +637,7 @@ public sealed class ResistanceChannelEditor : ObservableObject
         _channelSelection = Math.Clamp(
             setting.Channel,
             0,
-            D2xxResistanceRouting.MaxChannel);
+            ResistanceMeasurementPlan.MaxChannel);
         _minOhm = setting.MinOhm;
         _maxOhm = setting.MaxOhm;
     }

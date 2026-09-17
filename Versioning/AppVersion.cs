@@ -1,4 +1,4 @@
-namespace JBZUniversalTester.Versioning;
+namespace JBZUniveresalLunix.Versioning;
 
 /// <summary>
 /// API version dùng chung cho toàn bộ ứng dụng.

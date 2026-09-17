@@ -1,6 +1,6 @@
 using System.Globalization;
 
-namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 /// <summary>
 /// Builds compact Korean fault text for customer history exports from canonical

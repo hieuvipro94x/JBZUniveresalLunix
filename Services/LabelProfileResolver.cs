@@ -1,7 +1,7 @@
 using System.IO;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public static class LabelProfileResolver
 {

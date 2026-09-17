@@ -1,9 +1,9 @@
-﻿using System.Threading.Channels;
+using System.Threading.Channels;
 using System.IO;
 using System.Diagnostics;
 using System.Text;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public enum AppLogCategory
 {
@@ -64,7 +64,7 @@ public sealed class AsyncFileLogService : IDisposable
             string root = Path.IsPathRooted(rootDirectory)
                 ? rootDirectory
                 : Path.Combine(AppContext.BaseDirectory, rootDirectory);
-            LogFilePath = Path.Combine(root, "JBZUniversalTester.log");
+            LogFilePath = Path.Combine(root, "JBZUniveresalLunix.log");
         }
 
         // When disabled, do not enqueue or create the canonical runtime log.
@@ -81,7 +81,7 @@ public sealed class AsyncFileLogService : IDisposable
             string root = Path.IsPathRooted(rootDirectory)
                 ? rootDirectory
                 : Path.Combine(AppContext.BaseDirectory, rootDirectory);
-            LogFilePath = Path.Combine(root, "JBZUniversalTester.log");
+            LogFilePath = Path.Combine(root, "JBZUniveresalLunix.log");
         }
 
         if (!FileLoggingEnabled)

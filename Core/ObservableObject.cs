@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 
-namespace JBZUniversalTester.Core;
+namespace JBZUniveresalLunix.Core;
 
 public abstract class ObservableObject : INotifyPropertyChanged
 {

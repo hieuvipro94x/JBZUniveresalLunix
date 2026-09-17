@@ -1,4 +1,4 @@
-﻿namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 public sealed class ProductionSettings
 {
@@ -6,8 +6,10 @@ public sealed class ProductionSettings
     // THIẾT BỊ / I/O
     // ============================================================
 
-    /// <summary>Chọn họ bo D2XX. Auto giữ tương thích config cũ nhưng chỉ kết nối D2XX.</summary>
-    public BoardMode BoardMode { get; set; } = BoardMode.Auto;
+    /// <summary>Runtime chỉ dùng Universal Tester New qua UART; config legacy được normalize về JbzSerial.</summary>
+    public BoardMode BoardMode { get; set; } = BoardMode.JbzSerial;
+    /// <summary>Windows COM for the JBZ UART board; empty means discover an available board.</summary>
+    public string BoardPortName { get; set; } = string.Empty;
 
 
     /// <summary>
@@ -60,7 +62,7 @@ public sealed class ProductionSettings
     /// <summary>Legacy compatibility: số COM cũ của máy kín nước (5 = COM5).</summary>
     public int WaterproofSerialPort { get; set; }
 
-    /// <summary>Máy leak UART/RS232 riêng, không liên quan transport D2XX.</summary>
+    /// <summary>Máy leak UART/RS232 riêng, không liên quan transport JBZ UART.</summary>
     public WaterProofMachineSettings WaterProofMachine { get; set; } = new();
 
     /// <summary>
@@ -153,34 +155,34 @@ public sealed class ProductionSettings
     // Compatibility cho config cũ. Normalize đồng bộ về ShortCircuitConfirmMs.
     public int ShortConfirmMs { get; set; } = 0;
 
-    /// <summary>Thời gian Relay 1 - MỞ/ĐẨY JIG giữ ON trước khi cưỡng bức OFF.</summary>
+    /// <summary>Thời gian OUTPUT mở/đẩy JIG giữ ON trước khi cưỡng bức OFF.</summary>
     public int Relay1JigPulseMs { get; set; } = 120;
 
-    /// <summary>Thời gian Relay 2 - MARKING giữ ON trước khi cưỡng bức OFF.</summary>
+    /// <summary>Thời gian OUTPUT MARKING giữ ON trước khi cưỡng bức OFF.</summary>
     public int Relay2MarkingPulseMs { get; set; } = 120;
 
-    /// <summary>Bật/tắt Relay 1 JIG trong chuỗi PASS/FAIL/Master.</summary>
+    /// <summary>Bật/tắt OUTPUT JIG trong chuỗi PASS/FAIL/Master.</summary>
     public bool JigEjectRelayEnabled { get; set; } = true;
 
-    /// <summary>Bật/tắt Relay 2 MARKING trong chuỗi PASS. FAIL/Master không bao giờ dùng MARKING.</summary>
+    /// <summary>Bật/tắt OUTPUT MARKING trong chuỗi PASS. FAIL/Master không bao giờ dùng MARKING.</summary>
     public bool PassMarkingRelayEnabled { get; set; } = true;
 
     /// <summary>PASS sequence: false = MARKING trước JIG; true = JIG trước MARKING.</summary>
     public bool PassJigRelayFirst { get; set; }
 
-    /// <summary>
-    /// 0: R1 mở JIG, R2 MARKING. 1: R1 MARKING, R2 mở JIG.
-    /// PASS luôn MARKING trước rồi mới mở JIG; FAIL chỉ bật relay mở JIG.
-    /// </summary>
+    /// <summary>Trường tương thích file cfg cũ; runtime Universal Tester New bỏ qua hoàn toàn.</summary>
     public int RelayWiringMode { get; set; }
 
-    /// <summary>
-    /// Relay vật lý thực sự mở JIG sau khi người vận hành xác nhận sản phẩm lỗi.
-    /// Một số máy đấu ngược R1/R2 nên giá trị này phải được xác nhận bằng nút thử relay.
-    /// </summary>
+    /// <summary>Relay vật lý 1 của Universal Tester New = firmware OUTPUT channel 0. Cố định, không cho đổi mapping.</summary>
+    public int JigRelayChannel { get; set; } = 0;
+
+    /// <summary>Relay vật lý 5 của Universal Tester New = firmware OUTPUT channel 4. Cố định, không cho đổi mapping.</summary>
+    public int MarkingRelayChannel { get; set; } = 4;
+
+    /// <summary>Trường tương thích cfg cũ; luôn biểu diễn relay vật lý 1 mở JIG.</summary>
     public int FaultJigRelayNumber { get; set; } = 1;
 
-    /// <summary>Khoảng chờ an toàn sau khi R2 MARKING OFF trước khi R1 JIG ON trong chu trình PASS.</summary>
+    /// <summary>Khoảng chờ an toàn sau OUTPUT MARKING OFF trước OUTPUT JIG ON trong chu trình PASS.</summary>
     public int PassMarkingToJigDelayMs { get; set; } = 120;
 
     /// <summary>Compatibility V15.1 trở về trước: "R1,R2". V15.2 UI không còn dùng trực tiếp.</summary>

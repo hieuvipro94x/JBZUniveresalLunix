@@ -1,6 +1,6 @@
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public readonly record struct LiveTopologyPair(int FirstIo, int SecondIo);
 

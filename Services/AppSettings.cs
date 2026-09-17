@@ -1,7 +1,7 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 /// <summary>
 /// Hardware/test settings compiled into the application. These internal values
@@ -37,7 +37,6 @@ public sealed class AppSettings
 
 public sealed class BoardSettings
 {
-    public string FtdiSerial { get; set; } = string.Empty;
     public int RequiredStableFrames { get; set; } = 1;
 }
 

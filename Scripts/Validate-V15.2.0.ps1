@@ -24,7 +24,7 @@ Check 'History uses one column definition' ($history -match 'HistoryColumn\[\] C
 Check 'XLSX native DateTime/number output' ($history -match 'ToOADate\(\)' -and $history -match 'HistoryCellType\.Number')
 Check 'Unsupported settings hidden from UI' (
     $settingsXaml -notmatch 'Settings\.(WaterproofSerialPort|TemperatureTolerance|OversizeWaitSeconds|ShieldDelay)')
-Check 'Self-test project exists' (Test-Path (Join-Path $ProjectRoot 'Tests\JBZUniversalTester.SelfTests.csproj'))
+Check 'Self-test project exists' (Test-Path (Join-Path $ProjectRoot 'Tests\JBZUniveresalLunix.SelfTests.csproj'))
 
 $xamlOk = $true
 Get-ChildItem (Join-Path $ProjectRoot 'Views') -Filter '*.xaml' -File | ForEach-Object {

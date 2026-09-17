@@ -1,6 +1,6 @@
-﻿using JBZUniversalTester.Core;
+using JBZUniveresalLunix.Core;
 
-namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 /// <summary>Trạng thái một scan-card 64 I/O trên TestView.</summary>
 public sealed class BoardCardState : ObservableObject

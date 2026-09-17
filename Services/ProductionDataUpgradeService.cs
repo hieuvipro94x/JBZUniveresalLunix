@@ -2,7 +2,7 @@ using System.IO;
 using System.Globalization;
 using System.Text.Json;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 /// <summary>
 /// Carries station-local production state forward when a new version is placed
@@ -13,14 +13,14 @@ public static class ProductionDataUpgradeService
 {
     private static readonly string[] ProductionFiles =
     [
-        "JBZUniversalTester.cfg",
-        Path.Combine("Data", "JBZUniversalTester.db"),
+        "JBZUniveresalLunix.cfg",
+        Path.Combine("Data", "JBZUniveresalLunix.db"),
         "PartCnt.txt"
     ];
 
     private static readonly string[] FastConfigurationFiles =
     [
-        "JBZUniversalTester.cfg"
+        "JBZUniveresalLunix.cfg"
     ];
 
     public static IReadOnlyList<string> MigrateForCurrentVersion()

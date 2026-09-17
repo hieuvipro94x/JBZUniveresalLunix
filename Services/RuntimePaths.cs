@@ -1,6 +1,6 @@
 using System.IO;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 /// <summary>
 /// Canonical runtime layout. Production services must use these paths instead
@@ -9,13 +9,13 @@ namespace JBZUniversalTester.Services;
 public static class RuntimePaths
 {
     public static string AppDirectory => Path.GetFullPath(AppContext.BaseDirectory);
-    public static string ConfigFile => Path.Combine(AppDirectory, "JBZUniversalTester.cfg");
+    public static string ConfigFile => Path.Combine(AppDirectory, "JBZUniveresalLunix.cfg");
     public static string PartCounterFile => Path.Combine(AppDirectory, "PartCnt.txt");
-    public static string LogFile => Path.Combine(AppDirectory, "JBZUniversalTester.log");
+    public static string LogFile => Path.Combine(AppDirectory, "JBZUniveresalLunix.log");
     public static string DataDirectory => Path.Combine(AppDirectory, "Data");
-    public static string DatabaseFile => Path.Combine(DataDirectory, "JBZUniversalTester.db");
+    public static string DatabaseFile => Path.Combine(DataDirectory, "JBZUniveresalLunix.db");
     public static string CrashDirectory => Path.Combine(AppDirectory, "Crash");
-    public static string CrashReportFile => Path.Combine(CrashDirectory, "JBZUniversalTester.RPT");
+    public static string CrashReportFile => Path.Combine(CrashDirectory, "JBZUniveresalLunix.RPT");
     public static string ItemDirectory => @"C:\ITEM";
     public static string PassRoot => @"C:\Pass";
     public static string ErrorRoot => @"C:\Error";

@@ -1,4 +1,4 @@
-namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
 /// <summary>
 /// Cấu hình continuity chẩn đoán học từ frame thật. Không phải THT và không

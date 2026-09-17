@@ -1,0 +1,28 @@
+<Window x:Class="JBZUniveresalLunix.Views.BoardMaintenanceWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="JBZ UART - Bảo trì và Firmware" Width="760" Height="560"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize" Background="#F7F8FA">
+    <Grid Margin="20">
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <TextBlock Text="BẢO TRÌ BO JBZ UART" FontSize="24" FontWeight="Bold" Foreground="#273F91"/>
+        <GroupBox Grid.Row="1" Header="Firmware Intel HEX" Margin="0,16,0,8" Padding="12">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="120"/></Grid.ColumnDefinitions>
+                <TextBox x:Name="FirmwarePathText" IsReadOnly="True" Height="32" VerticalContentAlignment="Center"/>
+                <Button Grid.Column="1" Margin="8,0,0,0" Content="CHỌN HEX" Click="SelectHex_Click"/>
+            </Grid>
+        </GroupBox>
+        <TextBlock x:Name="ImageInfoText" Grid.Row="2" TextWrapping="Wrap" Foreground="#374151" Margin="4"/>
+        <Grid Grid.Row="3" Margin="0,10"><Grid.ColumnDefinitions><ColumnDefinition Width="170"/><ColumnDefinition Width="*"/><ColumnDefinition Width="140"/></Grid.ColumnDefinitions>
+            <TextBlock Text="Mật khẩu Admin:" VerticalAlignment="Center"/>
+            <PasswordBox x:Name="AdminPassword" Grid.Column="1" Height="32" Margin="8,0"/>
+            <Button x:Name="UpdateButton" Grid.Column="2" Content="NẠP FIRMWARE" Click="UpdateFirmware_Click" IsEnabled="False" Background="#B91C1C" Foreground="White"/>
+        </Grid>
+        <StackPanel Grid.Row="4" Margin="0,8">
+            <ProgressBar x:Name="FirmwareProgress" Height="24" Minimum="0" Maximum="100"/>
+            <TextBlock x:Name="StatusText" Margin="0,8" FontWeight="SemiBold" Text="Chọn đúng firmware dành cho Universal Tester New 1.2." TextWrapping="Wrap"/>
+            <TextBox x:Name="LogText" Height="180" IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
+        </StackPanel>
+        <Button Grid.Row="5" Width="120" Height="34" HorizontalAlignment="Right" Content="ĐÓNG" Click="Close_Click"/>
+    </Grid>
+</Window>

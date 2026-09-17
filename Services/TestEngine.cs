@@ -1,10 +1,10 @@
-﻿using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.RegularExpressions;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public sealed record ExpectedNetworkDiagnostic(
     string Key,
@@ -106,9 +106,6 @@ public sealed class TestEngine : IDisposable
     }
     const int ClipDisplayOrderBase = -1_000_000;
     const string PendingConnectionStatus = "CHƯA KẾT NỐI";
-    const string RemovalConnectionStatus = "CHỜ THÁO";
-    public const int JigEjectRelay = 1;
-    public const int MarkingRelay = 2;
 
     readonly IBoardTransport _board;
     readonly KeysightVisaService _visa;
@@ -123,9 +120,20 @@ public sealed class TestEngine : IDisposable
     readonly Dictionary<string, int> _stableCounters = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<int> _currentActive = [];
     readonly Dictionary<int, HashSet<int>> _currentConnections = [];
+    // Snapshot of the electrical edges that belonged to the product at the moment
+    // a committed result entered THÁO SẢN PHẨM. Removal is complete when these
+    // original edges are all gone. New incidental OTHER/SHORT contacts that appear
+    // later must not keep the previous product locked forever.
+    readonly HashSet<(int LowIo, int HighIo)> _productRemovalBaselineEdges = [];
+    bool _productRemovalBaselineArmed;
     // Presentation-only overlay populated from changed SOURCE relations before C0.
     // It never participates in PASS/FAIL, fault debounce, relay or counters.
     readonly Dictionary<int, HashSet<int>> _continuityPreviewConnections = [];
+    // Rev 1.42 renders OTHER/SHORT immediately in TestDialog::viewOther().
+    // Keep the same operator feedback as a presentation-only preview; these
+    // entries are never copied into _wiringFaults/_candidateWiringFaults and
+    // therefore cannot decide PASS/FAIL, relay actions or production counters.
+    readonly Dictionary<int, HashSet<WiringFaultPair>> _continuityPreviewWiringBySource = [];
     long _continuityPreviewSequence;
     readonly HashSet<int> _unexpectedIo = [];
     readonly HashSet<WiringFaultPair> _wiringFaults = [];
@@ -147,9 +155,7 @@ public sealed class TestEngine : IDisposable
     Dictionary<PinRecord, int> _displayOrderByPin = new(ReferenceEqualityComparer.Instance);
     Dictionary<WireNet, int> _displayOrderByNet = new(ReferenceEqualityComparer.Instance);
     Dictionary<WireNet, FaultRow[]> _displayRowsByNet = new(ReferenceEqualityComparer.Instance);
-    Dictionary<WireNet, FaultRow[]> _removalDisplayRowsByNet = new(ReferenceEqualityComparer.Instance);
     Dictionary<ClipBranch, FaultRow> _displayRowByClip = new(ReferenceEqualityComparer.Instance);
-    Dictionary<ClipBranch, FaultRow> _removalDisplayRowByClip = new(ReferenceEqualityComparer.Instance);
     FaultRow? _clipCommonDisplayRow;
     readonly Dictionary<string, bool> _expectedConnectionScratch = new(StringComparer.Ordinal);
     volatile bool _frameProcessingEnabled = true;
@@ -269,18 +275,24 @@ public sealed class TestEngine : IDisposable
             return BuildProductEvidenceSnapshotUnsafe();
     }
 
+    // Compatibility shim for older callers/tests. Universal Tester New does not
+    // have a separate removal presentation; the same missing/open
+    // pair table is used in every phase.
+    public IReadOnlyList<FaultRow> BuildRemovalRows() => BuildRows();
+
     public TestEnginePresentationSnapshot CapturePresentationSnapshot(bool removal)
     {
         long started = Stopwatch.GetTimestamp();
         lock (_gate)
         {
-            IReadOnlyList<FaultRow> rows = removal
-                ? BuildRemovalRows()
-                : BuildRows();
+            // Universal Tester New always presents the inverse-open table:
+            // missing/open pairs are visible, connected pairs disappear.
+            // There is no separate removal presentation.
+            IReadOnlyList<FaultRow> rows = BuildRows();
             double rowBuildMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             return new TestEnginePresentationSnapshot(
                 BuildProductionElectricalSnapshotUnsafe(),
-                removal,
+                false,
                 rows,
                 rowBuildMs);
         }
@@ -413,48 +425,97 @@ public sealed class TestEngine : IDisposable
     }
 
     /// <summary>
-    /// Chỉ dùng SAU KHI sản phẩm đã PASS và relay đã mở jig. Ngay khi bất kỳ
-    /// quan hệ continuity bắt buộc nào của model bị mất, coi như thao tác tháo
-    /// sản phẩm đã bắt đầu và UI phải rời PASS -> CHỜ LẮP SẢN PHẨM ngay.
-    /// Không dùng property này trong lúc đang test vì contact có thể đang được
-    /// lắp dần từng chân.
+    /// SOURCE mà firmware JBZ phải báo OPEN khi toàn bộ harness đã rời JIG.
+    /// Chỉ gồm network production thật; single-pin/probe-only không được dùng
+    /// để chặn ProductRemoved vì firmware không phát OPEN cho các row đó.
     /// </summary>
-    public bool IsPassReleaseStarted
+    public int[] GetRequiredRemovalSourceIos()
     {
-        get
+        lock (_gate)
         {
-            lock (_gate)
+            if (_model is null)
+                return [];
+
+            HashSet<int> required = _model.Nets
+                .Where(IsEligibleProductionNet)
+                .Select(net => net.SourceIo)
+                .Where(io => io > 0)
+                .ToHashSet();
+
+            if (_model.Clip is { } clip &&
+                clip.CommonIo > 0 &&
+                clip.Branches.Any(branch => IsEligibleClipBranch(clip, branch)))
             {
-                if (_model is null)
-                    return true;
-
-                foreach (WireNet net in _model.Nets)
-                {
-                    if (!IsEligibleProductionNet(net))
-                        continue;
-
-                    if (!IsWireNetConnected(net))
-                        return true;
-                }
-
-                if (_model.Clip is not null)
-                {
-                    foreach (ClipBranch branch in _model.Clip.Branches)
-                    {
-                        if (!IsEligibleClipBranch(_model.Clip, branch))
-                            continue;
-
-                        if (!IsClipBranchConnected(_model.Clip, branch, _currentConnections))
-                            return true;
-                    }
-                }
-
-                return ProductionExpectedNetCount(_model) == 0;
+                required.Add(clip.CommonIo);
             }
+
+            return required.OrderBy(io => io).ToArray();
         }
     }
 
-    /// <summary>Number of receiver endpoints that are not currently A0 ACTIVE.</summary>
+    /// <summary>
+    /// Universal Tester New không luôn phát C0/CIRCUIT cho trạng thái all-open.
+    /// TestViewModel vì vậy xác nhận một sweep UART thật: CLEAR -> OPEN cho toàn
+    /// bộ SOURCE production và không có OTHER/SHORT/CIRCUIT trong khoảng guard.
+    /// Khi sweep đó đã được xác nhận, snapshot cũ (đặc biệt reverse OTHER như
+    /// IO8->IO7) phải bị xoá atomically để ProductRemoved có thể hoàn tất.
+    ///
+    /// Đây là đường removal-only, không được gọi trong Continuity/PASS evaluation.
+    /// </summary>
+    public bool ConfirmProductReleasedFromOpenSweep(
+        IReadOnlyCollection<int> openSourceIos,
+        long sweepId)
+    {
+        ArgumentNullException.ThrowIfNull(openSourceIos);
+
+        int[] required;
+        lock (_gate)
+        {
+            if (_disposed || !_frameProcessingEnabled || _model is null)
+                return false;
+
+            required = _model.Nets
+                .Where(IsEligibleProductionNet)
+                .Select(net => net.SourceIo)
+                .Where(io => io > 0)
+                .Distinct()
+                .OrderBy(io => io)
+                .ToArray();
+
+            if (_model.Clip is { } clip &&
+                clip.CommonIo > 0 &&
+                clip.Branches.Any(branch => IsEligibleClipBranch(clip, branch)) &&
+                !required.Contains(clip.CommonIo))
+            {
+                required = required.Append(clip.CommonIo).OrderBy(io => io).ToArray();
+            }
+
+            if (required.Length == 0)
+                return false;
+
+            HashSet<int> opened = openSourceIos
+                .Where(io => io > 0)
+                .ToHashSet();
+            if (required.Any(io => !opened.Contains(io)))
+                return false;
+
+            // Sweep all-open đã được VM debounce bằng raw UART. Không giữ bất kỳ
+            // relation cũ nào vì OTHER hai chiều có thể còn sót một reverse source
+            // mà firmware không bao giờ phát OPEN (ví dụ IO8 của IO7<->IO8).
+            ResetUnsafe();
+        }
+
+        AsyncFileLogService.Current.Performance(
+            $"REMOVAL_OPEN_SWEEP_CONFIRMED sweep={sweepId} " +
+            $"sources=[{string.Join(",", required.Select(io => $"IO{io}"))}]");
+        Changed?.Invoke(this, EventArgs.Empty);
+        return true;
+    }
+
+    // Universal Tester New removal is binary: after a committed result the UI stays
+    // in one THÁO SẢN PHẨM state until IsProductReleased becomes true.
+    // No partial-removal milestone is kept.
+
     public int MissingConnectionCount
     {
         get
@@ -613,29 +674,19 @@ public sealed class TestEngine : IDisposable
             // Connector/Pin/WireName/Color/IO-CN-PN cho hàng trăm endpoint.
             _displayRowsByNet = new Dictionary<WireNet, FaultRow[]>(
                 ReferenceEqualityComparer.Instance);
-            _removalDisplayRowsByNet = new Dictionary<WireNet, FaultRow[]>(
-                ReferenceEqualityComparer.Instance);
             foreach (WireNet net in prepared.Model.Nets)
-            {
                 _displayRowsByNet[net] = CreateNetworkMappingRowsCore(prepared.Model, net, PendingConnectionStatus);
-                _removalDisplayRowsByNet[net] = CreateNetworkMappingRowsCore(prepared.Model, net, RemovalConnectionStatus);
-            }
 
             _displayRowByClip = new Dictionary<ClipBranch, FaultRow>(
                 ReferenceEqualityComparer.Instance);
-            _removalDisplayRowByClip = new Dictionary<ClipBranch, FaultRow>(
-                ReferenceEqualityComparer.Instance);
             foreach (ClipBranch branch in prepared.Model.Clip?.Branches ?? [])
-            {
                 _displayRowByClip[branch] = CreateMissingClipConnectionRow(
                     prepared.Model.Clip!, branch, PendingConnectionStatus);
-                _removalDisplayRowByClip[branch] = CreateMissingClipConnectionRow(
-                    prepared.Model.Clip!, branch, RemovalConnectionStatus);
-            }
             _clipCommonDisplayRow = prepared.Model.Clip is null
                 ? null
                 : CreateClipCommonDisplayRow(prepared.Model.Clip, PendingConnectionStatus);
             _latchedClipKeys.Clear();
+            ClearProductRemovalBaselineUnsafe();
             ResetUnsafe();
         }
         Changed?.Invoke(this, EventArgs.Empty);
@@ -757,11 +808,13 @@ public sealed class TestEngine : IDisposable
                 return new
                 {
                     Connectors = connectors,
+                    Priority = connectors.Any(IsAoFamilyConnector) ? 0 : 1,
                     MinOriginal = minOriginal,
                     Natural = connectors.Select(NaturalSortKey).OrderBy(value => value, StringComparer.OrdinalIgnoreCase).First()
                 };
             })
-            .OrderBy(group => group.MinOriginal)
+            .OrderBy(group => group.Priority)
+            .ThenBy(group => group.MinOriginal)
             .ThenBy(group => group.Natural, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
@@ -769,7 +822,8 @@ public sealed class TestEngine : IDisposable
         foreach (var component in connectorsByComponent)
         {
             foreach (string connector in component.Connectors
-                         .OrderBy(connector => ConnectorOriginalOrder(connector, pinsByConnector))
+                         .OrderBy(AoFamilyConnectorRank)
+                         .ThenBy(connector => ConnectorOriginalOrder(connector, pinsByConnector))
                          .ThenBy(NaturalSortKey, StringComparer.OrdinalIgnoreCase))
             {
                 foreach (PinRecord pin in pinsByConnector[connector]
@@ -811,6 +865,7 @@ public sealed class TestEngine : IDisposable
                 Net = net,
                 ModelIndex = modelIndex,
                 RelationKey = ConnectorRelationKey(net),
+                Priority = IsAoPriorityNet(net) ? 0 : 1,
                 FirstOriginal = FirstOriginalOrder(net),
                 RelationNatural = ConnectorRelationNaturalKey(net)
             })
@@ -822,6 +877,7 @@ public sealed class TestEngine : IDisposable
             .Select(group => new
             {
                 Key = group.Key,
+                Priority = group.Min(entry => entry.Priority),
                 FirstOriginal = group.Min(entry => entry.FirstOriginal),
                 FirstModelIndex = group.Min(entry => entry.ModelIndex),
                 Natural = group
@@ -829,7 +885,8 @@ public sealed class TestEngine : IDisposable
                     .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
                     .First()
             })
-            .OrderBy(group => group.FirstOriginal)
+            .OrderBy(group => group.Priority)
+            .ThenBy(group => group.FirstOriginal)
             .ThenBy(group => group.FirstModelIndex)
             .ThenBy(group => group.Natural, StringComparer.OrdinalIgnoreCase)
             .Select((group, index) => new { group.Key, Index = index })
@@ -841,7 +898,8 @@ public sealed class TestEngine : IDisposable
                      .OrderBy(group => groupOrder[group.Key]))
         {
             foreach (var entry in group
-                         .OrderBy(item => item.FirstOriginal)
+                         .OrderBy(item => item.Priority)
+                         .ThenBy(item => item.FirstOriginal)
                          .ThenBy(item => item.ModelIndex))
             {
                 result[entry.Net] = order++ * 1000;
@@ -849,6 +907,41 @@ public sealed class TestEngine : IDisposable
         }
 
         return result;
+    }
+
+    static bool IsAoPriorityNet(WireNet net) =>
+        string.Equals((net.Name ?? string.Empty).Trim(), "AO", StringComparison.OrdinalIgnoreCase) ||
+        NetworkConnectors(net).Any(IsAoFamilyConnector);
+
+    static bool IsAoFamilyConnector(string? connector)
+    {
+        string value = (connector ?? string.Empty).Trim();
+        if (value.Equals("AO", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("A0", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return Regex.IsMatch(value, @"^a\d+$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    static int AoFamilyConnectorRank(string? connector)
+    {
+        string value = (connector ?? string.Empty).Trim();
+        if (value.Equals("AO", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("A0", StringComparison.OrdinalIgnoreCase))
+        {
+            return 0;
+        }
+
+        Match branch = Regex.Match(value, @"^a(?<n>\d+)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (branch.Success &&
+            int.TryParse(branch.Groups["n"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int number))
+        {
+            return 1 + Math.Max(0, number);
+        }
+
+        return int.MaxValue;
     }
 
     static string ConnectorRelationKey(WireNet net)
@@ -935,6 +1028,7 @@ public sealed class TestEngine : IDisposable
         _currentActive.Clear();
         _currentConnections.Clear();
         _continuityPreviewConnections.Clear();
+        _continuityPreviewWiringBySource.Clear();
         _continuityPreviewSequence = 0;
         _actualComponentByIo.Clear();
         _unexpectedIo.Clear();
@@ -959,10 +1053,103 @@ public sealed class TestEngine : IDisposable
     public void ResetProductCycle()
     {
         lock (_gate)
+        {
             _latchedClipKeys.Clear();
+            ClearProductRemovalBaselineUnsafe();
+            ResetUnsafe();
+        }
 
-        Reset();
+        Changed?.Invoke(this, EventArgs.Empty);
     }
+
+    /// <summary>
+    /// Captures the exact electrical edges that belong to the product/result that
+    /// is about to enter THÁO SẢN PHẨM. This must be called before Reset() clears
+    /// the authoritative result snapshot. The captured set survives ordinary
+    /// Reset() calls and is cleared only when a new product cycle/model starts.
+    /// </summary>
+    public int ArmProductRemovalBaseline()
+    {
+        lock (_gate)
+        {
+            _productRemovalBaselineEdges.Clear();
+            if (_model is not null)
+            {
+                foreach ((int source, HashSet<int> targets) in _currentConnections)
+                {
+                    foreach (int target in targets)
+                    {
+                        if (!IsProductConnectivityEdgeUnsafe(_model, source, target))
+                            continue;
+
+                        _productRemovalBaselineEdges.Add(CanonicalEdge(source, target));
+                    }
+                }
+            }
+
+            _productRemovalBaselineArmed = true;
+            return _productRemovalBaselineEdges.Count;
+        }
+    }
+
+    public int ProductRemovalBaselineEdgeCount
+    {
+        get
+        {
+            lock (_gate)
+                return _productRemovalBaselineEdges.Count;
+        }
+    }
+
+    public int ProductRemovalBaselineRemainingEdgeCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                if (!_productRemovalBaselineArmed || _productRemovalBaselineEdges.Count == 0)
+                    return HasProductActivityUnsafeFallback() ? 1 : 0;
+
+                return _productRemovalBaselineEdges.Count(edge =>
+                    HasElectricalEdge(_currentConnections, edge.LowIo, edge.HighIo));
+            }
+        }
+    }
+
+    public bool IsProductRemovalBaselineReleased
+    {
+        get
+        {
+            lock (_gate)
+            {
+                // Compatibility/safety fallback for diagnostic callers that arm
+                // removal before a complete product snapshot exists.
+                if (!_productRemovalBaselineArmed || _productRemovalBaselineEdges.Count == 0)
+                    return !HasProductActivityUnsafeFallback();
+
+                return !_productRemovalBaselineEdges.Any(edge =>
+                    HasElectricalEdge(_currentConnections, edge.LowIo, edge.HighIo));
+            }
+        }
+    }
+
+    public void ClearProductRemovalBaseline()
+    {
+        lock (_gate)
+            ClearProductRemovalBaselineUnsafe();
+    }
+
+    private bool HasProductActivityUnsafeFallback() =>
+        _model is not null && HasProductActivityUnsafe(_model);
+
+    private void ClearProductRemovalBaselineUnsafe()
+    {
+        _productRemovalBaselineEdges.Clear();
+        _productRemovalBaselineArmed = false;
+    }
+
+    private static (int LowIo, int HighIo) CanonicalEdge(int a, int b) =>
+        (Math.Min(a, b), Math.Max(a, b));
 
     /// <summary>
     /// Applies one finalized SOURCE relation from the in-progress Production scan.
@@ -972,63 +1159,339 @@ public sealed class TestEngine : IDisposable
     public bool ApplyContinuityPreviewSource(
         int sourceIo,
         IReadOnlyCollection<int> targets,
-        long sequence)
+        long sequence,
+        IReadOnlyDictionary<(int SourceIo, int TargetIo), ProductFaultType>? explicitFaults = null)
     {
         if (_disposed || sourceIo <= 0)
             return false;
 
         lock (_gate)
         {
-            if (!_frameProcessingEnabled || _model is null ||
-                !_componentByIo.TryGetValue(sourceIo, out int expectedComponent))
-            {
+            if (!_frameProcessingEnabled || _model is null)
                 return false;
-            }
+
+            bool sourceComponentKnown = _componentByIo.TryGetValue(
+                sourceIo,
+                out int expectedComponent);
 
             if (_continuityPreviewSequence != 0 &&
                 sequence > 0 &&
                 sequence != _continuityPreviewSequence)
             {
                 _continuityPreviewConnections.Clear();
+                _continuityPreviewWiringBySource.Clear();
             }
             if (sequence > 0)
                 _continuityPreviewSequence = sequence;
 
             var filteredTargets = new HashSet<int>();
+            var previewFaults = new HashSet<WiringFaultPair>();
             foreach (int target in targets)
             {
-                if (target > 0 &&
+                if (target <= 0 || target == sourceIo)
+                    continue;
+
+                if (sourceComponentKnown &&
                     _componentByIo.TryGetValue(target, out int targetComponent) &&
                     targetComponent == expectedComponent)
                 {
                     filteredTargets.Add(target);
+                    continue;
                 }
+
+                // OTHER/SHORT from the JBZ firmware is already an electrical
+                // relation. Mirror Rev 1.42 viewOther() immediately on screen,
+                // but keep it strictly outside the authoritative fault state.
+                WiringFaultPair inferred = ClassifyUnexpectedPair(_model, sourceIo, target);
+                previewFaults.Add(ApplyExplicitFaultType(
+                    inferred,
+                    sourceIo,
+                    target,
+                    explicitFaults));
             }
 
-            // If this preview matches the last authoritative C0 relation, remove any
-            // older override instead of keeping an unnecessary presentation overlay.
-            bool matchesAuthoritative = _currentConnections.TryGetValue(
-                sourceIo,
-                out HashSet<int>? authoritativeTargets)
-                ? FilterExpectedComponentTargetsUnsafe(
-                    authoritativeTargets,
-                    expectedComponent).SetEquals(filteredTargets)
-                : filteredTargets.Count == 0;
+            bool changed = false;
+            if (previewFaults.Count == 0)
+                changed |= _continuityPreviewWiringBySource.Remove(sourceIo);
+            else if (!_continuityPreviewWiringBySource.TryGetValue(sourceIo, out HashSet<WiringFaultPair>? oldPreviewFaults) ||
+                     !oldPreviewFaults.SetEquals(previewFaults))
+            {
+                _continuityPreviewWiringBySource[sourceIo] = previewFaults;
+                changed = true;
+            }
+
+            // If the expected-edge portion of this preview matches the last
+            // authoritative C0 relation, remove only that expected-edge override.
+            // A simultaneous presentation-only OTHER/SHORT fault still remains.
+            bool matchesAuthoritative = !sourceComponentKnown ||
+                (_currentConnections.TryGetValue(
+                    sourceIo,
+                    out HashSet<int>? authoritativeTargets)
+                    ? FilterExpectedComponentTargetsUnsafe(
+                        authoritativeTargets,
+                        expectedComponent).SetEquals(filteredTargets)
+                    : filteredTargets.Count == 0);
 
             if (matchesAuthoritative)
-                return _continuityPreviewConnections.Remove(sourceIo);
+            {
+                changed |= _continuityPreviewConnections.Remove(sourceIo);
+                return changed;
+            }
 
             if (_continuityPreviewConnections.TryGetValue(
                     sourceIo,
                     out HashSet<int>? existing) &&
                 existing.SetEquals(filteredTargets))
             {
-                return false;
+                return changed;
             }
 
             _continuityPreviewConnections[sourceIo] = filteredTargets;
             return true;
         }
+    }
+
+    /// <summary>
+    /// During THÁO SẢN PHẨM the firmware still reports one finalized SOURCE
+    /// relation at a time before the next C0. Unlike the normal continuity preview,
+    /// removal must update the authoritative electrical graph immediately; otherwise
+    /// IsProductReleased can remain stuck on the last failed C0 frame forever.
+    ///
+    /// This method is removal-only: it never creates/confirm new wiring faults and
+    /// never participates in PASS. It only replaces the physical relation for the
+    /// supplied source, rebuilds the current graph and raises Changed so the existing
+    /// ProductRemoved state machine can reset the cycle as soon as all product edges
+    /// have actually disappeared.
+    /// </summary>
+    public bool ApplyRemovalPreviewSource(
+        int sourceIo,
+        IReadOnlyCollection<int> targets,
+        long sequence,
+        long scanGeneration)
+    {
+        ArgumentNullException.ThrowIfNull(targets);
+        if (_disposed || sourceIo <= 0)
+            return false;
+
+        bool changed;
+        bool released;
+        int[] normalizedTargets;
+        lock (_gate)
+        {
+            ProductModel? model = _model;
+            if (!_frameProcessingEnabled || model is null)
+                return false;
+
+            normalizedTargets = targets
+                .Where(io => io > 0 &&
+                             io != sourceIo &&
+                             !model.IgnoredIo.Contains(io))
+                .Distinct()
+                .OrderBy(io => io)
+                .ToArray();
+
+            var nextTargets = normalizedTargets.ToHashSet();
+            if (nextTargets.Count == 0)
+            {
+                changed = _currentConnections.Remove(sourceIo);
+            }
+            else if (_currentConnections.TryGetValue(sourceIo, out HashSet<int>? existing) &&
+                     existing.SetEquals(nextTargets))
+            {
+                changed = false;
+            }
+            else
+            {
+                _currentConnections[sourceIo] = nextTargets;
+                changed = true;
+            }
+
+            // Removal frames are source-by-source. A no-op source still must not
+            // create a fake engine event; the next source/C0 will continue the scan.
+            if (!changed)
+                return false;
+
+            _currentActive.Clear();
+            foreach ((int source, HashSet<int> currentTargets) in _currentConnections)
+            {
+                if (currentTargets.Count == 0)
+                    continue;
+
+                _currentActive.Add(source);
+                foreach (int target in currentTargets)
+                    _currentActive.Add(target);
+            }
+
+            _actualComponentByIo = BuildActualComponents(_currentConnections);
+            _lastFrameValid = true;
+            if (sequence > 0)
+                _lastFrameSequence = Math.Max(_lastFrameSequence, sequence);
+            if (scanGeneration > 0)
+                _lastFrameScanGeneration = scanGeneration;
+            _lastFrameUnknownBytes = 0;
+
+            // Do not let post-result removal activity become PASS/NG evidence.
+            _productStable = false;
+            _readyToEvaluateProductFaults = false;
+            released = !HasProductActivityUnsafe(model);
+        }
+
+        AsyncFileLogService.Current.Performance(
+            $"REMOVAL_SOURCE_APPLIED source=IO{sourceIo} seq={sequence} " +
+            $"targets=[{string.Join(",", normalizedTargets.Select(io => $"IO{io}"))}] released={released}");
+        Changed?.Invoke(this, EventArgs.Empty);
+        return true;
+    }
+
+    /// <summary>
+    /// Promote firmware-authoritative :OTHER/:SHORT relations observed before C0
+    /// into the real production fault state. The partial frame is still NOT used
+    /// for PASS/open evaluation; only an explicit firmware fault hint is trusted.
+    /// This closes the gap where TryHandleContinuityPreviewFrame consumed the UART
+    /// event for presentation and the fault never reached ProcessFrame().
+    /// </summary>
+    public bool PromoteAuthoritativeContinuityPreviewFaults(
+        int sourceIo,
+        long sequence,
+        long scanGeneration,
+        IReadOnlyDictionary<(int SourceIo, int TargetIo), ProductFaultType>? explicitFaults)
+    {
+        if (_disposed || sourceIo <= 0 || explicitFaults is null || explicitFaults.Count == 0)
+            return false;
+
+        bool changed = false;
+        WiringFaultPair[] promoted = [];
+        lock (_gate)
+        {
+            if (!_frameProcessingEnabled || _model is null ||
+                !_continuityPreviewWiringBySource.TryGetValue(sourceIo, out HashSet<WiringFaultPair>? previewFaults))
+            {
+                return false;
+            }
+
+            promoted = previewFaults
+                .Where(fault => IsFirmwareAuthoritativeFault(fault, explicitFaults))
+                .ToArray();
+            if (promoted.Length == 0)
+                return false;
+
+            foreach (WiringFaultPair fault in promoted)
+            {
+                changed |= _candidateWiringFaults.Add(fault);
+                changed |= _wiringFaults.Add(fault);
+                _unexpectedIo.Add(fault.SourceIo);
+                _unexpectedIo.Add(fault.TargetIo);
+            }
+
+            if (changed)
+            {
+                // Valid for FAIL lifecycle only. PASS still requires the complete
+                // continuity snapshot and ReadyToEvaluateProductFaults.
+                _lastFrameValid = true;
+                if (sequence > 0)
+                    _lastFrameSequence = Math.Max(_lastFrameSequence, sequence);
+                if (scanGeneration > 0)
+                    _lastFrameScanGeneration = scanGeneration;
+                _lastFrameUnknownBytes = 0;
+            }
+        }
+
+        if (changed)
+        {
+            AsyncFileLogService.Current.Performance(
+                $"REALTIME_FAULT_PROMOTED source=IO{sourceIo} seq={sequence} " +
+                $"faults={string.Join('|', promoted.Select(f => $"{f.FaultType}:IO{f.SourceIo}-IO{f.TargetIo}"))}");
+            Changed?.Invoke(this, EventArgs.Empty);
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// Universal Tester New can report a physical bridge as two simultaneous
+    /// TESTPIN contacts instead of :SHORT. One probe touching a normal network may
+    /// expose one or more I/O from the SAME expected component; that remains probe
+    /// presentation only. Two active TESTPIN I/O from DIFFERENT expected THT
+    /// components are an electrical bridge and are promoted to a latched SHORT.
+    /// </summary>
+    public bool PromoteCrossNetworkTestPinShort(
+        IReadOnlyCollection<int> probeIos,
+        long sequence,
+        long scanGeneration)
+    {
+        ArgumentNullException.ThrowIfNull(probeIos);
+        if (_disposed || probeIos.Count < 2)
+            return false;
+
+        bool changed = false;
+        WiringFaultPair[] promoted = [];
+        lock (_gate)
+        {
+            ProductModel? model = _model;
+            if (!_frameProcessingEnabled || model is null)
+                return false;
+
+            int[] ios = probeIos
+                .Where(io => io > 0 && !model.IgnoredIo.Contains(io) && _componentByIo.ContainsKey(io))
+                .Distinct()
+                .OrderBy(io => io)
+                .ToArray();
+            if (ios.Length < 2)
+                return false;
+
+            var faults = new List<WiringFaultPair>();
+            for (int i = 0; i < ios.Length - 1; i++)
+            {
+                int source = ios[i];
+                int sourceComponent = _componentByIo[source];
+                for (int j = i + 1; j < ios.Length; j++)
+                {
+                    int target = ios[j];
+                    if (_componentByIo[target] == sourceComponent)
+                        continue;
+
+                    faults.Add(new WiringFaultPair(
+                        source,
+                        target,
+                        $"Phát hiện chập IO{source} <-> IO{target}: TESTPIN đồng thời thuộc hai network khác nhau",
+                        ProductFaultType.ShortCircuit,
+                        null,
+                        null));
+                }
+            }
+
+            if (faults.Count == 0)
+                return false;
+
+            promoted = faults.Distinct().ToArray();
+            foreach (WiringFaultPair fault in promoted)
+            {
+                changed |= _candidateWiringFaults.Add(fault);
+                changed |= _wiringFaults.Add(fault);
+                _unexpectedIo.Add(fault.SourceIo);
+                _unexpectedIo.Add(fault.TargetIo);
+            }
+
+            if (changed)
+            {
+                _lastFrameValid = true;
+                if (sequence > 0)
+                    _lastFrameSequence = Math.Max(_lastFrameSequence, sequence);
+                if (scanGeneration > 0)
+                    _lastFrameScanGeneration = scanGeneration;
+                _lastFrameUnknownBytes = 0;
+            }
+        }
+
+        if (changed)
+        {
+            AsyncFileLogService.Current.Performance(
+                $"REALTIME_SHORT_FROM_TESTPIN seq={sequence} ios={string.Join(",", probeIos.OrderBy(io => io))} " +
+                $"faults={string.Join('|', promoted.Select(f => $"IO{f.SourceIo}-IO{f.TargetIo}"))}");
+            Changed?.Invoke(this, EventArgs.Empty);
+        }
+
+        return changed;
     }
 
     /// <summary>
@@ -1044,9 +1507,10 @@ public sealed class TestEngine : IDisposable
                 if (_model is null)
                     return false;
 
-                return _continuityPreviewConnections.Any(pair =>
-                    pair.Value.Any(target =>
-                        IsProductConnectivityEdgeUnsafe(_model, pair.Key, target)));
+                return _continuityPreviewWiringBySource.Count > 0 ||
+                       _continuityPreviewConnections.Any(pair =>
+                           pair.Value.Any(target =>
+                               IsProductConnectivityEdgeUnsafe(_model, pair.Key, target)));
             }
         }
     }
@@ -1068,13 +1532,15 @@ public sealed class TestEngine : IDisposable
     {
         lock (_gate)
         {
-            if (_continuityPreviewConnections.Count == 0)
+            if (_continuityPreviewConnections.Count == 0 &&
+                _continuityPreviewWiringBySource.Count == 0)
             {
                 _continuityPreviewSequence = 0;
                 return false;
             }
 
             _continuityPreviewConnections.Clear();
+            _continuityPreviewWiringBySource.Clear();
             _continuityPreviewSequence = 0;
             return true;
         }
@@ -1257,15 +1723,16 @@ public sealed class TestEngine : IDisposable
             // thị Pin đang chạm. Không cho snapshot này tạo candidate/confirmed
             // WRONG hoặc SHORT mới; các lỗi thật đã có trước đó vẫn được giữ.
             // PASS cần coverage đầy đủ của model; một cạnh SAI thật thì không.
-            // Nếu operator chạm đủ hai đầu của một dây sai, BO đã trả về cạnh
-            // vật lý đó và phải báo sau debounce riêng, không đợi 99 dây của
-            // WH322244 được lắp xong.
+            // Với topology suy luận (không có firmware hint), vẫn giữ debounce.
+            // Nhưng Universal Tester New đã phân loại trực tiếp :OTHER/:SHORT;
+            // các hint đó là authoritative và được confirm ngay ở UpdateWiringFaults.
             bool realtimeEvaluationEnabled = hasProductActivity;
             bool wiringChanged = !preserveConfirmedWiringFaults && UpdateWiringFaults(
                 model,
                 _expectedConnectionScratch,
                 hasProductActivity,
-                realtimeEvaluationEnabled);
+                realtimeEvaluationEnabled,
+                frame.FaultHints);
 
             if (preserveConfirmedWiringFaults &&
                 previousConfirmedWiringFaults.Length > 0 &&
@@ -1300,7 +1767,7 @@ public sealed class TestEngine : IDisposable
                 Stopwatch.GetElapsedTime(computeStarted).TotalMilliseconds;
         }
 
-        // Không block worker D2XX. TestViewModel sẽ marshal async sang UI.
+        // Không block worker UART. TestViewModel sẽ marshal async sang UI.
         if (changed)
             Changed?.Invoke(this, EventArgs.Empty);
 
@@ -1311,7 +1778,8 @@ public sealed class TestEngine : IDisposable
         ProductModel model,
         IReadOnlyDictionary<string, bool> expectedConnections,
         bool hasProductActivity,
-        bool readyToEvaluateFaults)
+        bool readyToEvaluateFaults,
+        IReadOnlyDictionary<(int SourceIo, int TargetIo), ProductFaultType>? explicitFaults = null)
     {
         // Đấu sai phải xét theo COMPONENT điện thật, không chỉ theo một chiều
         // source->target. Trace cho thấy một component nhiều nhánh có thể sinh
@@ -1370,7 +1838,18 @@ public sealed class TestEngine : IDisposable
         WiringFaultPair[] classified = unexpectedNow.Count == 0
             ? Array.Empty<WiringFaultPair>()
             : unexpectedNow
-                .Select(pair => ClassifyUnexpectedPair(model, pair.SourceIo, pair.TargetIo))
+                .Select(pair =>
+                {
+                    WiringFaultPair inferred = ClassifyUnexpectedPair(
+                        model,
+                        pair.SourceIo,
+                        pair.TargetIo);
+                    return ApplyExplicitFaultType(
+                        inferred,
+                        pair.SourceIo,
+                        pair.TargetIo,
+                        explicitFaults);
+                })
                 .ToArray();
 
         bool changed = false;
@@ -1419,7 +1898,9 @@ public sealed class TestEngine : IDisposable
         }
 
         WiringFaultPair[] confirmedFaults = classified
-            .Where(fault => snapshot.ConfirmedUnexpectedPairs.Contains((fault.SourceIo, fault.TargetIo)))
+            .Where(fault =>
+                IsFirmwareAuthoritativeFault(fault, explicitFaults) ||
+                snapshot.ConfirmedUnexpectedPairs.Contains((fault.SourceIo, fault.TargetIo)))
             .ToArray();
 
         if (!_wiringFaults.SetEquals(confirmedFaults))
@@ -1438,6 +1919,45 @@ public sealed class TestEngine : IDisposable
         }
 
         return changed;
+    }
+
+    private static bool IsFirmwareAuthoritativeFault(
+        WiringFaultPair fault,
+        IReadOnlyDictionary<(int SourceIo, int TargetIo), ProductFaultType>? explicitFaults)
+    {
+        if (explicitFaults is null || explicitFaults.Count == 0)
+            return false;
+
+        var key = (Math.Min(fault.SourceIo, fault.TargetIo), Math.Max(fault.SourceIo, fault.TargetIo));
+        return explicitFaults.TryGetValue(key, out ProductFaultType type) &&
+               type is ProductFaultType.WrongWiring or ProductFaultType.ShortCircuit;
+    }
+
+    private static WiringFaultPair ApplyExplicitFaultType(
+        WiringFaultPair inferred,
+        int sourceIo,
+        int targetIo,
+        IReadOnlyDictionary<(int SourceIo, int TargetIo), ProductFaultType>? explicitFaults)
+    {
+        if (explicitFaults is null || explicitFaults.Count == 0)
+            return inferred;
+
+        var key = (Math.Min(sourceIo, targetIo), Math.Max(sourceIo, targetIo));
+        if (!explicitFaults.TryGetValue(key, out ProductFaultType explicitType) ||
+            explicitType is not (ProductFaultType.WrongWiring or ProductFaultType.ShortCircuit))
+        {
+            return inferred;
+        }
+
+        string reason = explicitType == ProductFaultType.ShortCircuit
+            ? $"Firmware SHORT: IO{sourceIo} <-> IO{targetIo}"
+            : $"Firmware OTHER: IO{sourceIo} đang nối nhầm IO{targetIo}";
+
+        return inferred with
+        {
+            FaultType = explicitType,
+            Reason = reason
+        };
     }
 
     private static WiringFaultPair ClassifyUnexpectedPair(
@@ -1887,6 +2407,7 @@ public sealed class TestEngine : IDisposable
             // không đi vào bảng operator.
             HashSet<int> diagnosticIos = [];
             rows.AddRange(BuildConfirmedWiringDisplayRows(model, diagnosticIos));
+            rows.AddRange(BuildPreviewWiringDisplayRows(model, diagnosticIos));
 
             // CLIP giữ nguyên semantics latch hiện hữu. Continuity preview chỉ
             // tác động WireNet thường để không thay đổi workflow CLIP/PASS.
@@ -1911,10 +2432,10 @@ public sealed class TestEngine : IDisposable
                 }
             }
 
-            foreach (WireNet net in model.Nets)
+            foreach (WireNet net in model.Nets
+                         .Where(IsEligibleProductionNet)
+                         .OrderBy(net => _displayOrderByNet.TryGetValue(net, out int order) ? order : int.MaxValue))
             {
-                if (!IsEligibleProductionNet(net))
-                    continue;
 
                 bool previewAffected = previewComponents is not null &&
                     IsNetAffectedByContinuityPreviewUnsafe(net, previewExpectedComponents);
@@ -1941,59 +2462,29 @@ public sealed class TestEngine : IDisposable
             }
         }
 
-        return rows;
+        return PromoteAoFamilyRows(rows);
     }
 
-    /// <summary>
-    /// Presentation riêng cho giai đoạn chờ tháo: quan hệ nào còn thật trên
-    /// jig thì còn row; tháo quan hệ nào thì row của network đó mất ngay.
-    /// Continuity preview may accelerate only the table; removal completion still
-    /// requires the authoritative complete frame in the existing state machine.
-    /// </summary>
-    public IReadOnlyList<FaultRow> BuildRemovalRows()
+    private static IReadOnlyList<FaultRow> PromoteAoFamilyRows(List<FaultRow> rows)
     {
-        ProductModel? model = _model;
-        if (model is null)
-            return [];
+        // Universal Tester New: AO/A0/a1/a2/... is the fixture-common family
+        // operators must see first. Keep every non-AO row in its existing stable
+        // order; only lift AO-family rows to the head and order those connectors
+        // AO -> a1 -> a2 -> a3... . This also keeps AO wrong/short rows visible
+        // at the top instead of letting diagnostic insertion order push them down.
+        if (rows.Count < 2 || !rows.Any(row => IsAoFamilyConnector(row.Connector)))
+            return rows;
 
-        var rows = new List<FaultRow>();
-        lock (_gate)
-        {
-            Dictionary<int, int>? previewComponents =
-                BuildContinuityPreviewComponentsUnsafe(out HashSet<int> previewExpectedComponents);
-            HashSet<int> diagnosticIos = [];
-            rows.AddRange(BuildConfirmedWiringDisplayRows(model, diagnosticIos));
+        FaultRow[] aoRows = rows
+            .Where(row => IsAoFamilyConnector(row.Connector))
+            .OrderBy(row => AoFamilyConnectorRank(row.Connector))
+            .ThenBy(row => row.DisplayOrder)
+            .ToArray();
 
-            foreach (WireNet net in model.Nets)
-            {
-                if (!IsEligibleProductionNet(net) || net.IoNumbers.Any(diagnosticIos.Contains))
-                    continue;
-
-                bool previewAffected = previewComponents is not null &&
-                    IsNetAffectedByContinuityPreviewUnsafe(net, previewExpectedComponents);
-                bool connected = previewAffected
-                    ? IsWireNetConnected(net, previewComponents!)
-                    : IsWireNetConnected(net);
-
-                if (connected &&
-                    _removalDisplayRowsByNet.TryGetValue(net, out FaultRow[]? cachedRows))
-                {
-                    rows.AddRange(cachedRows);
-                }
-            }
-
-            if (model.Clip is not null)
-            {
-                foreach (ClipBranch branch in OrderedClipBranches(model.Clip))
-                {
-                    if (IsEligibleClipBranch(model.Clip, branch) &&
-                        IsClipBranchConnected(model.Clip, branch, _currentConnections) &&
-                        _removalDisplayRowByClip.TryGetValue(branch, out FaultRow? row))
-                        rows.Add(row);
-                }
-            }
-        }
-        return rows;
+        var ordered = new List<FaultRow>(rows.Count);
+        ordered.AddRange(aoRows);
+        ordered.AddRange(rows.Where(row => !IsAoFamilyConnector(row.Connector)));
+        return ordered;
     }
 
     private Dictionary<int, int>? BuildContinuityPreviewComponentsUnsafe(
@@ -2028,16 +2519,51 @@ public sealed class TestEngine : IDisposable
 
     private IReadOnlyList<FaultRow> BuildConfirmedWiringDisplayRows(
         ProductModel model,
+        HashSet<int> diagnosticIos) =>
+        BuildWiringDisplayRows(model, diagnosticIos, _wiringFaults);
+
+    private IReadOnlyList<FaultRow> BuildPreviewWiringDisplayRows(
+        ProductModel model,
         HashSet<int> diagnosticIos)
+    {
+        WiringFaultPair[] preview = _continuityPreviewWiringBySource.Values
+            .SelectMany(static faults => faults)
+            .Where(fault => !_wiringFaults.Contains(fault))
+            .Distinct()
+            .ToArray();
+        return BuildWiringDisplayRows(model, diagnosticIos, preview);
+    }
+
+    private IReadOnlyList<FaultRow> BuildWiringDisplayRows(
+        ProductModel model,
+        HashSet<int> diagnosticIos,
+        IEnumerable<WiringFaultPair> faults)
     {
         var rows = new List<FaultRow>();
         HashSet<string> keys = new(StringComparer.Ordinal);
 
-        foreach (WiringFaultPair fault in _wiringFaults
+        foreach (WiringFaultPair fault in faults
                      .OrderBy(item => item.SourceIo)
                      .ThenBy(item => item.TargetIo))
         {
             int[] relation = [fault.SourceIo, fault.TargetIo];
+
+            // Universal Tester New already distinguishes OTHER and SHORT.
+            // Show that firmware classification directly instead of expanding
+            // one electrical pair into the legacy three-row guess
+            // (wrong + short + open), which confused the TestView operator.
+            if (fault.FaultType is ProductFaultType.WrongWiring or ProductFaultType.ShortCircuit)
+            {
+                bool isShort = fault.FaultType == ProductFaultType.ShortCircuit;
+                string status = isShort ? "CHẬP MẠCH" : "SAI DÂY";
+                FaultKind kind = isShort ? FaultKind.Short : FaultKind.WrongWiring;
+                AddDiagnosticRow(rows, keys, diagnosticIos, model, fault,
+                    fault.SourceIo, status, kind, fault.FaultType, relation);
+                AddDiagnosticRow(rows, keys, diagnosticIos, model, fault,
+                    fault.TargetIo, status, kind, fault.FaultType, relation);
+                continue;
+            }
+
             if (TryResolveExpectedDisplayRelation(
                     model,
                     fault,
@@ -2231,11 +2757,16 @@ public sealed class TestEngine : IDisposable
         return pins
             .Select((pin, endpointIndex) =>
             {
-                int? firstPeer = endpointIos
-                    .Where(io => io != pin.IoNumber)
-                    .OrderBy(io => ResolvePeerOrder(net, io))
-                    .Cast<int?>()
-                    .FirstOrDefault();
+                int canonicalSourceIo = net.SourceIo > 0
+                    ? net.SourceIo
+                    : pins[0].IoNumber;
+                int? rowTargetIo = pin.IoNumber == canonicalSourceIo
+                    ? endpointIos
+                        .Where(io => io != canonicalSourceIo)
+                        .OrderBy(io => ResolvePeerOrder(net, io))
+                        .Cast<int?>()
+                        .FirstOrDefault()
+                    : pin.IoNumber;
 
                 return new FaultRow
                 {
@@ -2244,8 +2775,8 @@ public sealed class TestEngine : IDisposable
                     FaultType = topologyType,
                     Io = pin.IoNumber,
                     DisplayOrder = ResolveNetworkEndpointDisplayOrder(net, pin, endpointIndex),
-                    ExpectedSourceIo = net.SourceIo,
-                    ExpectedTargetIo = firstPeer,
+                    ExpectedSourceIo = canonicalSourceIo,
+                    ExpectedTargetIo = rowTargetIo,
                     RelatedIos = relatedIos,
                     Connector = pin.Connector,
                     Pin = pin.PinNumber,
@@ -2301,10 +2832,11 @@ public sealed class TestEngine : IDisposable
                 _probeEvidenceExcludedIo.Add(io);
 
             changed |= _candidateWiringFaults.RemoveWhere(fault =>
-                          suppressed.Contains(fault.SourceIo) || suppressed.Contains(fault.TargetIo)) > 0;
+                          (suppressed.Contains(fault.SourceIo) || suppressed.Contains(fault.TargetIo)) &&
+                          !_wiringFaults.Contains(fault)) > 0;
 
-            // Không xóa _wiringFaults đã confirmed: đó có thể là lỗi SHORT/WRONG
-            // thật tồn tại trước khi người vận hành chạm đầu dò vào cùng I/O.
+            // Không xóa candidate đã confirmed hoặc _wiringFaults: đó có thể là
+            // lỗi SHORT/WRONG thật tồn tại trước khi TESTPIN/probe xuất hiện.
         }
 
         if (changed)
@@ -2619,53 +3151,53 @@ public sealed class TestEngine : IDisposable
 
 
     /// <summary>
-    /// Sau khi người vận hành XÁC NHẬN hàng lỗi, chỉ relay đã được cài là
-    /// relay MỞ JIG LỖI được pulse. Không chạy chuỗi MARKING của PASS.
-    /// Một số máy đấu ngược R1/R2 nên số relay được chọn sau khi thử tay.
+    /// Sau khi người vận hành XÁC NHẬN hàng lỗi, pulse đúng Relay vật lý 1
+    /// (firmware OUTPUT channel 0) để nhả JIG. Không chạy MARKING của PASS.
     /// </summary>
     public Task EjectFaultProductAsync(CancellationToken ct = default)
         => PulseJigRelayAsync(ct);
 
     /// <summary>
-    /// Manual/production helper V15.2: Relay 1 JIG chỉ được pulse đúng một lần.
-    /// Dù delay bị hủy hoặc board phát sinh exception, finally vẫn cố đưa toàn bộ relay về OFF.
+    /// Universal Tester New: OUTPUT JIG chỉ được pulse đúng một lần.
+    /// Dù delay bị hủy hoặc board phát sinh exception, finally vẫn cố đưa toàn bộ OUTPUT về OFF.
     /// </summary>
     public Task PulseJigRelayAsync(CancellationToken ct = default)
     {
         int relay = ConfiguredJigRelay;
-        string relayName = $"R{relay} JIG";
+        string relayName = "RELAY 1 / OUT0 JIG";
         return _production.JigEjectRelayEnabled
-            ? PulseRelaySafeAsync(relay, PulseDurationForRelay(relay), relayName, ct)
+            ? PulseRelaySafeAsync(relay, Math.Clamp(_production.Relay1JigPulseMs, 50, 5_000), relayName, ct)
             : SkipDisabledRelayAsync(relayName, ct);
     }
 
-    /// <summary>Relay MARKING theo kiểu đấu máy chỉ được pulse đúng một lần và luôn trả về OFF.</summary>
+    /// <summary>OUTPUT MARKING được pulse đúng một lần và luôn chờ firmware xác nhận OFF.</summary>
     public Task PulseMarkingRelayAsync(CancellationToken ct = default)
     {
         int relay = ConfiguredMarkingRelay;
-        string relayName = $"R{relay} MARKING";
+        string relayName = "RELAY 5 / OUT4 MARKING";
         return _production.PassMarkingRelayEnabled
-            ? PulseRelaySafeAsync(relay, PulseDurationForRelay(relay), relayName, ct)
+            ? PulseRelaySafeAsync(relay, Math.Clamp(_production.Relay2MarkingPulseMs, 50, 5_000), relayName, ct)
             : SkipDisabledRelayAsync(relayName, ct);
     }
 
     /// <summary>Thử đúng relay vật lý theo số, không áp dụng ánh xạ vai trò production.</summary>
     public Task PulsePhysicalRelayAsync(int relay, CancellationToken ct = default)
     {
-        if (relay is < 1 or > 2)
-            throw new ArgumentOutOfRangeException(nameof(relay), relay, "Relay vật lý phải là 1 hoặc 2.");
+        if (!JbzBoardTransportAdapter.IsPhysicalRelayOutput(relay))
+            throw new ArgumentOutOfRangeException(nameof(relay), relay,
+                "Only physical Relay 1 (OUT0) and Relay 5 (OUT4) are valid.");
 
-        return PulseRelaySafeAsync(relay, PulseDurationForRelay(relay), $"R{relay} MANUAL", ct);
+        int duration = relay == ConfiguredMarkingRelay
+            ? _production.Relay2MarkingPulseMs
+            : _production.Relay1JigPulseMs;
+        return PulseRelaySafeAsync(relay, duration, relay == 0 ? "RELAY 1 / OUT0 MANUAL" : "RELAY 5 / OUT4 MANUAL", ct);
     }
 
-    private int ConfiguredJigRelay => _production.RelayWiringMode == 1 ? 2 : 1;
-    private int ConfiguredMarkingRelay => _production.RelayWiringMode == 1 ? 1 : 2;
-    private int PulseDurationForRelay(int relay) => relay == 2
-        ? _production.Relay2MarkingPulseMs
-        : _production.Relay1JigPulseMs;
+    private int ConfiguredJigRelay => JbzBoardTransportAdapter.Relay1OutputChannel;
+    private int ConfiguredMarkingRelay => JbzBoardTransportAdapter.Relay5OutputChannel;
 
     /// <summary>
-    /// V12.9.5: eject riêng cho Master Sample. Chỉ Relay 1 JIG được pulse;
+    /// Eject riêng cho Master Sample. Chỉ OUTPUT JIG đã cấu hình được pulse;
     /// tuyệt đối không MARKING và không dùng behavior Product FAIL.
     /// </summary>
     public Task EjectMasterSampleAsync(CancellationToken ct = default)
@@ -2680,11 +3212,11 @@ public sealed class TestEngine : IDisposable
         {
             // Luôn bắt đầu từ trạng thái OFF để không kế thừa trạng thái relay trước đó.
             await ForceAllRelaysOffAsync(relayName + " PRE", ct);
-            string relayMarker = relay == MarkingRelay
-                ? "T_RELAY2"
-                : relay == JigEjectRelay
-                    ? "T_RELAY1"
-                    : $"T_RELAY{relay}";
+            string relayMarker = relay == ConfiguredMarkingRelay
+                ? "T_OUTPUT_MARKING"
+                : relay == ConfiguredJigRelay
+                    ? "T_OUTPUT_JIG"
+                    : $"T_OUTPUT_{relay}";
             AsyncFileLogService.Current.Performance(
                 $"PASS_LATENCY {relayMarker}_START relay={relay} name=\"{relayName}\" pulse_ms={pulseMs}");
             await _board.SetRelayAsync(relay, ct);
@@ -2697,11 +3229,11 @@ public sealed class TestEngine : IDisposable
             {
                 // CancellationToken của cycle có thể đã cancel. Safe-OFF vẫn phải cố chạy độc lập.
                 await ForceAllRelaysOffAsync(relayName + " POST", CancellationToken.None);
-                string relayMarker = relay == MarkingRelay
-                    ? "T_RELAY2"
-                    : relay == JigEjectRelay
-                        ? "T_RELAY1"
-                        : $"T_RELAY{relay}";
+                string relayMarker = relay == ConfiguredMarkingRelay
+                    ? "T_OUTPUT_MARKING"
+                    : relay == ConfiguredJigRelay
+                        ? "T_OUTPUT_JIG"
+                        : $"T_OUTPUT_{relay}";
                 AsyncFileLogService.Current.Performance(
                     $"PASS_LATENCY {relayMarker}_END relay={relay} name=\"{relayName}\"");
                 AsyncFileLogService.Current.Test($"RELAY {relayName} OFF - safe idle");
@@ -2785,8 +3317,8 @@ public sealed class TestEngine : IDisposable
         ArgumentNullException.ThrowIfNull(steps);
 
         ResistanceStep[] enabledSteps = steps
-            .Where(step => step.Channel is >= D2xxResistanceRouting.MinChannel and
-                <= D2xxResistanceRouting.MaxChannel)
+            .Where(step => step.Channel is >= ResistanceMeasurementPlan.MinChannel and
+                <= ResistanceMeasurementPlan.MaxChannel)
             .ToArray();
         if (enabledSteps.Length == 0)
             return [];
@@ -2809,12 +3341,12 @@ public sealed class TestEngine : IDisposable
                 ct.ThrowIfCancellationRequested();
 
                 // Production Settings là nguồn duy nhất cho danh sách bước,
-                // kênh vật lý và giới hạn Min/Max. Route phần cứng lấy từ
-                // Selector D2XX được dựng canonical trực tiếp từ Channel,
+                // kênh vật lý và giới hạn Min/Max. Kênh điện trở UART lấy trực tiếp
+                // từ Channel trong Production Settings;
                 // không phụ thuộc block resistance THT hay RouteA/RouteB cũ.
                 AsyncFileLogService.Current.Test(
                     $"[AUTO-R] {step.Name} enabled=true channel={step.Channel} " +
-                    $"selector=0x{D2xxResistanceRouting.ToResistanceSelector(step.Channel):X2}");
+                    $"uart_channel={step.Channel}");
                 await _board.SelectResistanceRouteAsync(step, ct);
 
                 var measuring = new ResistanceResult
@@ -3049,9 +3581,9 @@ public sealed class TestEngine : IDisposable
         if (relayStartDelayMs > 0)
             await Task.Delay(relayStartDelayMs, ct);
 
-        // Vai trò relay lấy từ kiểu đấu của từng máy. Dù R1/R2 bị đảo vật lý,
-        // production PASS luôn MARKING trước rồi mới mở JIG. Master/FAIL chỉ
-        // gọi relay mở JIG và không đi vào chuỗi MARKING.
+        // Universal Tester New dùng channel OUTPUT 0..4 cấu hình trực tiếp.
+        // Production PASS luôn MARKING trước rồi mới mở JIG. Master/FAIL chỉ
+        // gọi OUTPUT mở JIG và không đi vào chuỗi MARKING.
         await _board.AllRelaysOffAsync(ct);
 
         bool runMarking = markingEnabled && _production.PassMarkingRelayEnabled;

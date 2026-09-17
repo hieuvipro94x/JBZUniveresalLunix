@@ -1,7 +1,7 @@
 using System.Windows;
 using System.Windows.Input;
 
-namespace JBZUniversalTester.Views;
+namespace JBZUniveresalLunix.Views;
 
 public partial class ProbeMaintenanceResetWindow : Window
 {

@@ -1,9 +1,9 @@
 using System.IO;
 using System.Globalization;
 using System.Text;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public static class EplLabelService
 {

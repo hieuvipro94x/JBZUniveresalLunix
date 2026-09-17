@@ -1,8 +1,8 @@
 using System.Threading.Channels;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 using Microsoft.Data.Sqlite;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 /// <summary>
 /// Serialized production persistence boundary. All mutations are executed by

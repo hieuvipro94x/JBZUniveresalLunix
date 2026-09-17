@@ -1,4 +1,4 @@
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 /// <summary>
 /// Rejects callbacks from an older runtime, product cycle, D2XX scan session or

@@ -1,6 +1,6 @@
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public enum ScanHealthState
 {
@@ -156,6 +156,12 @@ public sealed class ScanSupervisor
             await _board.StartScanAsync(BoardScanMode.Production, ct);
         MarkStartCommandCompleted();
 
+        if (!_board.ProducesPassiveScanFrames)
+        {
+            _log($"START_SCAN OK sau {reason}: UART scan chờ sự kiện sản phẩm, không chờ frame rỗng.");
+            return;
+        }
+
         ScanFrame frame = await WaitForFirstFrameAsync(
             firstFrame,
             baselineFrameCount,
@@ -176,10 +182,12 @@ public sealed class ScanSupervisor
         {
             long now = _timeProvider.GetTimestamp();
             stalled = SnapshotUnsafe(now);
-            bool startTimedOut = _healthState == ScanHealthState.Starting &&
+            bool startTimedOut = _board.ProducesPassiveScanFrames &&
+                                 _healthState == ScanHealthState.Starting &&
                                  _startCommandCompletedAt >= 0 &&
                                  ElapsedMilliseconds(_startCommandCompletedAt, now) > startFrameTimeoutMs;
-            bool monitoringTimedOut = _healthState == ScanHealthState.Monitoring &&
+            bool monitoringTimedOut = _board.ProducesPassiveScanFrames &&
+                                      _healthState == ScanHealthState.Monitoring &&
                                       _lastCompleteFrameAt >= 0 &&
                                       ElapsedMilliseconds(_lastCompleteFrameAt, now) > monitoringStallTimeoutMs;
             bool stoppedUnexpectedly = _healthState == ScanHealthState.Monitoring && !_board.IsScanning;
@@ -255,6 +263,11 @@ public sealed class ScanSupervisor
                 "soft-recovery");
             await _board.StartScanAsync(mode, recoveryToken);
             MarkStartCommandCompleted();
+            if (!_board.ProducesPassiveScanFrames)
+            {
+                _log("SCAN_RECOVERY success level=soft; UART scan waits for product events.");
+                return true;
+            }
             ScanFrame frame = await WaitForFirstFrameAsync(
                 firstFrame,
                 baseline,
@@ -296,6 +309,11 @@ public sealed class ScanSupervisor
                 "reopen-recovery");
             await _board.StartScanAsync(mode, recoveryToken);
             MarkStartCommandCompleted();
+            if (!_board.ProducesPassiveScanFrames)
+            {
+                _log("SCAN_RECOVERY success level=reopen; UART scan waits for product events.");
+                return true;
+            }
             ScanFrame frame = await WaitForFirstFrameAsync(
                 firstFrame,
                 baseline,
@@ -372,11 +390,21 @@ public sealed class ScanSupervisor
 
     private void MarkStartCommandCompleted()
     {
+        bool passive = _board.ProducesPassiveScanFrames;
         lock (_healthGate)
         {
             _startCommandCompletedAt = _timeProvider.GetTimestamp();
             _stateEnteredAt = _startCommandCompletedAt;
+            if (!passive)
+            {
+                _healthState = ScanHealthState.Monitoring;
+                _healthReason = "uart-event-scan-active";
+                _firstFrameWaiter?.TrySetCanceled();
+                _firstFrameWaiter = null;
+            }
         }
+        if (!passive)
+            _log("SCAN_HEALTH state=Monitoring reason=uart-event-scan-active");
     }
 
     private async Task<ScanFrame> WaitForFirstFrameAsync(

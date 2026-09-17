@@ -1,4 +1,4 @@
-<Window x:Class="JBZUniversalTester.Views.FaultConfirmationWindow"
+<Window x:Class="JBZUniveresalLunix.Views.FaultConfirmationWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Sản phẩm không đạt"

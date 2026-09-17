@@ -1,6 +1,6 @@
 # Project Overview
 
-JBZUniversalTester is a Windows production harness tester for JBZ wiring products. The current .NET application is WPF on .NET 8 for Windows x86, with self-tests in `Tests/`.
+JBZUniveresalLunix is a Windows production harness tester for JBZ wiring products. The current .NET application is WPF on .NET 8 for Windows x86, with self-tests in `Tests/`.
 
 The production board backend is FTDI D2XX: scan frames, `.tht` model files, PC-side `TestEngine`, D2XX card capacity and relay behavior. The Leak machine and label printer use their own independent Windows COM connections and must not be mixed with the D2XX board lifecycle.
 
@@ -16,8 +16,8 @@ Current source code is the final source of truth. If docs and source conflict, i
 
 # Important Modules
 
-- `JBZUniversalTester.csproj`: main WPF app project.
-- `Tests/JBZUniversalTester.SelfTests.csproj`, `Tests/Program.cs`: self-test harness.
+- `JBZUniveresalLunix.csproj`: main WPF app project.
+- `Tests/JBZUniveresalLunix.SelfTests.csproj`, `Tests/Program.cs`: self-test harness.
 - `Models/ProductModel.cs`, `Models/TestModels.cs`: neutral model/result DTOs.
 - `Models/ProductBundle.cs`: D2XX product bundle mapping.
 - `Models/BoardMode.cs`, `Models/ProductionSettings.cs`: production configuration surface.
@@ -118,7 +118,7 @@ A task is not done just because compile passes. Verification must match the risk
 
 These rules are CRITICAL for every change that touches History, SQLite schema, migration, indexing, filtering, pagination, export, production persistence, or test-result timestamps.
 
-- Preserve all existing production history. Never solve a migration/history bug by deleting, resetting, recreating, or replacing the real `JBZUniversalTester.db`.
+- Preserve all existing production history. Never solve a migration/history bug by deleting, resetting, recreating, or replacing the real `JBZUniveresalLunix.db`.
 - Do not run destructive operations such as `DROP TABLE Tests`, `DELETE FROM Tests`, bulk replacement of production history, or any migration that can reduce history row counts unless the task explicitly requires it and a verified backup/restore plan exists.
 - Preserve `Tests`, `TestFaults`, `ResistanceMeasurements`, `WaterProofMeasurements`, Master history, `CycleId`, `PartId`, `ModelId`, and their relationships.
 - Legacy rows must remain queryable, visible, filterable, sortable, and exportable after upgrades.

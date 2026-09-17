@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using Microsoft.Data.Sqlite;
 
-namespace JBZUniversalTester.SelfTests;
+namespace JBZUniveresalLunix.SelfTests;
 
 internal static class DatabaseBenchmark
 {

@@ -1,8 +1,8 @@
 using System.IO;
 using System.Text.Json;
-using JBZUniversalTester.Models;
+using JBZUniveresalLunix.Models;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public static class TopologyLearningService
 {
@@ -11,67 +11,16 @@ public static class TopologyLearningService
         WriteIndented = true
     };
 
+    // Universal Tester New exposes probe contact with TESTPIN, not inside the
+    // continuity ScanFrame. The topology-learning observer therefore never
+    // attempts to infer probe pins from OPEN/CIRCUIT data.
     public static IReadOnlyList<int> FindProbeContactIo(
         ScanFrame frame,
-        BoardCapacity capacity)
-    {
-        ArgumentNullException.ThrowIfNull(frame);
-        ArgumentNullException.ThrowIfNull(capacity);
+        BoardCapacity capacity) => [];
 
-        if (frame.Mode != BoardScanMode.Production || !frame.Complete || frame.UnknownBytes != 0)
-            return [];
-
-        int[] activeIo = frame.ActiveIo
-            .Where(capacity.ContainsGlobalIo)
-            .Distinct()
-            .ToArray();
-
-        // Một đầu dò chỉ xác định một IO. Từ hai IO active trở lên là một
-        // quan hệ continuity cần đưa sang bảng kết nối, không phải hai đầu dò.
-        if (activeIo.Length != 1)
-            return [];
-
-        return ProbeContactClassifier
-            .DetectMany(frame, model: null, maxContacts: 1, boardCapacity: capacity)
-            .Select(detection => detection.Io)
-            .Where(io => io == activeIo[0])
-            .Distinct()
-            .OrderBy(io => io)
-            .ToArray();
-    }
-
-    /// <summary>
-    /// Kết quả quan sát vật lý dùng chung với cửa sổ QUÉT/HỌC MÃ:
-    /// một active IO là tác động trực tiếp; từ hai active IO trở lên lấy đúng
-    /// các thành phần continuity mà BuildSnapshot đang hiển thị.
-    /// Chỉ mở nhánh continuity khi frame có chữ ký fan-in Probe mạnh, nên một
-    /// cạnh sản phẩm/wrong wiring thông thường không bị lấy khỏi TestEngine.
-    /// </summary>
     public static IReadOnlyList<int> FindProbeObservationIo(
         ScanFrame frame,
-        BoardCapacity capacity)
-    {
-        IReadOnlyList<int> direct = FindProbeContactIo(frame, capacity);
-        if (direct.Count > 0)
-            return direct;
-
-        if (frame.ActiveIo.Count < 2 ||
-            ProbeContactClassifier.DetectMany(
-                frame,
-                model: null,
-                maxContacts: Math.Max(2, frame.ActiveIo.Count),
-                boardCapacity: capacity).Count == 0)
-        {
-            return [];
-        }
-
-        return BuildSnapshot(frame, capacity).Networks
-            .SelectMany(network => network.Ios)
-            .Where(capacity.ContainsGlobalIo)
-            .Distinct()
-            .OrderBy(io => io)
-            .ToArray();
-    }
+        BoardCapacity capacity) => [];
 
     public static LearnedTopologySnapshot BuildSnapshot(ScanFrame frame, BoardCapacity capacity)
     {
@@ -86,8 +35,6 @@ public static class TopologyLearningService
             .Where(capacity.ContainsGlobalIo)
             .Distinct()
             .ToHashSet();
-        HashSet<int> probeContactIo = FindProbeContactIo(frame, capacity).ToHashSet();
-        activeIo.ExceptWith(probeContactIo);
 
         int Find(int value)
         {

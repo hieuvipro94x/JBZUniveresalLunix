@@ -3,11 +3,11 @@ setlocal EnableExtensions
 chcp 65001 >nul
 cd /d "%~dp0"
 
-title JBZUniversalTester V12.9.5 - Verify and Build
+title JBZUniveresalLunix V12.9.5 - Verify and Build
 set "LOG=verify_build_V12.9.5.log"
 
 echo ============================================================ > "%LOG%"
-echo JBZUniversalTester V12.9.5 VERIFY BUILD >> "%LOG%"
+echo JBZUniveresalLunix V12.9.5 VERIFY BUILD >> "%LOG%"
 echo Date: %DATE% %TIME% >> "%LOG%"
 echo ============================================================ >> "%LOG%"
 
@@ -25,11 +25,11 @@ dotnet --version >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 echo [2/4] Restore
-dotnet restore "JBZUniversalTester.csproj" -r win-x86 --nologo >> "%LOG%" 2>&1
+dotnet restore "JBZUniveresalLunix.csproj" -r win-x86 --nologo >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 echo [3/4] Build Release win-x86
-dotnet build "JBZUniversalTester.csproj" -c Release -r win-x86 --no-restore --nologo >> "%LOG%" 2>&1
+dotnet build "JBZUniveresalLunix.csproj" -c Release -r win-x86 --no-restore --nologo >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 echo [4/4] Publish one-file

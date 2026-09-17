@@ -1,15 +1,15 @@
-﻿using System.IO;
+using System.IO;
 using System.IO.Ports;
 using System.Text.RegularExpressions;
 using System.Text;
 using System.Diagnostics;
 using System.Windows;
 using System.Windows.Controls;
-using JBZUniversalTester.Models;
-using JBZUniversalTester.Services;
-using JBZUniversalTester.ViewModels;
+using JBZUniveresalLunix.Models;
+using JBZUniveresalLunix.Services;
+using JBZUniveresalLunix.ViewModels;
 
-namespace JBZUniversalTester.Views;
+namespace JBZUniveresalLunix.Views;
 
 /// <summary>
 /// V12.9: trang Cài đặt nhúng trực tiếp trong MainWindow. Không tạo Window,
@@ -167,7 +167,7 @@ public partial class ProductionSettingsPage : UserControl
         if (_vm.Settings.ExpansionCardCount <= 0)
         {
             _vm.Settings.ExpansionCardCount =
-                BoardIoDecoder.ExpansionCardCountFromScanCards(_vm.Settings.CardCount);
+                Math.Clamp(_vm.Settings.CardCount, 1, BoardCapacity.MaxExpansionCardCount);
         }
 
         _vm.Settings.ExpansionCardCount = Math.Clamp(
@@ -185,11 +185,8 @@ public partial class ProductionSettingsPage : UserControl
 
         IoConfirm1ComboBox.ItemsSource = Enumerable.Range(0, 128).ToArray();
         IoConfirmNComboBox.ItemsSource = Enumerable.Range(0, 32).ToArray();
-        RelayWiringModeComboBox.ItemsSource = new[]
-        {
-            new RelayWiringOption(0, "R2 MARK → R1 JIG • FAIL R1"),
-            new RelayWiringOption(1, "R1 MARK → R2 JIG • FAIL R2")
-        };
+        // Universal Tester New relay mapping is fixed by hardware/firmware:
+        // Relay 1 = OUT0, Relay 5 = OUT4. No user-selectable relay channel list.
     }
 
     private void CardIoComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
@@ -386,7 +383,7 @@ public partial class ProductionSettingsPage : UserControl
                 EncoderFallback.ExceptionFallback,
                 DecoderFallback.ExceptionFallback);
             string extension = request.Profile.Mode == LabelPrintMode.RawZpl ? ".zpl" : ".txt";
-            string directory = Path.Combine(Path.GetTempPath(), "JBZUniversalTester", "LabelPreview");
+            string directory = Path.Combine(Path.GetTempPath(), "JBZUniveresalLunix", "LabelPreview");
             Directory.CreateDirectory(directory);
             string path = Path.Combine(directory, $"PREVIEW_{SafeFileName(request.Profile.Id)}_LOT{request.Data.LotNo}{extension}");
             File.WriteAllBytes(path, encoding.GetBytes(request.Payload));
@@ -430,7 +427,7 @@ public partial class ProductionSettingsPage : UserControl
         if (string.IsNullOrWhiteSpace(thtPath) || !File.Exists(thtPath))
             throw new FileNotFoundException("Chưa có file THT hiện tại để dựng dữ liệu tem.", thtPath);
 
-        ProductModel model = new ThtModelParser().Load(thtPath);
+        ProductModel model = new JbzModelParser().Load(thtPath);
         DateTime now = DateTime.Now;
         var history = new TestHistoryRecord
         {
@@ -639,29 +636,27 @@ public partial class ProductionSettingsPage : UserControl
 
         if (_vm.Settings.Relay1JigPulseMs is < 50 or > 5000)
         {
-            error = "R1 JIG phải từ 50 đến 5000 ms.";
+            error = "Thời gian pulse OUTPUT mở JIG phải từ 50 đến 5000 ms.";
             return false;
         }
 
         if (_vm.Settings.Relay2MarkingPulseMs is < 50 or > 5000)
         {
-            error = "R2 MARKING phải từ 50 đến 5000 ms.";
+            error = "Thời gian pulse OUTPUT MARKING phải từ 50 đến 5000 ms.";
             return false;
         }
 
         if (_vm.Settings.PassMarkingToJigDelayMs is < 0 or > 5000)
         {
-            error = "Delay PASS từ R2 sang R1 phải từ 0 đến 5000 ms.";
+            error = "Delay PASS từ OUTPUT MARKING sang OUTPUT JIG phải từ 0 đến 5000 ms.";
             return false;
         }
 
-        if (_vm.Settings.RelayWiringMode is < 0 or > 1)
-        {
-            error = "Hãy chọn đúng kiểu đấu Relay MARKING và Relay mở JIG của máy.";
-            return false;
-        }
-
-        _vm.Settings.StampDelay = $"{_vm.Settings.Relay1JigPulseMs},{_vm.Settings.Relay2MarkingPulseMs}"; // compatibility
+        // Fixed physical mapping: Relay 1 = OUT0 (JIG), Relay 5 = OUT4 (MARKING).
+        _vm.Settings.JigRelayChannel = JbzBoardTransportAdapter.Relay1OutputChannel;
+        _vm.Settings.MarkingRelayChannel = JbzBoardTransportAdapter.Relay5OutputChannel;
+        _vm.Settings.FaultJigRelayNumber = 1;
+        _vm.Settings.StampDelay = $"{_vm.Settings.Relay1JigPulseMs},{_vm.Settings.Relay2MarkingPulseMs}";
 
         if (_vm.Settings.Label.WidthMm <= 0 || _vm.Settings.Label.HeightMm <= 0)
         {
@@ -750,7 +745,7 @@ public partial class ProductionSettingsPage : UserControl
         foreach (ResistanceChannelEditor channel in _vm.ResistanceChannels)
         {
             if (channel.ChannelSelection is < ResistanceMeasurementPlan.DisabledChannel or
-                > D2xxResistanceRouting.MaxChannel)
+                > ResistanceMeasurementPlan.MaxChannel)
             {
                 error = $"Kênh của {channel.Name} phải nằm trong khoảng 0 đến 10.";
                 return false;
@@ -790,5 +785,4 @@ public partial class ProductionSettingsPage : UserControl
 
     private sealed record CardIoOption(int ExpansionCardCount, string Display);
     private sealed record ComPortOption(string PortName, string Display);
-    private sealed record RelayWiringOption(int Mode, string Display);
 }

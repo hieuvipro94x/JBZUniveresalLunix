@@ -1,17 +1,12 @@
-namespace JBZUniversalTester.Models;
+namespace JBZUniveresalLunix.Models;
 
+/// <summary>Production runtime supports only Universal Tester New over UART.</summary>
 public enum BoardMode
 {
-    Auto = 0,
-    D2xx = 1
+    JbzSerial = 2
 }
 
 public static class BoardModeCatalog
 {
-    public static string DisplayName(BoardMode mode) => mode switch
-    {
-        BoardMode.D2xx => "JBZ D2XX",
-        _ => "Tự động nhận dạng"
-    };
+    public static string DisplayName(BoardMode mode) => "JBZ UART";
 }
-

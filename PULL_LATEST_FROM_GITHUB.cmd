@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
-title JBZUniversalTester - Lay code moi nhat tu GitHub
+title JBZUniveresalLunix - Lay code moi nhat tu GitHub
 
 set "ROOT=%~dp0"
 set "TARGET_BRANCH=main"
@@ -16,7 +16,7 @@ if errorlevel 1 (
 )
 
 echo ============================================================
-echo JBZUniversalTester - LAY CODE MOI NHAT TU GITHUB
+echo JBZUniveresalLunix - LAY CODE MOI NHAT TU GITHUB
 echo ============================================================
 echo Thu muc:
 echo   %ROOT%

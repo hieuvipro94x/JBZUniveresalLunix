@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.IO;
 
-namespace JBZUniversalTester.Services;
+namespace JBZUniveresalLunix.Services;
 
 public class KeysightVisaService : IDisposable
 {

@@ -1,6 +1,6 @@
 using System.Reflection;
 
-namespace JBZUniversalTester.Versioning;
+namespace JBZUniveresalLunix.Versioning;
 
 /// <summary>
 /// Thông tin version thực tế đã được đóng vào assembly/EXE.
@@ -20,7 +20,7 @@ public sealed record AssemblyVersionInfo(
 
     public string FileTag => ProductVersion.Replace('.', '_');
 
-    public string VersionedExeName => "JBZUniversalTester.exe";
+    public string VersionedExeName => "JBZUniveresalLunix.exe";
 
     private static AssemblyVersionInfo Read(Assembly assembly)
     {
@@ -36,7 +36,7 @@ public sealed record AssemblyVersionInfo(
 
         string product = assembly
             .GetCustomAttribute<AssemblyProductAttribute>()?
-            .Product ?? "JBZUniversalTester";
+            .Product ?? "JBZUniveresalLunix";
 
         string title = assembly
             .GetCustomAttribute<AssemblyTitleAttribute>()?

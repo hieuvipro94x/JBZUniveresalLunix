@@ -1,7 +1,7 @@
-﻿@echo off
+@echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
-title JBZUniversalTester - Push Source GitHub
+title JBZUniveresalLunix - Push Source GitHub
 
 set "ROOT=%~dp0"
 set "TARGET_BRANCH=main"
@@ -15,7 +15,7 @@ if errorlevel 1 (
 )
 
 echo ============================================================
-echo JBZUniversalTester - TỔNG HỢP VÀ ĐẨY SOURCE LÊN GITHUB
+echo JBZUniveresalLunix - TỔNG HỢP VÀ ĐẨY SOURCE LÊN GITHUB
 echo ============================================================
 echo.
 
@@ -96,7 +96,7 @@ echo.
 
 git diff --cached --quiet
 if errorlevel 1 (
-    set "DEFAULT_MSG=Cập nhật source JBZUniversalTester"
+    set "DEFAULT_MSG=Cập nhật source JBZUniveresalLunix"
     set "COMMIT_MSG="
     set /p "COMMIT_MSG=Nhập nội dung commit, ENTER để dùng mặc định: "
     if "!COMMIT_MSG!"=="" set "COMMIT_MSG=!DEFAULT_MSG!"
