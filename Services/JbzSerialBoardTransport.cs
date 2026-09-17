@@ -80,7 +80,13 @@ public sealed class JbzSerialBoardTransport : IAsyncDisposable
         excluded.RemoveWhere(string.IsNullOrWhiteSpace);
         string preferredPort = preferred?.Trim() ?? string.Empty;
         if (preferredPort.Length > 0 && excluded.Contains(preferredPort))
-            throw new IOException($"{preferredPort} is reserved for the Leak machine or label printer.");
+        {
+            // A stale/duplicated saved preference must never block automatic
+            // discovery. Treat it only as a hint and scan the remaining COMs.
+            Log?.Invoke(this,
+                $"COM_PREFERRED_IGNORED port={preferredPort} reason=auxiliary-device-setting");
+            preferredPort = string.Empty;
+        }
 
         string[] candidates = CandidatePorts(preferredPort)
             .Where(port => !excluded.Contains(port))
@@ -294,22 +300,42 @@ public sealed class JbzSerialBoardTransport : IAsyncDisposable
             if (!IsConnected)
                 throw new IOException("JBZ board COM is not connected.");
 
+            // During normal scan firmware answers :STOP. During reset/bootloader
+            // transition the same original-software :STOP can produce BootLoader,
+            // BOOT or START PROCESS instead. Any of those is a JBZ-specific
+            // signature and is sufficient to identify a recovery candidate.
             Drain(JbzEventFamily.Stop);
-            Task<JbzBoardEvent> ack = WaitAsync(
-                JbzEventFamily.Stop,
-                TimeSpan.FromMilliseconds(900),
-                ct);
+            Drain(JbzEventFamily.Boot);
+
+            using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            probeCts.CancelAfter(TimeSpan.FromMilliseconds(900));
+            Task<JbzBoardEvent> stopAck = ReadQueueAsync(JbzEventFamily.Stop, probeCts.Token);
+            Task<JbzBoardEvent> bootAck = ReadQueueAsync(JbzEventFamily.Boot, probeCts.Token);
+
             await SendCoreAsync(":STOP", ct);
             try
             {
-                await ack;
-                Log?.Invoke(this, "FIRMWARE_RECOVERY_STOP_ACK");
+                Task<JbzBoardEvent> completed = await Task.WhenAny(stopAck, bootAck);
+                JbzBoardEvent signal = await completed;
+                probeCts.Cancel();
+
+                if (signal.Family == JbzEventFamily.Stop)
+                    Log?.Invoke(this, "FIRMWARE_RECOVERY_STOP_ACK");
+                else
+                    Log?.Invoke(this, $"FIRMWARE_RECOVERY_BOOT_SIGNATURE raw={signal.Raw}");
+
                 return true;
             }
-            catch (TimeoutException)
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
                 Log?.Invoke(this, "FIRMWARE_RECOVERY_STOP_NO_ACK");
                 return false;
+            }
+            finally
+            {
+                probeCts.Cancel();
+                try { await stopAck; } catch { }
+                try { await bootAck; } catch { }
             }
         }
         finally
