@@ -1,4 +1,4 @@
-using System.ComponentModel;
+﻿using System.ComponentModel;
 using System.IO;
 using System.Windows;
 using System.Windows.Input;
@@ -10,129 +10,251 @@ namespace JBZUniveresalLunix.Views;
 
 public partial class JbzPartSelectionWindow : Window
 {
+    private const string DefaultTitle = "NHẬP MÃ HÀNG";
+
     private readonly MainViewModel _main;
     private CancellationTokenSource? _uploadCts;
     private bool _preparing;
+    private bool _allowClose;
+    private bool _closeRequested;
 
     public JbzPartSelectionWindow(MainViewModel main)
     {
         _main = main;
         InitializeComponent();
-        PartBox.Focus();
+
+        ContentRendered += (_, _) =>
+        {
+            PartBox.Focus();
+            PartBox.SelectAll();
+        };
     }
 
-    private void PartBox_KeyDown(object sender, KeyEventArgs e)
+    private async void PartBox_KeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Enter) { e.Handled = true; UploadButton_Click(sender, e); }
+        if (e.Key != Key.Enter)
+            return;
+
+        e.Handled = true;
+        await LoadPartAsync();
     }
 
-    private async void UploadButton_Click(object sender, RoutedEventArgs e)
+    private async Task LoadPartAsync()
     {
-        if (_uploadCts is not null || _preparing) return;
-        _preparing = true;
+        if (_uploadCts is not null || _preparing)
+            return;
+
         string part = PartBox.Text.Trim();
+        if (string.IsNullOrWhiteSpace(part))
+        {
+            MessageBox.Show(
+                this,
+                "Vui lòng nhập mã hàng.",
+                "CHƯA NHẬP MÃ HÀNG",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            PartBox.Focus();
+            return;
+        }
+
+        _preparing = true;
+        PartBox.IsEnabled = false;
+        Cursor = Cursors.Wait;
+        Title = "ĐANG KIỂM TRA MÃ HÀNG...";
+
         JbzPartFiles files;
         try
         {
             files = JbzPartFileResolver.Resolve(part);
-            // Prove the model payload is compilable before asking the operator to upload.
+
+            // Kiểm tra model có thể biên dịch trước khi gửi bất kỳ lệnh nào xuống bo.
             _ = await Task.Run(() => JbzModelCompiler.Compile(files.ModelPath));
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or JbzModelCompileException)
         {
-            StatusText.Text = ex.Message;
-            MessageBox.Show(this, ex.Message, "KHÔNG TÌM THẤY MÃ HÀNG", MessageBoxButton.OK,
+            AsyncFileLogService.Current.Error($"MODEL_PREFLIGHT_FAIL part={part}: {ex}");
+
+            MessageBox.Show(
+                this,
+                $"Không thể sử dụng mã hàng {part}. Vui lòng kiểm tra lại mã hàng.",
+                "KHÔNG TÌM THẤY MÃ HÀNG",
+                MessageBoxButton.OK,
                 MessageBoxImage.Warning);
+
+            RestoreInput();
             return;
         }
         catch (Exception ex)
         {
             AsyncFileLogService.Current.Error($"MODEL_PREFLIGHT_FAIL part={part}: {ex}");
-            StatusText.Text = ex.Message;
-            MessageBox.Show(this, ex.Message, "LỖI ĐỌC MÃ HÀNG", MessageBoxButton.OK,
+
+            MessageBox.Show(
+                this,
+                "Không thể đọc mã hàng. Vui lòng kiểm tra lại.",
+                "LỖI ĐỌC MÃ HÀNG",
+                MessageBoxButton.OK,
                 MessageBoxImage.Error);
+
+            RestoreInput();
             return;
         }
-        finally { _preparing = false; }
+        finally
+        {
+            _preparing = false;
+        }
 
-        FilesText.Text = $"MODEL: {files.ModelPath}\nSETUP: {files.SetupPath}";
         if (!_main.Test.IsBoardIdentityVerified)
         {
-            StatusText.Text = "Bo UART chưa kết nối; chưa thể nạp mã hàng.";
-            MessageBox.Show(this, StatusText.Text, "BO CHƯA KẾT NỐI", MessageBoxButton.OK,
+            MessageBox.Show(
+                this,
+                "Bo UART chưa kết nối; chưa thể nạp mã hàng.",
+                "BO CHƯA KẾT NỐI",
+                MessageBoxButton.OK,
                 MessageBoxImage.Warning);
+
+            RestoreInput();
             return;
         }
-        if (MessageBox.Show(this,
-                $"BẮT BUỘC NẠP LẠI TOÀN BỘ mã hàng {files.PartNumber} xuống bo UART?\n\n{files.ModelPath}\n{files.SetupPath}",
-                "XÁC NHẬN NẠP MODEL", MessageBoxButton.YesNo,
-                MessageBoxImage.Question) != MessageBoxResult.Yes)
-            return;
+
+        // Chỉ hỏi khi đúng mã/model hiện tại đã được nạp trước đó.
+        // Mã mới: bấm Enter là nạp ngay, không có hộp xác nhận trung gian.
+        if (IsCurrentModel(files))
+        {
+            MessageBoxResult updateAgain = MessageBox.Show(
+                this,
+                $"Mã hàng {files.PartNumber} đang được sử dụng.\nBạn có muốn cập nhật lại xuống bo không?",
+                "CẬP NHẬT LẠI MÃ HÀNG",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+
+            if (updateAgain != MessageBoxResult.Yes)
+            {
+                RestoreInput();
+                return;
+            }
+        }
 
         _uploadCts = new CancellationTokenSource();
-        PartBox.IsEnabled = false; UploadButton.IsEnabled = false;
-        CancelButton.Content = "HỦY NẠP";
-        StatusText.Text = "Đang chuẩn bị nạp lại toàn bộ model xuống bo...";
-        UploadProgress.Value = 0; PercentText.Text = "0%";
+        PartBox.IsEnabled = false;
+        Cursor = Cursors.Wait;
+        Title = $"ĐANG NẠP {files.PartNumber}...";
+
         var progress = new Progress<JbzModelUploadProgress>(value =>
         {
-            UploadProgress.Value = value.Percent;
-            PercentText.Text = $"{value.Percent}%";
-            StatusText.Text = value.Percent == 100
-                ? "Đã nạp lại toàn bộ model và gửi RESET xuống bo."
-                : $"Đang nạp {value.Completed}/{value.Total}: {value.Command}";
+            Title = $"ĐANG NẠP {files.PartNumber} - {value.Percent}%";
         });
+
         bool loaded = false;
         try
         {
-            ProductModel? model = await _main.LoadModelAsync(files.ModelPath, progress, _uploadCts.Token);
+            ProductModel? model = await _main.LoadModelAsync(
+                files.ModelPath,
+                progress,
+                _uploadCts.Token);
+
             loaded = model is not null;
-            if (!loaded) StatusText.Text = "Chưa hoàn tất nạp mã hàng.";
         }
         catch (OperationCanceledException)
         {
-            StatusText.Text = _main.Test.IsDeviceFault
-                ? "Đã hủy khi đang nạp. Cần kết nối lại bo trước khi thử tiếp."
-                : "Đã hủy trước khi nạp; mã hàng hiện tại được giữ nguyên.";
+            if (!_closeRequested)
+            {
+                MessageBox.Show(
+                    this,
+                    "Đã hủy nạp mã hàng.",
+                    "ĐÃ HỦY",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+            }
         }
         catch (Exception ex)
         {
-            AsyncFileLogService.Current.Error($"MODEL_UPLOAD_FAIL part={files.PartNumber}: {ex}");
-            StatusText.Text = $"Nạp model thất bại: {ex.Message}";
-            MessageBox.Show(this, StatusText.Text, "LỖI NẠP MODEL", MessageBoxButton.OK,
+            AsyncFileLogService.Current.Error(
+                $"MODEL_UPLOAD_FAIL part={files.PartNumber}: {ex}");
+
+            MessageBox.Show(
+                this,
+                $"Không thể nạp mã hàng {files.PartNumber} xuống bo.",
+                "LỖI NẠP MODEL",
+                MessageBoxButton.OK,
                 MessageBoxImage.Error);
         }
         finally
         {
-            _uploadCts.Dispose(); _uploadCts = null;
-            PartBox.IsEnabled = true; UploadButton.IsEnabled = true;
-            CancelButton.Content = "ĐÓNG";
+            _uploadCts.Dispose();
+            _uploadCts = null;
         }
+
+        if (_closeRequested)
+        {
+            _allowClose = true;
+            Close();
+            return;
+        }
+
         if (loaded)
         {
-            UploadProgress.Value = 100; PercentText.Text = "100%";
-            StatusText.Text = $"Đã nạp lại toàn bộ mã hàng {files.PartNumber} xuống bo.";
             DialogResult = true;
+            return;
+        }
+
+        RestoreInput();
+    }
+
+    private bool IsCurrentModel(JbzPartFiles files)
+    {
+        string currentPart = _main.Test.PartNumber?.Trim() ?? string.Empty;
+        if (!string.IsNullOrWhiteSpace(currentPart) &&
+            string.Equals(currentPart, files.PartNumber, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        string? currentPath = _main.Test.CurrentModelPath;
+        if (string.IsNullOrWhiteSpace(currentPath))
+            return false;
+
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(currentPath),
+                Path.GetFullPath(files.ModelPath),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return string.Equals(
+                currentPath,
+                files.ModelPath,
+                StringComparison.OrdinalIgnoreCase);
         }
     }
 
-    private void CancelButton_Click(object sender, RoutedEventArgs e)
+    private void RestoreInput()
     {
-        if (_preparing) { StatusText.Text = "Đang kiểm tra file mã hàng..."; return; }
-        if (_uploadCts is not null)
-        {
-            _uploadCts.Cancel();
-            StatusText.Text = "Đang hủy lệnh nạp...";
-        }
-        else DialogResult = false;
+        Title = DefaultTitle;
+        Cursor = Cursors.Arrow;
+        PartBox.IsEnabled = true;
+        PartBox.Focus();
+        PartBox.SelectAll();
     }
 
     private void Window_Closing(object? sender, CancelEventArgs e)
     {
-        if (_preparing) { e.Cancel = true; StatusText.Text = "Đang kiểm tra file mã hàng..."; return; }
-        if (_uploadCts is null) return;
+        if (_allowClose)
+            return;
+
+        if (_preparing)
+        {
+            e.Cancel = true;
+            return;
+        }
+
+        if (_uploadCts is null)
+            return;
+
+        // Không còn nút HỦY riêng. Bấm X trong lúc nạp sẽ hủy an toàn rồi đóng.
+        _closeRequested = true;
         _uploadCts.Cancel();
-        StatusText.Text = "Đang hủy lệnh nạp...";
         e.Cancel = true;
     }
 }
