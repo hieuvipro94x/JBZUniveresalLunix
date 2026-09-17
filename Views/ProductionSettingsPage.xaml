@@ -1,4 +1,4 @@
-<UserControl x:Class="JBZUniveresalLunix.Views.ProductionSettingsPage"
+﻿<UserControl x:Class="JBZUniveresalLunix.Views.ProductionSettingsPage"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              Background="White"
@@ -383,17 +383,17 @@
                                  IsReadOnly="True"
                                  ToolTip="Ngưỡng thay Pin và counter được quản lý theo từng mã hàng trong PartCnt.txt."/>
 
-                        <TextBlock Grid.Row="1" Text="JIG pulse (ms)" Style="{StaticResource FieldLabelStyle}"/>
-                        <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding Settings.Relay1JigPulseMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                        <TextBlock Grid.Row="1" Text="PASSPEN đóng (ms)" Style="{StaticResource FieldLabelStyle}"/>
+                        <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding Settings.PassPenCloseMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
 
-                        <TextBlock Grid.Row="2" Text="MARK pulse (ms)" Style="{StaticResource FieldLabelStyle}"/>
-                        <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding Settings.Relay2MarkingPulseMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                        <TextBlock Grid.Row="2" Text="PASSPEN nhả (ms)" Style="{StaticResource FieldLabelStyle}"/>
+                        <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding Settings.PassPenReleaseMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
 
-                        <TextBlock Grid.Row="3" Text="PASS MARK - JIG" Style="{StaticResource FieldLabelStyle}"/>
-                        <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding Settings.PassMarkingToJigDelayMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                        <TextBlock Grid.Row="3" Text="UNCONNECT đóng (ms)" Style="{StaticResource FieldLabelStyle}"/>
+                        <TextBox Grid.Row="3" Grid.Column="1" Text="{Binding Settings.UnconnectCloseMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
 
-                        <TextBlock Grid.Row="4" Text="Bật mở JIG" Style="{StaticResource FieldLabelStyle}"/>
-                        <CheckBox Grid.Row="4" Grid.Column="1" IsChecked="{Binding Settings.JigEjectRelayEnabled, Mode=TwoWay}"/>
+                        <TextBlock Grid.Row="4" Text="UNCONNECT nhả (ms)" Style="{StaticResource FieldLabelStyle}"/>
+                        <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding Settings.UnconnectReleaseMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
 
                         <TextBlock Grid.Row="5" Text="Bật MARKING PASS" Style="{StaticResource FieldLabelStyle}"/>
                         <CheckBox Grid.Row="5" Grid.Column="1" IsChecked="{Binding Settings.PassMarkingRelayEnabled, Mode=TwoWay}"/>

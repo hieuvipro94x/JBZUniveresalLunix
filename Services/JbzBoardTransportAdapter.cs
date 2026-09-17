@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.Text;
 using JBZUniveresalLunix.Models;
 
@@ -32,6 +32,7 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
     private long _frames;
     private DateTime _lastFrameUtc;
     private int _maxIo;
+    private TaskCompletionSource<bool>? _passPenAck;
 
     public JbzBoardTransportAdapter(string preferredPort, ProductionSettings settings)
     {
@@ -437,6 +438,53 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
     /// :REMOVAL followed by :UNCONNECT.  :UNCONNECT is the only clean
     /// product-boundary event; CLEAR/OPEN/OTHER are live topology only.
     /// </summary>
+    /// <summary>
+    /// Verified original production PASS protocol:
+    /// :PASSPEN,close,release -> wait :PEN -> :UNCONNECT,close,release.
+    /// OUTPUTTEST is intentionally not used for automatic PASS.
+    /// </summary>
+    public async Task StartOriginalPassRemovalAsync(
+        int passPenCloseMs, int passPenReleaseMs,
+        int unconnectCloseMs, int unconnectReleaseMs,
+        CancellationToken ct = default)
+    {
+        await _modelOperationGate.WaitAsync(ct);
+        try
+        {
+            if (!IsConnected)
+                throw new IOException("Bo JBZ UART không kết nối khi chạy PASSPEN.");
+
+            var penAck = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _passPenAck = penAck;
+            string passPen = $":PASSPEN,{passPenCloseMs},{passPenReleaseMs}";
+            Log?.Invoke(this, $"PASS_ORIGINAL_TX command={passPen} waiting_for=PEN");
+            await _serial.PassPenAsync(passPenCloseMs, passPenReleaseMs, ct);
+
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            try
+            {
+                await penAck.Task.WaitAsync(timeout.Token);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                throw new TimeoutException("Timeout chờ firmware trả :PEN sau :PASSPEN.");
+            }
+            finally
+            {
+                if (ReferenceEquals(_passPenAck, penAck)) _passPenAck = null;
+            }
+
+            string unconnect = $":UNCONNECT,{unconnectCloseMs},{unconnectReleaseMs}";
+            Log?.Invoke(this, $"PASS_ORIGINAL_TX command={unconnect} after=PEN");
+            await _serial.UnconnectAsync(unconnectCloseMs, unconnectReleaseMs, ct);
+        }
+        finally
+        {
+            _modelOperationGate.Release();
+        }
+    }
+
     public async Task RequestProductRemovalAsync(
         int delayMilliseconds,
         int physicalPinCount,
@@ -688,6 +736,10 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
             case JbzEventFamily.TestPin:
                 if (IsConnected && !IsScanning) break;
                 PublishProbe(value);
+                break;
+            case JbzEventFamily.Pen:
+                Log?.Invoke(this, "PASS_ORIGINAL_RX event=PEN");
+                _passPenAck?.TrySetResult(true);
                 break;
             case JbzEventFamily.Removal:
                 // Verified JBZ_Windows behavior: REMOVAL is only an intermediate

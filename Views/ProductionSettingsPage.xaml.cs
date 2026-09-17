@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.IO.Ports;
 using System.Text.RegularExpressions;
 using System.Text;
@@ -631,6 +631,18 @@ public partial class ProductionSettingsPage : UserControl
         if (_vm.Settings.UsbDelay is < 1 or > 16)
         {
             error = "USB Delay phải từ 1 đến 16 ms.";
+            return false;
+        }
+
+        if (_vm.Settings.PassPenCloseMs is < 50 or > 5000 || _vm.Settings.PassPenReleaseMs is < 50 or > 5000)
+        {
+            error = "PASSPEN đóng/nhả phải từ 50 đến 5000 ms.";
+            return false;
+        }
+
+        if (_vm.Settings.UnconnectCloseMs is < 50 or > 5000 || _vm.Settings.UnconnectReleaseMs is < 50 or > 5000)
+        {
+            error = "UNCONNECT đóng/nhả phải từ 50 đến 5000 ms.";
             return false;
         }
 

@@ -2023,32 +2023,28 @@ public sealed class TestViewModel : ObservableObject
         Interlocked.Exchange(ref _wiringFaultHandlingStarted, 0);
         _engine.SetFrameProcessingEnabled(true);
 
-        if (_waitForFaultProductRemoval && _board is JbzBoardTransportAdapter jbzBoard)
+        if (_board is JbzBoardTransportAdapter jbzBoard)
         {
-            // Exact JBZ_Windows behavior after FAIL:
-            //   TX :UNCONNECT,500,<physical_pin_count>
-            //   RX :REMOVAL
-            //   RX :UNCONNECT   <-- only clean boundary
-            // Never START a new scan merely to detect removal.  Doing that starts a
-            // new electrical cycle and can legitimately produce another :OTHER,
-            // which is exactly what kept the previous implementation stuck.
             _scanSupervisor.Suspend("WaitingProductRemoval");
-            int physicalPinCount = _model is null
-                ? 0
-                : Math.Max(_model.Pins.Count, _model.MaxIo);
-            if (physicalPinCount <= 0)
-                throw new InvalidDataException("Không xác định được physical pin count để gửi :UNCONNECT.");
+            int u1 = Math.Clamp(_productionSettings.UnconnectCloseMs, 50, 5000);
+            int u2 = Math.Clamp(_productionSettings.UnconnectReleaseMs, 50, 5000);
+
+            if (!_waitForFaultProductRemoval)
+            {
+                int p1 = Math.Clamp(_productionSettings.PassPenCloseMs, 50, 5000);
+                int p2 = Math.Clamp(_productionSettings.PassPenReleaseMs, 50, 5000);
+                AsyncFileLogService.Current.Performance(
+                    $"PASS_ORIGINAL_BEGIN PASSPEN={p1},{p2} UNCONNECT={u1},{u2}");
+                State = "THÁO SẢN PHẨM";
+                await jbzBoard.StartOriginalPassRemovalAsync(p1, p2, u1, u2, ct);
+                AddLog($"PASS firmware: :PASSPEN,{p1},{p2} -> :PEN -> :UNCONNECT,{u1},{u2}; chờ :REMOVAL/:UNCONNECT.");
+                return;
+            }
 
             AsyncFileLogService.Current.Performance(
-                $"REMOVAL_HANDSHAKE_BEGIN reason={reason} delay_ms={JbzRemovalUnconnectDelayMilliseconds} " +
-                $"physical_pin_count={physicalPinCount} scanning={_board.IsScanning}");
-            await jbzBoard.RequestProductRemovalAsync(
-                JbzRemovalUnconnectDelayMilliseconds,
-                physicalPinCount,
-                ct);
-            AddLog(
-                $"THÁO SẢN PHẨM - đã gửi :UNCONNECT,{JbzRemovalUnconnectDelayMilliseconds},{physicalPinCount}; " +
-                "chờ firmware trả :REMOVAL rồi :UNCONNECT.");
+                $"REMOVAL_HANDSHAKE_BEGIN reason={reason} UNCONNECT={u1},{u2} scanning={_board.IsScanning}");
+            await jbzBoard.RequestProductRemovalAsync(u1, u2, ct);
+            AddLog($"THÁO SẢN PHẨM - đã gửi :UNCONNECT,{u1},{u2}; chờ firmware trả :REMOVAL rồi :UNCONNECT.");
             return;
         }
 
@@ -8854,7 +8850,7 @@ public sealed class TestViewModel : ObservableObject
                     $"PASS_LATENCY T_PASS_UI cycle={_activeCycleId}");
                 _sound.SetWiringFaultAlarm(false);
                 _sound.PlayTestOk();
-                AddLog("PASS - continuity/điện trở/kín nước theo cấu hình đã đạt; chuẩn bị chuỗi relay MARKING/JIG.");
+                AddLog("PASS - continuity/điện trở/kín nước đã đạt; chuẩn bị protocol firmware PASSPEN -> PEN -> UNCONNECT.");
             }
 
             TriggerPassUi();
@@ -8918,7 +8914,7 @@ public sealed class TestViewModel : ObservableObject
                 return;
             }
 
-            AddLog("Chuỗi PASS hoàn tất: " + PassRelaySequenceText() + " -> cả 2 relay vật lý OFF.");
+            AddLog("PASS logic đã xác nhận; chuyển quyền MARKING/JIG/removal cho firmware theo trace gốc.");
             RaiseTestStatistics();
 
             bool rearmAfterRemoval = ShouldRestartAfterPass(

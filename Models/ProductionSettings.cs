@@ -1,4 +1,4 @@
-namespace JBZUniveresalLunix.Models;
+﻿namespace JBZUniveresalLunix.Models;
 
 public sealed class ProductionSettings
 {
@@ -184,6 +184,18 @@ public sealed class ProductionSettings
 
     /// <summary>Khoảng chờ an toàn sau OUTPUT MARKING OFF trước OUTPUT JIG ON trong chu trình PASS.</summary>
     public int PassMarkingToJigDelayMs { get; set; } = 120;
+
+    /// <summary>Firmware production PASS: first PASSPEN timing parameter (trace default 300 ms).</summary>
+    public int PassPenCloseMs { get; set; } = 300;
+
+    /// <summary>Firmware production PASS: second PASSPEN timing parameter (trace default 200 ms).</summary>
+    public int PassPenReleaseMs { get; set; } = 200;
+
+    /// <summary>Firmware removal: first UNCONNECT timing parameter (trace default 400 ms).</summary>
+    public int UnconnectCloseMs { get; set; } = 400;
+
+    /// <summary>Firmware removal: second UNCONNECT timing parameter (trace default 200 ms).</summary>
+    public int UnconnectReleaseMs { get; set; } = 200;
 
     /// <summary>Compatibility V15.1 trở về trước: "R1,R2". V15.2 UI không còn dùng trực tiếp.</summary>
     public string StampDelay { get; set; } = "250,250";
