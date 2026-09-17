@@ -477,6 +477,143 @@ public sealed class TestViewModel : ObservableObject
         RaiseCenterPresentation();
     }
 
+    /// <summary>
+    /// Xóa toàn bộ presentation tạm của TestView nhưng không thay đổi model,
+    /// thống kê, LOT, kết nối UART hoặc ProductRemoved safety gate.
+    /// Mỗi lần mở/đóng TestWindow đều đi qua cùng một boundary để snapshot cũ
+    /// không thể dựng lại bảng trước khi có frame UART mới.
+    /// </summary>
+    private void ResetTestViewPresentation(string reason, bool armFreshFrameGate)
+    {
+        int rowsBefore = Faults.Count;
+        int faultsBefore = WiringFaultCount;
+        bool removalPending =
+            IsProductRemovalPending ||
+            CurrentProductionPhase == ProductionPhase.WaitingProductRemoval ||
+            _waitForProductRelease ||
+            _waitForFaultProductRemoval;
+
+        AsyncFileLogService.Current.Performance(
+            $"TEST_VIEW_RESET_BEGIN reason={reason} rows_before={rowsBefore} faults_before={faultsBefore} " +
+            $"product_state={CurrentProductionRuntimeState} removal_pending={removalPending}");
+
+        // Mọi callback/snapshot đã xếp hàng của phiên TestView cũ phải bị vô hiệu
+        // trước khi collection được xóa. Engine/hardware state không bị reset ở đây.
+        AdvanceProductionUiCycleEpoch();
+        Interlocked.Increment(ref _continuityPreviewUiRevision);
+        Interlocked.Exchange(ref _suppressProductionWireTableUntilNextJbzFrame, 1);
+        Interlocked.Exchange(ref _forceProductionWireTableReloadPending, 0);
+        Interlocked.Exchange(ref _stalePreCycleFrameLogged, 0);
+        _lastLiveTopologySnapshot = LiveTopologySnapshot.Empty();
+
+        ResetProductPresentationCycle();
+        ResetProbePresentation($"test-view-reset:{reason}");
+        SelectedOperationTabIndex = 0;
+        SynchronizeFaultRows(Array.Empty<FaultRow>());
+        RaiseActiveFault();
+
+        // Clear presentation state only. A committed PASS/FAIL that is still waiting
+        // for removal keeps WaitingProductRemoval/ProductRemoved authoritative.
+        if (!removalPending)
+        {
+            SetProductionRuntimeState(
+                ProductionRuntimeState.WaitingForProduct,
+                reason: reason);
+            SetProductionPresentationMode(
+                ProductionPresentationMode.Waiting,
+                0,
+                reason);
+        }
+
+        if (armFreshFrameGate)
+        {
+            long boundarySequence = Volatile.Read(ref _lastObservedProductionFrameSequence);
+            long boundaryGeneration = Volatile.Read(ref _lastObservedProductionScanGeneration);
+            Volatile.Write(ref _cycleStartFrameSequence, boundarySequence);
+            Volatile.Write(ref _cycleStartScanGeneration, boundaryGeneration);
+            Interlocked.Exchange(ref _freshFrameGateActive, boundarySequence > 0 ? 1 : 0);
+
+            AsyncFileLogService.Current.Performance(
+                $"TEST_VIEW_FRESH_GATE_ARMED active={boundarySequence > 0} sequence={boundarySequence} " +
+                $"generation={boundaryGeneration} reason={reason}");
+        }
+        else
+        {
+            // Khi TestView đã đóng, scan nền/removal monitor vẫn phải được xử lý.
+            // Chỉ presentation bị khóa; không được drop frame phần cứng vì UI không mở.
+            Interlocked.Exchange(ref _freshFrameGateActive, 0);
+        }
+
+        AsyncFileLogService.Current.Performance(
+            $"TEST_VIEW_TABLE_CLEARED reason={reason} rows={Faults.Count}");
+        AsyncFileLogService.Current.Performance(
+            $"TEST_VIEW_RESET_COMPLETE reason={reason} rows={Faults.Count} faults={WiringFaultCount} " +
+            $"presentation={CurrentProductionPresentationMode} removal_pending={removalPending}");
+    }
+
+    private bool TryAcceptFreshFrameForTestView(ScanFrame frame, string source)
+    {
+        if (Volatile.Read(ref _freshFrameGateActive) == 0)
+            return true;
+
+        long boundarySequence = Volatile.Read(ref _cycleStartFrameSequence);
+        long boundaryGeneration = Volatile.Read(ref _cycleStartScanGeneration);
+        bool sameScanSession = boundaryGeneration == 0 ||
+                               frame.ScanGeneration == 0 ||
+                               frame.ScanGeneration == boundaryGeneration;
+
+        bool stale = boundarySequence > 0 &&
+                     sameScanSession &&
+                     (frame.Sequence <= 0 || frame.Sequence <= boundarySequence);
+        if (stale)
+        {
+            if (Interlocked.CompareExchange(ref _stalePreCycleFrameLogged, 1, 0) == 0)
+            {
+                AsyncFileLogService.Current.Performance(
+                    $"STALE_UI_RENDER_BLOCKED source={source} seq={frame.Sequence} " +
+                    $"cycleStartSeq={boundarySequence} generation={frame.ScanGeneration}/{boundaryGeneration} " +
+                    $"complete={frame.Complete}");
+                if (frame.Complete)
+                {
+                    // Giữ telemetry cũ để self-test/audit hiện hữu không bị mất dấu.
+                    AsyncFileLogService.Current.Performance(
+                        $"PASS_GATE seq={frame.Sequence} cycleStartSeq={boundarySequence} " +
+                        $"generation={frame.ScanGeneration}/{boundaryGeneration} scanMode={frame.Mode} " +
+                        $"frameComplete={frame.Complete} reason=STALE_PRE_CYCLE_FRAME action=ignored");
+                }
+            }
+
+            return false;
+        }
+
+        Interlocked.Exchange(ref _freshFrameGateActive, 0);
+        AsyncFileLogService.Current.Performance(
+            $"FRESH_FRAME_ACCEPTED seq={frame.Sequence} cycleStartSeq={boundarySequence} " +
+            $"generation={frame.ScanGeneration}/{boundaryGeneration}");
+        AsyncFileLogService.Current.Performance(
+            $"FIRST_FRESH_FRAME_AFTER_TEST_VIEW_OPEN source={source} seq={frame.Sequence} " +
+            $"generation={frame.ScanGeneration}");
+        return true;
+    }
+
+    private bool TryReleaseTestViewWireTableGate(ScanFrame frame, string source)
+    {
+        bool removalMode =
+            CurrentProductionPhase == ProductionPhase.WaitingProductRemoval ||
+            IsProductRemovalPending ||
+            _waitForFaultProductRemoval ||
+            _waitForProductRelease;
+        if (removalMode)
+            return false;
+
+        if (Interlocked.Exchange(ref _suppressProductionWireTableUntilNextJbzFrame, 0) == 0)
+            return false;
+
+        AsyncFileLogService.Current.Performance(
+            $"TEST_VIEW_TABLE_RELOAD_BEGIN source={source} seq={frame.Sequence} generation={frame.ScanGeneration}");
+        return true;
+    }
+
     private bool IsProbeOwningProductionPresentation()
     {
         ProbePresentationState probeState = CurrentProbePresentationState;
@@ -3700,6 +3837,9 @@ public sealed class TestViewModel : ObservableObject
                 .ToArray();
         }
 
+        if (!TryAcceptFreshFrameForTestView(frame, $"PREVIEW_IO{sourceIo}"))
+            return true;
+
         long generation = Volatile.Read(ref _runtimeGeneration);
         long scanGeneration = Volatile.Read(ref _lastObservedProductionScanGeneration);
         bool removalMode =
@@ -3707,13 +3847,13 @@ public sealed class TestViewModel : ObservableObject
             IsProductRemovalPending ||
             _waitForFaultProductRemoval;
 
-        bool forceWireTableReload = false;
-        if (!removalMode &&
-            _board is JbzBoardTransportAdapter &&
-            Interlocked.Exchange(ref _suppressProductionWireTableUntilNextJbzFrame, 0) != 0)
+        bool forceWireTableReload = TryReleaseTestViewWireTableGate(
+            frame,
+            $"PREVIEW_IO{sourceIo}");
+        if (forceWireTableReload)
         {
-            forceWireTableReload = true;
             Interlocked.Exchange(ref _forceProductionWireTableReloadPending, 1);
+            // Giữ log cũ để trace/bộ test hiện hữu vẫn nhận ra clean-boundary reload.
             AsyncFileLogService.Current.Performance(
                 $"FAIL_UI_TABLE_RELOAD_BEGIN source=IO{sourceIo} seq={frame.Sequence}");
         }
@@ -4067,36 +4207,15 @@ public sealed class TestViewModel : ObservableObject
             {
                 Interlocked.Increment(ref _productionFramesReceived);
 
-                if (Volatile.Read(ref _freshFrameGateActive) != 0)
+                if (!TryAcceptFreshFrameForTestView(frame, "COMPLETE_FRAME"))
                 {
-                    long cycleStartSequence = Volatile.Read(ref _cycleStartFrameSequence);
-                    long cycleStartGeneration = Volatile.Read(ref _cycleStartScanGeneration);
-                    bool sameScanSession = cycleStartGeneration == 0 ||
-                                           frame.ScanGeneration == 0 ||
-                                           frame.ScanGeneration == cycleStartGeneration;
-                    if (cycleStartSequence > 0 &&
-                        sameScanSession &&
-                        frame.Sequence > 0 &&
-                        frame.Sequence <= cycleStartSequence)
-                    {
-                        if (Interlocked.CompareExchange(ref _stalePreCycleFrameLogged, 1, 0) == 0)
-                        {
-                            AsyncFileLogService.Current.Performance(
-                                $"PASS_GATE seq={frame.Sequence} cycleStartSeq={cycleStartSequence} " +
-                                $"generation={frame.ScanGeneration}/{cycleStartGeneration} scanMode={frame.Mode} " +
-                                $"frameComplete={frame.Complete} reason=STALE_PRE_CYCLE_FRAME action=ignored");
-                        }
-
-                        Interlocked.Increment(ref _productionFramesDropped);
-                        LogContinuousScanMetricsIfDue();
-                        return;
-                    }
-
-                    Interlocked.Exchange(ref _freshFrameGateActive, 0);
-                    AsyncFileLogService.Current.Performance(
-                        $"FRESH_FRAME_ACCEPTED seq={frame.Sequence} cycleStartSeq={cycleStartSequence} " +
-                        $"generation={frame.ScanGeneration}/{cycleStartGeneration}");
+                    Interlocked.Increment(ref _productionFramesDropped);
+                    LogContinuousScanMetricsIfDue();
+                    return;
                 }
+
+                bool forceWireTableReloadFromCompleteFrame =
+                    TryReleaseTestViewWireTableGate(frame, "COMPLETE_FRAME");
 
                 // Universal Tester New sends TESTPIN as an independent UART event.
                 // Continuity frames must never be re-classified as a probe frame.
@@ -4142,7 +4261,9 @@ public sealed class TestViewModel : ObservableObject
                 Interlocked.Increment(ref _productionFramesProcessed);
                 if (continuityPreviewCleared && !engineChanged)
                     QueueContinuityPreviewUi(generation);
-                if (!preserveProductionFaultsForProbe && restoreBoardPresentation && !engineChanged)
+                if (!preserveProductionFaultsForProbe &&
+                    (restoreBoardPresentation || forceWireTableReloadFromCompleteFrame) &&
+                    !engineChanged)
                 {
                     // UI đã xóa snapshot lúc đổi lifecycle. Frame đầu tiên của phiên mới
                     // phải dựng lại presentation kể cả topology vật lý không đổi.
@@ -5634,10 +5755,19 @@ public sealed class TestViewModel : ObservableObject
     /// </summary>
     public async Task StopViewAsync()
     {
-        if (!_board.ProducesPassiveScanFrames)
-            await _board.ResetClearAsync();
-        InvokeUi(ClearInlineProbeDisplay);
-        await StopTestAsync();
+        try
+        {
+            if (!_board.ProducesPassiveScanFrames)
+                await _board.ResetClearAsync();
+            InvokeUi(ClearInlineProbeDisplay);
+            await StopTestAsync();
+        }
+        finally
+        {
+            // Không để bảng/snapshot của TestView vừa đóng tồn tại tới lần mở sau.
+            // ProductRemoved/removal monitor vẫn được giữ bởi StopTestAsync.
+            ResetTestViewPresentation("TestViewClosed", armFreshFrameGate: false);
+        }
     }
 
     /// <summary>
@@ -5877,7 +6007,11 @@ public sealed class TestViewModel : ObservableObject
     /// Được TestWindow gọi tự động ngay sau khi người vận hành bấm
     /// "BẮT ĐẦU KIỂM TRA" tại MainWindow. Không còn nút Start I/O thứ hai.
     /// </summary>
-    public Task StartProductionTestAsync() => StartTestAsync();
+    public Task StartProductionTestAsync()
+    {
+        ResetTestViewPresentation("TestViewOpening", armFreshFrameGate: true);
+        return StartTestAsync();
+    }
 
     private async Task StartTestAsync()
     {
