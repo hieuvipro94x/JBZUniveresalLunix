@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.Windows;
 using JBZUniveresalLunix.Core;
 using JBZUniveresalLunix.Models;
@@ -68,9 +68,12 @@ public sealed class MainViewModel : ObservableObject
     public ProductionSettings ProductionSettings => _productionSettings;
     public JbzBoardTransportAdapter BoardTransport => _board;
 
-    // Universal Tester New reports/validates the physical model during upload;
-    // the legacy JBZ UART expansion-card gate no longer blocks model selection.
-    public bool HasEnoughCardsForModel => true;
+    // Legacy Htdrv gate: model chỉ được nạp/ARM khi dải I/O cấu hình đủ
+    // chứa I/O lớn nhất của model. Không được cắt model để ép vừa số card.
+    public bool HasEnoughCardsForModel =>
+        Model is not null &&
+        Model.MaxIo <= BoardCapacity.MaxGlobalIo &&
+        CurrentBoardCapacity.ContainsGlobalIo(Model.MaxIo);
 
     public HomeViewModel Home { get; }
     public TestViewModel Test { get; }
@@ -267,6 +270,40 @@ public sealed class MainViewModel : ObservableObject
             throw new InvalidDataException("Ứng dụng chỉ nhận file mã hàng .model của bo JBZ UART.");
         string? setupPath = JbzSetupParser.FindForModel(full);
         JbzSetupProfile? setup = setupPath is null ? null : JbzSetupParser.Load(setupPath, full);
+
+        // Preflight giống máy gốc: đọc TOÀN BỘ .model trước khi gửi :MODEL.
+        // Nếu model cần I/O ngoài dải card đang cấu hình thì báo ngay và tuyệt
+        // đối không gửi một phần PINDATA/CON xuống bo.
+        JbzCompiledModel candidate = await Task.Run(() => JbzModelCompiler.Compile(full), ct);
+        BoardCapacity capacity = CurrentBoardCapacity;
+        int candidateMaxIo = candidate.Product.MaxIo;
+        int requiredCards = BoardCapacity.RequiredScanUnitsForIo(candidateMaxIo);
+        bool modelWithinSystem = candidateMaxIo <= BoardCapacity.MaxGlobalIo;
+        bool modelWithinConfiguredCards = modelWithinSystem && capacity.ContainsGlobalIo(candidateMaxIo);
+
+        if (!modelWithinConfiguredCards)
+        {
+            string detail = !modelWithinSystem
+                ? $"Model yêu cầu IO{candidateMaxIo}, vượt giới hạn IO{BoardCapacity.MaxGlobalIo} của hệ thống."
+                : $"Model yêu cầu tối thiểu {requiredCards} card ({requiredCards * BoardCapacity.IoPerExpansionCard} I/O), " +
+                  $"nhưng máy đang cấu hình {capacity.ExpansionCardCount} card ({capacity.TotalIoCapacity} I/O).";
+
+            AsyncFileLogService.Current.Error(
+                $"MODEL_CARD_CAPACITY_BLOCK model={candidate.ModelName} max_io={candidateMaxIo} " +
+                $"required_cards={requiredCards} configured_cards={capacity.ExpansionCardCount} " +
+                $"configured_io={capacity.TotalIoCapacity} action=BLOCK_BEFORE_UART");
+
+            MessageBox.Show(
+                "KHÔNG ĐỦ CARD MỞ RỘNG\n\n" + detail +
+                "\n\nKiểm tra/lắp đủ card I/O mở rộng rồi thử lại.",
+                "Thiếu card I/O",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+
+            Status = "THIẾU CARD I/O - CHƯA NẠP MODEL";
+            return null;
+        }
+
         model = await Test.LoadSelectedModelFromPathAsync(full, progress, ct);
 
         if (model is null) return null;
