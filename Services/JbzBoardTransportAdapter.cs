@@ -152,85 +152,42 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
     private async Task<(string Port, string Idn, string? Model)?> TryRecoverStuckStartupPortAsync(
         CancellationToken ct)
     {
-        // BoardPortName is only a startup optimization. It is NEVER required.
-        // When it is empty/stale, scan every available COM and recover only a
-        // port that proves it speaks the JBZ protocol (:STOP/BOOT or valid IDN).
         string preferred = _preferredPort?.Trim() ?? string.Empty;
         if (preferred.Length == 0)
             preferred = _settings.BoardPortName?.Trim() ?? string.Empty;
 
-        string[] present = JbzSerialBoardTransport.CandidatePorts();
+        var excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(_settings.WaterProofMachine.PortName))
+            excluded.Add(_settings.WaterProofMachine.PortName.Trim());
+        if (!string.IsNullOrWhiteSpace(_settings.Label.PrinterCom))
+            excluded.Add(_settings.Label.PrinterCom.Trim());
+
+        string[] present = JbzSerialBoardTransport.CandidatePorts(preferred.Length == 0 ? null : preferred)
+            .Where(p => !excluded.Contains(p))
+            .ToArray();
         if (present.Length == 0)
         {
-            Log?.Invoke(this, "BOARD_CONNECT_RECOVERY_AUTO_SKIP reason=no-windows-com-port");
-            return null;
-        }
-
-        var excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        string waterproof = _settings.WaterProofMachine.PortName?.Trim() ?? string.Empty;
-        string printer = _settings.Label.PrinterCom?.Trim() ?? string.Empty;
-        if (waterproof.Length > 0) excluded.Add(waterproof);
-        if (printer.Length > 0) excluded.Add(printer);
-
-        var candidates = new List<string>();
-        // Try the last verified board first when it still exists. A remembered
-        // board port wins even if another setting accidentally duplicates it.
-        if (preferred.Length > 0 &&
-            present.Contains(preferred, StringComparer.OrdinalIgnoreCase) &&
-            !excluded.Contains(preferred))
-        {
-            candidates.Add(preferred);
-        }
-        else if (preferred.Length > 0 && excluded.Contains(preferred))
-        {
-            Log?.Invoke(this,
-                $"BOARD_CONNECT_RECOVERY_AUTO_PREFERRED_IGNORED port={preferred} reason=auxiliary-device-setting");
-        }
-
-        foreach (string port in present)
-        {
-            if (candidates.Contains(port, StringComparer.OrdinalIgnoreCase))
-                continue;
-            if (excluded.Contains(port))
-            {
-                Log?.Invoke(this,
-                    $"BOARD_CONNECT_RECOVERY_AUTO_EXCLUDE port={port} reason=auxiliary-device-setting");
-                continue;
-            }
-            candidates.Add(port);
-        }
-
-        if (candidates.Count == 0)
-        {
-            Log?.Invoke(this,
-                $"BOARD_CONNECT_RECOVERY_AUTO_SKIP reason=no-candidate present={string.Join(',', present)}");
+            Log?.Invoke(this, "BOARD_CONNECT_RECOVERY_SKIP reason=no-candidate-port");
             return null;
         }
 
         Log?.Invoke(this,
-            $"BOARD_CONNECT_RECOVERY_AUTO_BEGIN preferred={(preferred.Length == 0 ? "<none>" : preferred)} " +
-            $"candidates={string.Join(',', candidates)}");
+            $"BOARD_CONNECT_RECOVERY_AUTO_BEGIN preferred={(preferred.Length == 0 ? "<none>" : preferred)} candidates={string.Join(',', present)}");
 
-        foreach (string port in candidates)
+        foreach (string port in present)
         {
-            ct.ThrowIfCancellationRequested();
-            bool rememberedPort = preferred.Length > 0 &&
-                                  port.Equals(preferred, StringComparison.OrdinalIgnoreCase);
-            bool jbzSignature = false;
-
+            bool remembered = preferred.Length > 0 &&
+                              port.Equals(preferred, StringComparison.OrdinalIgnoreCase);
             try
             {
                 Log?.Invoke(this,
-                    $"BOARD_CONNECT_RECOVERY_AUTO_PROBE_BEGIN port={port} remembered={rememberedPort}");
+                    $"BOARD_CONNECT_RECOVERY_AUTO_PROBE_BEGIN port={port} remembered={remembered}");
                 await _serial.OpenMaintenancePortAsync(port, ct);
 
-                // A board left in START/MEASURE or BOOT may ignore *IDN?. :STOP
-                // is the recovery handshake used by the original software. The
-                // transport returns true only for a JBZ-specific :STOP or BOOT
-                // signature, so an unrelated silent COM is never RESET blindly.
+                bool stopAck = false;
                 try
                 {
-                    jbzSignature = await _serial.TryStopForFirmwareRecoveryAsync(ct);
+                    stopAck = await _serial.TryStopForFirmwareRecoveryAsync(ct);
                 }
                 catch (Exception ex) when (ex is IOException or TimeoutException or InvalidOperationException)
                 {
@@ -238,17 +195,15 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
                         $"BOARD_CONNECT_RECOVERY_AUTO_STOP_WARN port={port} reason={ex.Message}");
                 }
 
-                await Task.Delay(jbzSignature ? 120 : 80, ct);
-
-                // If STOP produced a JBZ signature, first try one quick IDN.
-                // Do not spend ~6 seconds retrying IDN on a remembered board that
-                // is clearly stuck; recover it with the original RESET handshake.
-                if (jbzSignature)
+                // Only continue identity probing when this port shows a JBZ-specific
+                // STOP/BOOT signature, or it is the previously verified board COM.
+                if (stopAck || remembered)
                 {
+                    await Task.Delay(stopAck ? 120 : 220, ct);
                     try
                     {
                         string idn = await _serial.QueryIdentityAsync(
-                            ct, attempts: 1, retryDelay: TimeSpan.Zero);
+                            ct, attempts: 3, retryDelay: TimeSpan.FromMilliseconds(180));
                         Log?.Invoke(this,
                             $"BOARD_CONNECT_RECOVERY_AUTO_IDN_OK port={port} phase=after-stop raw={idn.Trim()}");
                         return (port, idn.Trim(), null);
@@ -260,52 +215,51 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
                     }
                 }
 
-                // Never RESET an arbitrary COM. A reset is allowed only after a
-                // JBZ STOP/BOOT signature or on the last successfully verified
-                // board port. This is what makes automatic discovery safe.
-                if (!jbzSignature && !rememberedPort)
+                // RESET is never sent to an arbitrary COM device. It is only attempted
+                // on the previously verified JBZ port.
+                if (remembered)
+                {
+                    try
+                    {
+                        Log?.Invoke(this, $"BOARD_CONNECT_RECOVERY_RESET_BEGIN port={port}");
+                        await _serial.SendAsync(":RESET", ct);
+                        await Task.Delay(700, ct);
+                        string idn = await _serial.QueryIdentityAsync(
+                            ct, attempts: 5, retryDelay: TimeSpan.FromMilliseconds(250));
+                        Log?.Invoke(this,
+                            $"BOARD_CONNECT_RECOVERY_AUTO_IDN_OK port={port} phase=after-reset raw={idn.Trim()}");
+                        return (port, idn.Trim(), null);
+                    }
+                    catch (Exception ex) when (ex is IOException or TimeoutException or InvalidDataException or InvalidOperationException)
+                    {
+                        Log?.Invoke(this,
+                            $"BOARD_CONNECT_RECOVERY_RESET_FAIL port={port} reason={ex.Message}");
+                    }
+                }
+                else
                 {
                     Log?.Invoke(this,
-                        $"BOARD_CONNECT_RECOVERY_AUTO_RESET_SKIP port={port} reason=unverified-device");
-                    await _serial.DisconnectAsync();
-                    continue;
+                        $"BOARD_CONNECT_RECOVERY_RESET_SKIP port={port} reason=unverified-device");
                 }
-
-                try
-                {
-                    Log?.Invoke(this,
-                        $"BOARD_CONNECT_RECOVERY_AUTO_RESET_BEGIN port={port} protocol=RESET_BOOTLOADER_STOP_BOOT_IDN");
-                    string idn = await _serial.RecoverKnownBoardApplicationAsync(ct);
-                    Log?.Invoke(this,
-                        $"BOARD_CONNECT_RECOVERY_AUTO_IDN_OK port={port} phase=after-reset raw={idn.Trim()}");
-                    return (port, idn.Trim(), null);
-                }
-                catch (Exception ex) when (ex is IOException or TimeoutException or InvalidDataException or InvalidOperationException)
-                {
-                    Log?.Invoke(this,
-                        $"BOARD_CONNECT_RECOVERY_AUTO_RESET_FAIL port={port} reason={ex.Message}");
-                }
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
             }
             catch (Exception ex) when (ex is IOException or TimeoutException or UnauthorizedAccessException or InvalidOperationException)
             {
                 Log?.Invoke(this,
                     $"BOARD_CONNECT_RECOVERY_AUTO_PROBE_FAIL port={port} reason={ex.Message}");
             }
-
-            try
+            finally
             {
-                if (_serial.IsConnected)
-                    await _serial.DisconnectAsync();
+                try
+                {
+                    if (_serial.IsConnected)
+                        await _serial.DisconnectAsync();
+                }
+                catch { }
             }
-            catch { }
         }
 
         Log?.Invoke(this,
-            $"BOARD_CONNECT_RECOVERY_AUTO_END status=not-found candidates={string.Join(',', candidates)}");
+            $"BOARD_CONNECT_RECOVERY_REQUIRED reason=idn-unresponsive candidates={string.Join(',', present)}");
         return null;
     }
 
@@ -319,9 +273,8 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
         _uploadedModel = string.Empty;
         ClearLiveProbe();
 
-        // Do not leave the MCU in START/MEASURE when Windows closes the COM.
-        // The original UniversalTester sends :STOP before releasing the UART.
-        // Best-effort only: shutdown must still finish if the board is already hung.
+        // Best effort: do not leave firmware in START/MEASURE when the application closes.
+        // Uses only the pre-existing STOP recovery primitive; connection/discovery code remains unchanged.
         if (_serial.IsConnected)
         {
             using var stopCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1200));
@@ -509,9 +462,9 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
     /// product-boundary event; CLEAR/OPEN/OTHER are live topology only.
     /// </summary>
     /// <summary>
-    /// Verified original production PASS protocol:
+    /// Production PASS protocol captured from the original UniversalTester trace:
     /// :PASSPEN,close,release -> wait :PEN -> :UNCONNECT,close,release.
-    /// OUTPUTTEST is intentionally not used for automatic PASS.
+    /// Automatic PASS does not use :OUTPUTTEST.
     /// </summary>
     public async Task StartOriginalPassRemovalAsync(
         int passPenCloseMs, int passPenReleaseMs,
