@@ -155,6 +155,10 @@ public static class ProductionConfigService
             $"[RelayWiringMode]{settings.RelayWiringMode}",
             $"[FaultJigRelayNumber]{settings.FaultJigRelayNumber}",
             $"[PassMarkingToJigDelayMs]{settings.PassMarkingToJigDelayMs}",
+            $"[PassPenCloseMs]{settings.PassPenCloseMs}",
+            $"[PassPenReleaseMs]{settings.PassPenReleaseMs}",
+            $"[UnconnectCloseMs]{settings.UnconnectCloseMs}",
+            $"[UnconnectReleaseMs]{settings.UnconnectReleaseMs}",
             $"[StampDelayMs]{settings.Relay1JigPulseMs},{settings.Relay2MarkingPulseMs}", // compatibility
             $"[OversizeWaitSeconds]{settings.OversizeWaitSeconds}",
             $"[ShieldDelayMs]{settings.ShieldDelay}",
@@ -567,6 +571,10 @@ public static class ProductionConfigService
             settings.Relay2MarkingPulseMs = legacyR2;
         }
         settings.PassMarkingToJigDelayMs = I(map, "PassMarkingToJigDelayMs", settings.PassMarkingToJigDelayMs);
+        settings.PassPenCloseMs = I(map, "PassPenCloseMs", settings.PassPenCloseMs);
+        settings.PassPenReleaseMs = I(map, "PassPenReleaseMs", settings.PassPenReleaseMs);
+        settings.UnconnectCloseMs = I(map, "UnconnectCloseMs", settings.UnconnectCloseMs);
+        settings.UnconnectReleaseMs = I(map, "UnconnectReleaseMs", settings.UnconnectReleaseMs);
         settings.JigEjectRelayEnabled = B(map, "JigEjectRelayEnabled", settings.JigEjectRelayEnabled);
         settings.PassMarkingRelayEnabled = B(map, "PassMarkingRelayEnabled", settings.PassMarkingRelayEnabled);
         settings.PassJigRelayFirst = B(map, "PassJigRelayFirst", settings.PassJigRelayFirst);
@@ -799,6 +807,18 @@ public static class ProductionConfigService
         settings.PassJigRelayFirst = settings.RelayWiringMode == 1;
         settings.FaultJigRelayNumber = settings.RelayWiringMode == 1 ? 2 : 1;
         settings.PassMarkingToJigDelayMs = Math.Clamp(settings.PassMarkingToJigDelayMs, 0, 5_000);
+
+        // Mapping cố định xác nhận từ trace BoardDiags gốc:
+        // OUT1/ch0=JIG, OUT2/ch1=MARKING, OUT5/ch4=POWER chung.
+        // Không cho config cũ đảo MARKING sang OUT5 vì OUT5 không phải relay chức năng.
+        settings.JigRelayChannel = JbzBoardTransportAdapter.JigOutputChannel;
+        settings.MarkingRelayChannel = JbzBoardTransportAdapter.MarkingOutputChannel;
+        settings.FaultJigRelayNumber = 1;
+
+        settings.PassPenCloseMs = Math.Clamp(settings.PassPenCloseMs, 50, 5_000);
+        settings.PassPenReleaseMs = Math.Clamp(settings.PassPenReleaseMs, 50, 5_000);
+        settings.UnconnectCloseMs = Math.Clamp(settings.UnconnectCloseMs, 50, 5_000);
+        settings.UnconnectReleaseMs = Math.Clamp(settings.UnconnectReleaseMs, 50, 5_000);
         settings.StampDelay = $"{settings.Relay1JigPulseMs},{settings.Relay2MarkingPulseMs}"; // compatibility only
 
         settings.OversizeWaitSeconds = Math.Clamp(settings.OversizeWaitSeconds, 0, 86_400);

@@ -65,5 +65,23 @@ public interface IBoardTransport : IAsyncDisposable
     Task SelectResistanceRouteAsync(ResistanceStep step, CancellationToken ct = default);
     Task ReleaseResistanceRouteAsync(CancellationToken ct = default);
     Task SetRelayAsync(int relay, CancellationToken ct = default);
+
+    /// <summary>
+    /// Áp trạng thái hai relay chức năng của tester. Universal Tester New override
+    /// để phát đúng snapshot OUT1=JIG, OUT2=MARK, OUT3/OUT4=OFF, OUT5=POWER.
+    /// Default giữ tương thích cho transport test/legacy.
+    /// </summary>
+    async Task ApplyRelayOutputsAsync(
+        bool jigOn,
+        bool markingOn,
+        CancellationToken ct = default)
+    {
+        await AllRelaysOffAsync(ct);
+        if (jigOn)
+            await SetRelayAsync(0, ct);
+        if (markingOn)
+            await SetRelayAsync(1, ct);
+    }
+
     Task AllRelaysOffAsync(CancellationToken ct = default);
 }

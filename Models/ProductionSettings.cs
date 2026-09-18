@@ -173,11 +173,16 @@ public sealed class ProductionSettings
     /// <summary>Trường tương thích file cfg cũ; runtime Universal Tester New bỏ qua hoàn toàn.</summary>
     public int RelayWiringMode { get; set; }
 
-    /// <summary>Relay vật lý 1 của Universal Tester New = firmware OUTPUT channel 0. Cố định, không cho đổi mapping.</summary>
+    /// <summary>
+    /// OUT1/firmware channel 0 = REMOVE/JIG. Mapping cố định theo trace phần mềm gốc.
+    /// OUT5/channel 4 chỉ là POWER cấp chung, không phải relay chức năng.
+    /// </summary>
     public int JigRelayChannel { get; set; } = 0;
 
-    /// <summary>Relay vật lý 5 của Universal Tester New = firmware OUTPUT channel 4. Cố định, không cho đổi mapping.</summary>
-    public int MarkingRelayChannel { get; set; } = 4;
+    /// <summary>
+    /// OUT2/firmware channel 1 = MARKING. Mapping cố định theo trace phần mềm gốc.
+    /// </summary>
+    public int MarkingRelayChannel { get; set; } = 1;
 
     /// <summary>Trường tương thích cfg cũ; luôn biểu diễn relay vật lý 1 mở JIG.</summary>
     public int FaultJigRelayNumber { get; set; } = 1;

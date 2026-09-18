@@ -14,7 +14,8 @@ public sealed class ProductionSettingsViewModel : ObservableObject
     private readonly string _lotProductKey;
     private bool _manualRuntimeActive;
     private string _manualRelay0Status = "OFF";
-    private string _manualRelay4Status = "OFF";
+    private string _manualRelay1Status = "OFF";
+    private string _manualPowerStatus = "OFF";
     private string _manualStatus = "Manual OFF";
     private int _selectedManualResistanceChannel;
     private bool _manualResistanceRunning;
@@ -87,13 +88,16 @@ public sealed class ProductionSettingsViewModel : ObservableObject
         private set => Set(ref _manualRelay0Status, value);
     }
 
-
-
-
-    public string ManualRelay4Status
+    public string ManualRelay1Status
     {
-        get => _manualRelay4Status;
-        private set => Set(ref _manualRelay4Status, value);
+        get => _manualRelay1Status;
+        private set => Set(ref _manualRelay1Status, value);
+    }
+
+    public string ManualPowerStatus
+    {
+        get => _manualPowerStatus;
+        private set => Set(ref _manualPowerStatus, value);
     }
 
     public string ManualStatus
@@ -124,7 +128,9 @@ public sealed class ProductionSettingsViewModel : ObservableObject
     }
 
     public AsyncRelayCommand ManualRelay0OnCommand { get; }
-    public AsyncRelayCommand ManualRelay4OnCommand { get; }
+    public AsyncRelayCommand ManualRelay0OffCommand { get; }
+    public AsyncRelayCommand ManualRelay1OnCommand { get; }
+    public AsyncRelayCommand ManualRelay1OffCommand { get; }
     public AsyncRelayCommand ManualResetCommand { get; }
     public AsyncRelayCommand ManualMeasureResistanceCommand { get; }
     public AsyncRelayCommand ManualWaterProofTestCommand { get; }
@@ -162,10 +168,16 @@ public sealed class ProductionSettingsViewModel : ObservableObject
             Settings, _modelPath);
 
         ManualRelay0OnCommand = new AsyncRelayCommand(
-            async () => await RunManualRelayCommandAsync(0, true),
+            async () => await RunManualRelayCommandAsync(JbzBoardTransportAdapter.JigOutputChannel, true),
             CanUseManualControls);
-        ManualRelay4OnCommand = new AsyncRelayCommand(
-            async () => await RunManualRelayCommandAsync(4, true),
+        ManualRelay0OffCommand = new AsyncRelayCommand(
+            async () => await RunManualRelayCommandAsync(JbzBoardTransportAdapter.JigOutputChannel, false),
+            CanUseManualControls);
+        ManualRelay1OnCommand = new AsyncRelayCommand(
+            async () => await RunManualRelayCommandAsync(JbzBoardTransportAdapter.MarkingOutputChannel, true),
+            CanUseManualControls);
+        ManualRelay1OffCommand = new AsyncRelayCommand(
+            async () => await RunManualRelayCommandAsync(JbzBoardTransportAdapter.MarkingOutputChannel, false),
             CanUseManualControls);
         ManualResetCommand = new AsyncRelayCommand(
             RunManualResetAsync,
@@ -208,13 +220,10 @@ public sealed class ProductionSettingsViewModel : ObservableObject
     public void SetManualRuntimeActive(bool active)
     {
         ManualRuntimeActive = active;
+        ApplyManualOutputStatus();
         ManualStatus = active
-            ? "MANUAL - production locked"
+            ? $"MANUAL - OUT1 JIG={ManualRelay0Status} • OUT2 MARK={ManualRelay1Status} • OUT5 POWER={ManualPowerStatus}"
             : "Manual OFF";
-        if (!active)
-        {
-            ApplyManualOutputStatus(-1);
-        }
     }
 
     private bool CanUseManualControls() =>
@@ -387,33 +396,36 @@ public sealed class ProductionSettingsViewModel : ObservableObject
         if (_test is null)
             return;
 
-        ManualStatus = turnOn
-            ? $"Đang bật OUTPUT {relay}..."
-            : $"Đang tắt {(relay == 0 ? "RELAY 1 / OUT0" : "RELAY 5 / OUT4")}...";
+        string role = relay == JbzBoardTransportAdapter.JigOutputChannel
+            ? "OUT1 / JIG"
+            : "OUT2 / MARK";
+        ManualStatus = $"Đang {(turnOn ? "BẬT" : "TẮT")} {role}...";
 
         try
         {
-            int activeRelay = await _test.SetManualRelayAsync(relay, turnOn);
+            await _test.SetManualRelayAsync(relay, turnOn);
             ManualRuntimeActive = _test.IsManualModeActive;
-            ApplyManualOutputStatus(activeRelay);
-            ManualStatus = activeRelay < 0
-                ? "MANUAL - cả 2 relay OFF"
-                : $"MANUAL - OUTPUT {activeRelay} ON";
+            ApplyManualOutputStatus();
+            ManualStatus =
+                $"MANUAL - OUT1 JIG={ManualRelay0Status} • OUT2 MARK={ManualRelay1Status} • OUT5 POWER={ManualPowerStatus}";
             RefreshManualCommands();
         }
         catch
         {
-            ApplyManualOutputStatus(-1);
+            ApplyManualOutputStatus();
             ManualStatus = "MANUAL FAULT - kiểm tra DeviceFault";
             RefreshManualCommands();
             throw;
         }
     }
 
-    private void ApplyManualOutputStatus(int activeChannel)
+    private void ApplyManualOutputStatus()
     {
-        ManualRelay0Status = activeChannel == JbzBoardTransportAdapter.Relay1OutputChannel ? "ON" : "OFF";
-        ManualRelay4Status = activeChannel == JbzBoardTransportAdapter.Relay5OutputChannel ? "ON" : "OFF";
+        bool jigOn = _test?.ManualJigRelayOn == true;
+        bool markingOn = _test?.ManualMarkingRelayOn == true;
+        ManualRelay0Status = jigOn ? "ON" : "OFF";
+        ManualRelay1Status = markingOn ? "ON" : "OFF";
+        ManualPowerStatus = jigOn || markingOn ? "ON" : "OFF";
     }
 
     private async Task RunManualResetAsync()
@@ -426,13 +438,13 @@ public sealed class ProductionSettingsViewModel : ObservableObject
         {
             await _test.ResetManualOutputsAsync();
             ManualRuntimeActive = _test.IsManualModeActive;
-            ApplyManualOutputStatus(-1);
+            ApplyManualOutputStatus();
             ManualStatus = "MANUAL - reset complete, cả 2 relay OFF";
             RefreshManualCommands();
         }
         catch
         {
-            ApplyManualOutputStatus(-1);
+            ApplyManualOutputStatus();
             ManualStatus = "MANUAL FAULT - kiểm tra DeviceFault";
             RefreshManualCommands();
             throw;
@@ -583,7 +595,9 @@ public sealed class ProductionSettingsViewModel : ObservableObject
     private void RefreshManualCommands()
     {
         ManualRelay0OnCommand?.RaiseCanExecuteChanged();
-        ManualRelay4OnCommand?.RaiseCanExecuteChanged();
+        ManualRelay0OffCommand?.RaiseCanExecuteChanged();
+        ManualRelay1OnCommand?.RaiseCanExecuteChanged();
+        ManualRelay1OffCommand?.RaiseCanExecuteChanged();
         ManualResetCommand?.RaiseCanExecuteChanged();
         ManualMeasureResistanceCommand?.RaiseCanExecuteChanged();
         ManualWaterProofTestCommand?.RaiseCanExecuteChanged();

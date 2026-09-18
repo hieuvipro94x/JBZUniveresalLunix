@@ -407,6 +407,62 @@ public sealed class JbzSerialBoardTransport : IAsyncDisposable
     public Task PassPenAsync(int delayMs, int pinCount, CancellationToken ct = default) => SendAsync($":PASSPEN,{delayMs},{pinCount}", ct);
     public Task UnconnectAsync(int delayMs, int pinCount, CancellationToken ct = default) => SendAsync($":UNCONNECT,{delayMs},{pinCount}", ct);
     public Task OutputAsync(int channel, bool state, CancellationToken ct = default) => SendAsync($":OUTPUTTEST,{channel},{(state ? 1 : 0)}", ct);
+
+    /// <summary>
+    /// Gửi OUTPUTTEST và bắt buộc chờ đúng phản hồi :OUTPUT,&lt;channel&gt;,ON/OFF.
+    /// BoardDiags của phần mềm gốc cho thấy Output Test gửi từng OUT tuần tự và
+    /// chờ phản hồi trước lệnh kế tiếp; dùng transaction này để tránh trạng thái
+    /// UI báo ON/OFF trước khi firmware thực sự áp dụng.
+    /// </summary>
+    public async Task OutputAndWaitAsync(
+        int channel,
+        bool state,
+        CancellationToken ct = default)
+    {
+        if (channel is < 0 or > 4)
+            throw new ArgumentOutOfRangeException(nameof(channel), channel, "OUTPUT channel phải 0..4.");
+
+        await _transaction.WaitAsync(ct);
+        try
+        {
+            if (!IsConnected)
+                throw new IOException("JBZ board COM is not connected.");
+
+            // Loại phản hồi OUTPUT cũ của lệnh trước để ACK sau đây luôn thuộc
+            // command vừa phát. Các OUTPUT command được serialize bởi _transaction.
+            Drain(JbzEventFamily.Output);
+            await SendCoreAsync($":OUTPUTTEST,{channel},{(state ? 1 : 0)}", ct);
+
+            string expected = state ? "ON" : "OFF";
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            linked.CancelAfter(TimeSpan.FromSeconds(2));
+            try
+            {
+                while (true)
+                {
+                    JbzBoardEvent ack = await ReadQueueAsync(JbzEventFamily.Output, linked.Token);
+                    int ackChannel = ack.Numbers is { Count: > 0 } ? ack.Numbers[0] : -1;
+                    string ackState = ack.Values is { Count: > 0 } ? ack.Values[0].Trim().ToUpperInvariant() : string.Empty;
+                    if (ackChannel == channel && string.Equals(ackState, expected, StringComparison.Ordinal))
+                    {
+                        Log?.Invoke(this, $"OUTPUT_ACK channel={channel} state={expected}");
+                        return;
+                    }
+
+                    Log?.Invoke(this,
+                        $"OUTPUT_ACK_SKIP expected={channel}:{expected} actual={ackChannel}:{ackState} raw={ack.Raw}");
+                }
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                throw new TimeoutException($"Timeout chờ :OUTPUT,{channel},{expected} sau OUTPUTTEST.");
+            }
+        }
+        finally
+        {
+            _transaction.Release();
+        }
+    }
     public Task MeasureResistanceAsync(int channel, CancellationToken ct = default) => SendAsync($":RESISTORTEST,{channel},200,1,0", ct);
 
     public Task UploadModelAsync(JbzCompiledModel model, CancellationToken ct = default) =>

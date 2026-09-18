@@ -7,12 +7,27 @@ namespace JBZUniveresalLunix.Services;
 /// <summary>Adapts semantic JBZ UART events to the established production engine contract.</summary>
 public sealed class JbzBoardTransportAdapter : IBoardTransport
 {
-    // Universal Tester New has exactly two physical relay outputs. Firmware channels are zero-based.
-    public const int Relay1OutputChannel = 0;
-    public const int Relay5OutputChannel = 4;
+    // Mapping xác nhận từ BoardDiags phần mềm gốc. Tên OUT trên UI là 1-based,
+    // protocol OUTPUTTEST dùng channel 0-based:
+    //   OUT1 / channel 0 = REMOVE / nhả JIG
+    //   OUT2 / channel 1 = MARKING
+    //   OUT3 / channel 2 = SPARE (luôn OFF khi thao tác relay)
+    //   OUT4 / channel 3 = SPARE (luôn OFF khi thao tác relay)
+    //   OUT5 / channel 4 = POWER cấp chung cho OUT1 + OUT2
+    public const int JigOutputChannel = 0;
+    public const int MarkingOutputChannel = 1;
+    public const int SpareOutputChannel2 = 2;
+    public const int SpareOutputChannel3 = 3;
+    public const int PowerOutputChannel = 4;
+
+    // Alias tương thích với code/config cũ. Relay5OutputChannel giờ chỉ là OUT5 POWER,
+    // không được coi là relay MARKING.
+    public const int Relay1OutputChannel = JigOutputChannel;
+    public const int Relay2OutputChannel = MarkingOutputChannel;
+    public const int Relay5OutputChannel = PowerOutputChannel;
 
     public static bool IsPhysicalRelayOutput(int channel) =>
-        channel == Relay1OutputChannel || channel == Relay5OutputChannel;
+        channel == JigOutputChannel || channel == MarkingOutputChannel;
     private readonly JbzSerialBoardTransport _serial = new();
     private readonly SemaphoreSlim _modelOperationGate = new(1, 1);
     private readonly ProductionSettings _settings;
@@ -551,10 +566,34 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
     {
         if (!IsPhysicalRelayOutput(relay))
             throw new ArgumentOutOfRangeException(nameof(relay), relay,
-                "Universal Tester New only exposes physical Relay 1 (OUTPUT 0) and Relay 5 (OUTPUT 4).");
+                "Chỉ OUT1/channel 0 (JIG) và OUT2/channel 1 (MARKING) là relay chức năng; OUT5/channel 4 là POWER chung.");
 
         await _modelOperationGate.WaitAsync(ct);
-        try { await _serial.OutputAsync(relay, true, ct); }
+        try
+        {
+            await ApplyRelayOutputSnapshotCoreAsync(
+                jigOn: relay == JigOutputChannel,
+                markingOn: relay == MarkingOutputChannel,
+                ct: ct);
+        }
+        finally { _modelOperationGate.Release(); }
+    }
+
+    /// <summary>
+    /// Áp snapshot relay đúng như Output Test của phần mềm gốc: OUT1 -> OUT2 ->
+    /// OUT3 -> OUT4 -> OUT5. OUT3/OUT4 luôn OFF; OUT5 POWER tự ON khi ít nhất
+    /// một relay JIG/MARKING đang ON và tự OFF khi cả hai đều OFF.
+    /// </summary>
+    public async Task ApplyRelayOutputsAsync(
+        bool jigOn,
+        bool markingOn,
+        CancellationToken ct = default)
+    {
+        await _modelOperationGate.WaitAsync(ct);
+        try
+        {
+            await ApplyRelayOutputSnapshotCoreAsync(jigOn, markingOn, ct);
+        }
         finally { _modelOperationGate.Release(); }
     }
 
@@ -563,10 +602,33 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
         await _modelOperationGate.WaitAsync(ct);
         try
         {
-            await _serial.OutputAsync(Relay1OutputChannel, false, ct);
-            await _serial.OutputAsync(Relay5OutputChannel, false, ct);
+            await ApplyRelayOutputSnapshotCoreAsync(false, false, ct);
         }
         finally { _modelOperationGate.Release(); }
+    }
+
+    private async Task ApplyRelayOutputSnapshotCoreAsync(
+        bool jigOn,
+        bool markingOn,
+        CancellationToken ct)
+    {
+        bool powerOn = jigOn || markingOn;
+        Log?.Invoke(this,
+            $"OUTPUT_SNAPSHOT_BEGIN OUT1_JIG={(jigOn ? "ON" : "OFF")} " +
+            $"OUT2_MARK={(markingOn ? "ON" : "OFF")} OUT5_POWER={(powerOn ? "ON" : "OFF")} " +
+            "order=OUT1>OUT2>OUT3>OUT4>OUT5");
+
+        // Đúng thứ tự batch quan sát trong BoardDiags gốc. Mỗi command bắt buộc
+        // chờ :OUTPUT,x,ON/OFF trước khi phát command kế tiếp.
+        await _serial.OutputAndWaitAsync(JigOutputChannel, jigOn, ct);
+        await _serial.OutputAndWaitAsync(MarkingOutputChannel, markingOn, ct);
+        await _serial.OutputAndWaitAsync(SpareOutputChannel2, false, ct);
+        await _serial.OutputAndWaitAsync(SpareOutputChannel3, false, ct);
+        await _serial.OutputAndWaitAsync(PowerOutputChannel, powerOn, ct);
+
+        Log?.Invoke(this,
+            $"OUTPUT_SNAPSHOT_END OUT1_JIG={(jigOn ? "ON" : "OFF")} " +
+            $"OUT2_MARK={(markingOn ? "ON" : "OFF")} OUT5_POWER={(powerOn ? "ON" : "OFF")}");
     }
 
     public async Task<string> UpdateFirmwareAsync(
@@ -604,8 +666,11 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
                 // second recovery owner while firmware maintenance owns the COM.
                 try
                 {
-                    await _serial.OutputAsync(Relay1OutputChannel, false, ct);
-                    await _serial.OutputAsync(Relay5OutputChannel, false, ct);
+                    await _serial.OutputAsync(JigOutputChannel, false, ct);
+                    await _serial.OutputAsync(MarkingOutputChannel, false, ct);
+                    await _serial.OutputAsync(SpareOutputChannel2, false, ct);
+                    await _serial.OutputAsync(SpareOutputChannel3, false, ct);
+                    await _serial.OutputAsync(PowerOutputChannel, false, ct);
                 }
                 catch (Exception ex)
                 {

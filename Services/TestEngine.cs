@@ -1,4 +1,4 @@
-﻿using JBZUniveresalLunix.Models;
+using JBZUniveresalLunix.Models;
 
 using System.Diagnostics;
 using System.Globalization;
@@ -3164,7 +3164,7 @@ public sealed class TestEngine : IDisposable
     public Task PulseJigRelayAsync(CancellationToken ct = default)
     {
         int relay = ConfiguredJigRelay;
-        string relayName = "RELAY 1 / OUT0 JIG";
+        string relayName = "OUT1 / channel 0 JIG (OUT5 POWER chung)";
         return _production.JigEjectRelayEnabled
             ? PulseRelaySafeAsync(relay, Math.Clamp(_production.Relay1JigPulseMs, 50, 5_000), relayName, ct)
             : SkipDisabledRelayAsync(relayName, ct);
@@ -3174,7 +3174,7 @@ public sealed class TestEngine : IDisposable
     public Task PulseMarkingRelayAsync(CancellationToken ct = default)
     {
         int relay = ConfiguredMarkingRelay;
-        string relayName = "RELAY 5 / OUT4 MARKING";
+        string relayName = "OUT2 / channel 1 MARKING (OUT5 POWER chung)";
         return _production.PassMarkingRelayEnabled
             ? PulseRelaySafeAsync(relay, Math.Clamp(_production.Relay2MarkingPulseMs, 50, 5_000), relayName, ct)
             : SkipDisabledRelayAsync(relayName, ct);
@@ -3185,16 +3185,16 @@ public sealed class TestEngine : IDisposable
     {
         if (!JbzBoardTransportAdapter.IsPhysicalRelayOutput(relay))
             throw new ArgumentOutOfRangeException(nameof(relay), relay,
-                "Only physical Relay 1 (OUT0) and Relay 5 (OUT4) are valid.");
+                "Only OUT1/channel 0 (JIG) and OUT2/channel 1 (MARKING) are valid functional relay outputs; OUT5/channel 4 is POWER.");
 
         int duration = relay == ConfiguredMarkingRelay
             ? _production.Relay2MarkingPulseMs
             : _production.Relay1JigPulseMs;
-        return PulseRelaySafeAsync(relay, duration, relay == 0 ? "RELAY 1 / OUT0 MANUAL" : "RELAY 5 / OUT4 MANUAL", ct);
+        return PulseRelaySafeAsync(relay, duration, relay == JbzBoardTransportAdapter.JigOutputChannel ? "OUT1 / JIG MANUAL" : "OUT2 / MARK MANUAL", ct);
     }
 
-    private int ConfiguredJigRelay => JbzBoardTransportAdapter.Relay1OutputChannel;
-    private int ConfiguredMarkingRelay => JbzBoardTransportAdapter.Relay5OutputChannel;
+    private int ConfiguredJigRelay => JbzBoardTransportAdapter.JigOutputChannel;
+    private int ConfiguredMarkingRelay => JbzBoardTransportAdapter.MarkingOutputChannel;
 
     /// <summary>
     /// Eject riêng cho Master Sample. Chỉ OUTPUT JIG đã cấu hình được pulse;
@@ -3544,7 +3544,7 @@ public sealed class TestEngine : IDisposable
         };
     }
 
-    public Task<bool> CompletePassAsync(
+    public async Task<bool> CompletePassAsync(
         IReadOnlyList<ResistanceResult> resistance,
         Action? onPassStarted = null,
         bool markingEnabled = true,
@@ -3553,17 +3553,58 @@ public sealed class TestEngine : IDisposable
     {
         ProductModel? model = _model;
         if (model is null)
-            return Task.FromResult(false);
+            return false;
 
         int expectedResistanceCount = ResistanceMeasurementPlan.BuildEnabledSteps(_production).Count;
         bool resistanceOk = expectedResistanceCount == 0 ||
-                            (resistance.Count == expectedResistanceCount && resistance.All(x => x.Passed));
-        bool ok = (ContinuityPassed || continuityAlreadyValidated) && resistanceOk;
-        if (ok) onPassStarted?.Invoke();
+                            (resistance.Count == expectedResistanceCount &&
+                             resistance.All(x => x.Passed));
 
-        // Production PASS relay/removal is owned by firmware via PASSPEN -> PEN -> UNCONNECT.
-        // OUTPUTTEST remains available for Manual Relay / Master / explicit fault eject only.
-        return Task.FromResult(ok);
+        if ((!ContinuityPassed && !continuityAlreadyValidated) || !resistanceOk)
+            return false;
+
+        if (expectedResistanceCount == 0)
+        {
+            // Trace production thật:
+            // continuity PASS -> STOP_SCAN -> RESET_CLEAR -> MARKING (Relay 2)
+            // -> JIG EJECT (Relay 1).
+            // STOP/RESET không làm mất trạng thái INIT, vì sau relay Htdrv
+            // START_SCAN lại trực tiếp.
+            await _board.StopScanAsync(ct);
+            await _board.ResetClearAsync(ct);
+        }
+
+        int relayStartDelayMs = expectedResistanceCount > 0
+            ? Math.Max(0, _settings.Test.PostResistanceRelayDelayMs)
+            : 0;
+
+        if (relayStartDelayMs > 0)
+            await Task.Delay(relayStartDelayMs, ct);
+
+        // Universal Tester New dùng channel OUTPUT 0..4 cấu hình trực tiếp.
+        // Production PASS luôn MARKING trước rồi mới mở JIG. Master/FAIL chỉ
+        // gọi OUTPUT mở JIG và không đi vào chuỗi MARKING.
+        await _board.AllRelaysOffAsync(ct);
+
+        bool runMarking = markingEnabled && _production.PassMarkingRelayEnabled;
+        if (runMarking)
+        {
+            onPassStarted?.Invoke();
+            await PulseMarkingRelayAsync(ct);
+
+            int interlockMs = Math.Clamp(_production.PassMarkingToJigDelayMs, 0, 5_000);
+            if (interlockMs > 0)
+                await Task.Delay(interlockMs, ct);
+        }
+        else
+        {
+            // Master sample, cấu hình tắt MARKING, hoặc cấu hình JIG chạy trước.
+            onPassStarted?.Invoke();
+        }
+
+        await PulseJigRelayAsync(ct);
+
+        return true;
     }
 
     public void Dispose()

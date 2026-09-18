@@ -15,15 +15,15 @@
       VersionFileTag  12_10_2 -> next release
   -->
   <PropertyGroup>
-    <VersionPrefix>16.0.374</VersionPrefix>
-    <Version>16.0.374</Version>
-    <AssemblyVersion>16.0.374.0</AssemblyVersion>
-    <FileVersion>16.0.374.0</FileVersion>
-    <InformationalVersion>16.0.374</InformationalVersion>
+    <VersionPrefix>16.0.375</VersionPrefix>
+    <Version>16.0.375</Version>
+    <AssemblyVersion>16.0.375.0</AssemblyVersion>
+    <FileVersion>16.0.375.0</FileVersion>
+    <InformationalVersion>16.0.375</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
-    <VersionFileTag>16_0_374</VersionFileTag>
+    <VersionFileTag>16_0_375</VersionFileTag>
     <Product>JBZUniveresalLunix</Product>
-    <AssemblyTitle>JBZUniveresalLunix V16.0.374</AssemblyTitle>
+    <AssemblyTitle>JBZUniveresalLunix V16.0.375</AssemblyTitle>
     <Description>JBZ Universal Tester - Production Harness Tester</Description>
     <Company>JBZ</Company>
     <Copyright>Copyright ??????????????????????????????????????????????JBZ 2026</Copyright>

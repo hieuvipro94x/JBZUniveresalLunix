@@ -186,7 +186,7 @@ public partial class ProductionSettingsPage : UserControl
         IoConfirm1ComboBox.ItemsSource = Enumerable.Range(0, 128).ToArray();
         IoConfirmNComboBox.ItemsSource = Enumerable.Range(0, 32).ToArray();
         // Universal Tester New relay mapping is fixed by hardware/firmware:
-        // Relay 1 = OUT0, Relay 5 = OUT4. No user-selectable relay channel list.
+        // Trace gốc: OUT1/ch0=JIG, OUT2/ch1=MARKING, OUT5/ch4=POWER. Mapping cố định.
     }
 
     private void CardIoComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e) =>
@@ -664,9 +664,9 @@ public partial class ProductionSettingsPage : UserControl
             return false;
         }
 
-        // Fixed physical mapping: Relay 1 = OUT0 (JIG), Relay 5 = OUT4 (MARKING).
-        _vm.Settings.JigRelayChannel = JbzBoardTransportAdapter.Relay1OutputChannel;
-        _vm.Settings.MarkingRelayChannel = JbzBoardTransportAdapter.Relay5OutputChannel;
+        // Fixed mapping từ BoardDiags: OUT1/ch0=JIG, OUT2/ch1=MARKING, OUT5/ch4=POWER chung.
+        _vm.Settings.JigRelayChannel = JbzBoardTransportAdapter.JigOutputChannel;
+        _vm.Settings.MarkingRelayChannel = JbzBoardTransportAdapter.MarkingOutputChannel;
         _vm.Settings.FaultJigRelayNumber = 1;
         _vm.Settings.StampDelay = $"{_vm.Settings.Relay1JigPulseMs},{_vm.Settings.Relay2MarkingPulseMs}";
 

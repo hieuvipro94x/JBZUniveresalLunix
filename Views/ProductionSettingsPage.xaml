@@ -375,6 +375,8 @@
                             <RowDefinition Height="30"/>
                             <RowDefinition Height="30"/>
                             <RowDefinition Height="30"/>
+                            <RowDefinition Height="30"/>
+                            <RowDefinition Height="30"/>
                         </Grid.RowDefinitions>
 
                         <TextBlock Text="Probe cycle" Style="{StaticResource FieldLabelStyle}"/>
@@ -395,20 +397,26 @@
                         <TextBlock Grid.Row="4" Text="UNCONNECT nhả (ms)" Style="{StaticResource FieldLabelStyle}"/>
                         <TextBox Grid.Row="4" Grid.Column="1" Text="{Binding Settings.UnconnectReleaseMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
 
-                        <TextBlock Grid.Row="5" Text="Bật MARKING PASS" Style="{StaticResource FieldLabelStyle}"/>
-                        <CheckBox Grid.Row="5" Grid.Column="1" IsChecked="{Binding Settings.PassMarkingRelayEnabled, Mode=TwoWay}"/>
+                        <TextBlock Grid.Row="5" Text="Cho phép JIG/REMOVE" Style="{StaticResource FieldLabelStyle}"/>
+                        <CheckBox Grid.Row="5" Grid.Column="1" IsChecked="{Binding Settings.JigEjectRelayEnabled, Mode=TwoWay}"/>
 
-                        <TextBlock Grid.Row="6" Text="Relay mở JIG" Style="{StaticResource FieldLabelStyle}"/>
-                        <TextBlock Grid.Row="6" Grid.Column="1" Text="RELAY 1 (OUT0) - cố định" FontWeight="Bold"/>
+                        <TextBlock Grid.Row="6" Text="Cho phép MARKING PASS" Style="{StaticResource FieldLabelStyle}"/>
+                        <CheckBox Grid.Row="6" Grid.Column="1" IsChecked="{Binding Settings.PassMarkingRelayEnabled, Mode=TwoWay}"/>
 
-                        <TextBlock Grid.Row="7" Text="Relay MARKING" Style="{StaticResource FieldLabelStyle}"/>
-                        <TextBlock Grid.Row="7" Grid.Column="1" Text="RELAY 5 (OUT4) - cố định" FontWeight="Bold"/>
+                        <TextBlock Grid.Row="7" Text="JIG / REMOVE" Style="{StaticResource FieldLabelStyle}"/>
+                        <TextBlock Grid.Row="7" Grid.Column="1" Text="OUT1 / channel 0 - cố định" FontWeight="Bold"/>
 
-                        <TextBlock Grid.Row="8" Text="Resistance delay" Style="{StaticResource FieldLabelStyle}"/>
-                        <TextBox Grid.Row="8" Grid.Column="1" Text="{Binding Settings.ResistanceDelayMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                        <TextBlock Grid.Row="8" Text="MARKING" Style="{StaticResource FieldLabelStyle}"/>
+                        <TextBlock Grid.Row="8" Grid.Column="1" Text="OUT2 / channel 1 - cố định" FontWeight="Bold"/>
 
-                        <TextBlock Grid.Row="9" Text="Scroll delay (ms)" Style="{StaticResource FieldLabelStyle}"/>
-                        <TextBox Grid.Row="9" Grid.Column="1" Text="{Binding Settings.ScrollDelay, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                        <TextBlock Grid.Row="9" Text="Nguồn relay" Style="{StaticResource FieldLabelStyle}"/>
+                        <TextBlock Grid.Row="9" Grid.Column="1" Text="OUT5 / channel 4 - POWER chung" FontWeight="Bold"/>
+
+                        <TextBlock Grid.Row="10" Text="Resistance delay" Style="{StaticResource FieldLabelStyle}"/>
+                        <TextBox Grid.Row="10" Grid.Column="1" Text="{Binding Settings.ResistanceDelayMs, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+
+                        <TextBlock Grid.Row="11" Text="Scroll delay (ms)" Style="{StaticResource FieldLabelStyle}"/>
+                        <TextBox Grid.Row="11" Grid.Column="1" Text="{Binding Settings.ScrollDelay, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
 
                     </Grid>
 
@@ -608,39 +616,45 @@
                                 </Style.Triggers>
                             </Style>
                         </StackPanel.Style>
-                        <TextBlock Text="MANUAL RELAY BO MỚI" Style="{StaticResource SectionTitleStyle}"/>
-                        <TextBlock Margin="0,0,0,4"
-                                   Text="Chỉ 2 relay vật lý: RELAY 1 = OUT0 và RELAY 5 = OUT4. OUT1/OUT2/OUT3 không phải relay."
+                        <TextBlock Text="MANUAL OUTPUT TEST - ĐÚNG TRACE GỐC" Style="{StaticResource SectionTitleStyle}"/>
+                        <TextBlock Margin="0,0,0,5"
+                                   Text="OUT1 = REMOVE/JIG • OUT2 = MARKING • OUT5 = POWER chung. OUT5 tự ON khi OUT1 hoặc OUT2 ON và tự OFF khi cả hai OFF. Mỗi lần đổi trạng thái gửi đủ OUT1→OUT2→OUT3→OUT4→OUT5 và chờ ACK."
                                    Foreground="{StaticResource TextMuted}" FontSize="11" TextWrapping="Wrap"/>
                         <Grid>
                             <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="110"/>
+                                <ColumnDefinition Width="112"/>
                                 <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="76"/>
-                                <ColumnDefinition Width="48"/>
+                                <ColumnDefinition Width="70"/>
+                                <ColumnDefinition Width="52"/>
                             </Grid.ColumnDefinitions>
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="34"/>
                                 <RowDefinition Height="34"/>
-                                <RowDefinition Height="34"/>
                                 <RowDefinition Height="30"/>
+                                <RowDefinition Height="34"/>
+                                <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
 
-                            <TextBlock Text="RELAY 1 (OUT0)" Style="{StaticResource FieldLabelStyle}"/>
+                            <TextBlock Text="OUT1 • JIG" Style="{StaticResource FieldLabelStyle}"/>
                             <Button Grid.Column="1" Content="BẬT" Command="{Binding ManualRelay0OnCommand}" Style="{StaticResource SettingsWarningButtonStyle}"/>
-                            <Button Grid.Column="2" Content="TẮT" Command="{Binding ManualResetCommand}" Style="{StaticResource SettingsExitButtonStyle}"/>
+                            <Button Grid.Column="2" Content="TẮT" Command="{Binding ManualRelay0OffCommand}" Style="{StaticResource SettingsExitButtonStyle}"/>
                             <TextBlock Grid.Column="3" Text="{Binding ManualRelay0Status}" FontWeight="Bold" HorizontalAlignment="Center"/>
 
-                            <TextBlock Grid.Row="1" Text="RELAY 5 (OUT4)" Style="{StaticResource FieldLabelStyle}"/>
-                            <Button Grid.Row="1" Grid.Column="1" Content="BẬT" Command="{Binding ManualRelay4OnCommand}" Style="{StaticResource SettingsWarningButtonStyle}"/>
-                            <Button Grid.Row="1" Grid.Column="2" Content="TẮT" Command="{Binding ManualResetCommand}" Style="{StaticResource SettingsExitButtonStyle}"/>
-                            <TextBlock Grid.Row="1" Grid.Column="3" Text="{Binding ManualRelay4Status}" FontWeight="Bold" HorizontalAlignment="Center"/>
+                            <TextBlock Grid.Row="1" Text="OUT2 • MARK" Style="{StaticResource FieldLabelStyle}"/>
+                            <Button Grid.Row="1" Grid.Column="1" Content="BẬT" Command="{Binding ManualRelay1OnCommand}" Style="{StaticResource SettingsWarningButtonStyle}"/>
+                            <Button Grid.Row="1" Grid.Column="2" Content="TẮT" Command="{Binding ManualRelay1OffCommand}" Style="{StaticResource SettingsExitButtonStyle}"/>
+                            <TextBlock Grid.Row="1" Grid.Column="3" Text="{Binding ManualRelay1Status}" FontWeight="Bold" HorizontalAlignment="Center"/>
 
-                            <Button Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Content="TẮT CẢ 2 RELAY"
+                            <TextBlock Grid.Row="2" Text="OUT5 • POWER" Style="{StaticResource FieldLabelStyle}"/>
+                            <TextBlock Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Text="TỰ ĐỘNG THEO OUT1 / OUT2"
+                                       Foreground="{StaticResource TextMuted}" FontSize="11" VerticalAlignment="Center"/>
+                            <TextBlock Grid.Row="2" Grid.Column="3" Text="{Binding ManualPowerStatus}" FontWeight="Bold" HorizontalAlignment="Center"/>
+
+                            <Button Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2" Content="TẮT OUT1 + OUT2 + OUT5"
                                     Command="{Binding ManualResetCommand}" Style="{StaticResource SettingsExitButtonStyle}"/>
 
-                            <TextBlock Grid.Row="3" Grid.ColumnSpan="4" Text="{Binding ManualStatus}"
-                                       Foreground="{StaticResource TextMuted}" FontSize="12"/>
+                            <TextBlock Grid.Row="4" Grid.ColumnSpan="4" Margin="0,3,0,0" Text="{Binding ManualStatus}"
+                                       Foreground="{StaticResource TextMuted}" FontSize="12" TextWrapping="Wrap"/>
                         </Grid>
                     </StackPanel>
                 </StackPanel>

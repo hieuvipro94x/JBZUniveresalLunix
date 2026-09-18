@@ -198,7 +198,11 @@ public sealed class TestViewModel : ObservableObject
     private int _deviceFaultDialogShown;
     private int _deviceFaultTransitionCount;
     private int _deviceFaultDialogCount;
-    private int _manualActiveRelay = -1;
+    // Manual Output Test state. OUT1/ch0=JIG, OUT2/ch1=MARKING; OUT5/ch4 POWER
+    // được transport tự suy ra từ hai trạng thái này.
+    private int _manualActiveRelay = -1; // compatibility: một relay đang active/relay thao tác cuối
+    private int _manualJigRelayOn;
+    private int _manualMarkingRelayOn;
     private int _firstFrameReceivedLogged;
     private int _firstLogicalStateLogged;
     private int _firstUiUpdateRenderedLogged;
@@ -377,6 +381,9 @@ public sealed class TestViewModel : ObservableObject
 
     public bool IsDeviceFault => Volatile.Read(ref _deviceFault) != 0;
     public bool IsManualModeActive => Volatile.Read(ref _manualModeActive) != 0;
+    public bool ManualJigRelayOn => Volatile.Read(ref _manualJigRelayOn) != 0;
+    public bool ManualMarkingRelayOn => Volatile.Read(ref _manualMarkingRelayOn) != 0;
+    public bool ManualRelayPowerOn => ManualJigRelayOn || ManualMarkingRelayOn;
     public bool CanEnterManualMode => !IsDeviceFault && !IsManualForbiddenWorkActive;
     public string DeviceFaultMessage => _deviceFaultMessage;
     public int DeviceFaultTransitionCount => Volatile.Read(ref _deviceFaultTransitionCount);
@@ -1296,21 +1303,21 @@ public sealed class TestViewModel : ObservableObject
                     return;
 
                 int relay1Ms = _productionSettings.Relay1JigPulseMs;
-                AddLog($"THỬ RELAY 1 vật lý: pulse 1 lần ({relay1Ms} ms)");
-                await _engine.PulsePhysicalRelayAsync(JbzBoardTransportAdapter.Relay1OutputChannel);
-                AddLog("Relay 1 OFF - đã cưỡng bức về trạng thái chờ.");
+                AddLog($"THỬ OUT1 / JIG: pulse 1 lần ({relay1Ms} ms), OUT5 POWER tự cấp");
+                await _engine.PulsePhysicalRelayAsync(JbzBoardTransportAdapter.JigOutputChannel);
+                AddLog("OUT1 JIG OFF; OUT5 POWER đã về OFF an toàn.");
             });
 
         Relay2Command =
             new AsyncRelayCommand(async () =>
             {
-                if (!EnsureManualBoardReady("thử Relay 5"))
+                if (!EnsureManualBoardReady("thử OUT2 MARKING"))
                     return;
 
                 int relay2Ms = _productionSettings.Relay2MarkingPulseMs;
-                AddLog($"THỬ RELAY 5 vật lý: pulse 1 lần ({relay2Ms} ms)");
-                await _engine.PulsePhysicalRelayAsync(JbzBoardTransportAdapter.Relay5OutputChannel);
-                AddLog("Relay 5 OFF - đã cưỡng bức về trạng thái chờ.");
+                AddLog($"THỬ OUT2 / MARKING: pulse 1 lần ({relay2Ms} ms), OUT5 POWER tự cấp");
+                await _engine.PulsePhysicalRelayAsync(JbzBoardTransportAdapter.MarkingOutputChannel);
+                AddLog("OUT2 MARKING OFF; OUT5 POWER đã về OFF an toàn.");
             });
 
         RelaysOffCommand =
@@ -1340,6 +1347,32 @@ public sealed class TestViewModel : ObservableObject
 
         return true;
     }
+
+    private void SetManualRelayState(bool jigOn, bool markingOn, int preferredRelay = -1)
+    {
+        Interlocked.Exchange(ref _manualJigRelayOn, jigOn ? 1 : 0);
+        Interlocked.Exchange(ref _manualMarkingRelayOn, markingOn ? 1 : 0);
+
+        int active = -1;
+        if (jigOn && markingOn)
+        {
+            active = preferredRelay is JbzBoardTransportAdapter.JigOutputChannel or JbzBoardTransportAdapter.MarkingOutputChannel
+                ? preferredRelay
+                : JbzBoardTransportAdapter.MarkingOutputChannel;
+        }
+        else if (jigOn)
+        {
+            active = JbzBoardTransportAdapter.JigOutputChannel;
+        }
+        else if (markingOn)
+        {
+            active = JbzBoardTransportAdapter.MarkingOutputChannel;
+        }
+
+        Volatile.Write(ref _manualActiveRelay, active);
+    }
+
+    private void ClearManualRelayState() => SetManualRelayState(false, false);
 
     public async Task EnterManualModeAsync()
     {
@@ -1371,11 +1404,14 @@ public sealed class TestViewModel : ObservableObject
             await _board.AllRelaysOffAsync();
         }
 
-        Volatile.Write(ref _manualActiveRelay, -1);
+        ClearManualRelayState();
         State = "MANUAL";
         Raise(nameof(IsManualModeActive));
+        Raise(nameof(ManualJigRelayOn));
+        Raise(nameof(ManualMarkingRelayOn));
+        Raise(nameof(ManualRelayPowerOn));
         Raise(nameof(CanEnterManualMode));
-        AddLog("MANUAL TỰ ĐỘNG ON - chỉ điều khiển Relay 1/OUT0 và Relay 5/OUT4; cả 2 relay đã OFF an toàn.");
+        AddLog("MANUAL OUTPUT TEST ON - OUT1/JIG=OFF, OUT2/MARK=OFF, OUT5/POWER=OFF. Mapping theo trace gốc.");
     }
 
     public bool IsProductRemovalPending =>
@@ -1399,7 +1435,7 @@ public sealed class TestViewModel : ObservableObject
         {
             if (_board.IsConnected && !outputsAlreadyOff)
                 await _board.AllRelaysOffAsync();
-            Volatile.Write(ref _manualActiveRelay, -1);
+            ClearManualRelayState();
             Interlocked.Exchange(ref _manualModeActive, 0);
         }
         finally
@@ -1408,17 +1444,22 @@ public sealed class TestViewModel : ObservableObject
         }
 
         Raise(nameof(IsManualModeActive));
+        Raise(nameof(ManualJigRelayOn));
+        Raise(nameof(ManualMarkingRelayOn));
+        Raise(nameof(ManualRelayPowerOn));
         Raise(nameof(CanEnterManualMode));
         State = ReadyStateForCurrentModel();
-        AddLog("MANUAL TỰ ĐỘNG OFF - Relay 1/OUT0 và Relay 5/OUT4 OFF, quét Production tiếp tục.");
+        AddLog("MANUAL OUTPUT TEST OFF - OUT1/JIG, OUT2/MARK và OUT5/POWER đều OFF; quét Production tiếp tục.");
 
         if (_board.IsConnected)
             await EnsureContinuousProductionScanAsync();
     }
 
     /// <summary>
-    /// Universal Tester New chỉ có hai relay vật lý: Relay 1 = OUT0 và Relay 5 = OUT4.
-    /// TẮT cưỡng bức cả hai relay OFF rồi mới khôi phục Production scan.
+    /// Manual Output Test theo trace gốc:
+    /// OUT1/channel 0 = REMOVE/JIG, OUT2/channel 1 = MARKING, OUT5/channel 4 = POWER chung.
+    /// Hai relay chức năng được phép ON độc lập hoặc đồng thời. Transport luôn gửi
+    /// snapshot OUT1 -> OUT2 -> OUT3 OFF -> OUT4 OFF -> OUT5 POWER và chờ ACK từng lệnh.
     /// </summary>
     public async Task<int> SetManualRelayAsync(int relay, bool turnOn)
     {
@@ -1426,48 +1467,56 @@ public sealed class TestViewModel : ObservableObject
             throw new InvalidOperationException("DeviceFault đang khóa lệnh Manual. Hãy thoát và mở lại ứng dụng.");
         if (!JbzBoardTransportAdapter.IsPhysicalRelayOutput(relay))
             throw new ArgumentOutOfRangeException(nameof(relay), relay,
-                "Chỉ Relay 1 (OUT0) và Relay 5 (OUT4) là relay vật lý của Universal Tester New.");
-        if (!EnsureManualBoardReady($"manual Relay {relay}"))
+                "Chỉ OUT1/channel 0 (JIG) và OUT2/channel 1 (MARKING) được điều khiển trực tiếp; OUT5/channel 4 là POWER tự động.");
+        if (!EnsureManualBoardReady($"manual OUTPUT {relay + 1}"))
             return Volatile.Read(ref _manualActiveRelay);
         if (!IsManualModeActive)
             await EnterManualModeAsync();
 
         long started = Stopwatch.GetTimestamp();
+        string role = relay == JbzBoardTransportAdapter.JigOutputChannel ? "OUT1/JIG" : "OUT2/MARK";
         AsyncFileLogService.Current.Performance(
-            $"MANUAL_RELAY_LATENCY relay={relay} action={(turnOn ? "ON" : "OFF")} event=button_click");
+            $"MANUAL_RELAY_LATENCY relay={relay} role={role} action={(turnOn ? "ON" : "OFF")} event=button_click");
 
         int activeRelay;
+        bool exitManualAfterCommand = false;
         await _manualRelayGate.WaitAsync();
         try
         {
             AsyncFileLogService.Current.Performance(
-                $"MANUAL_RELAY_LATENCY relay={relay} action={(turnOn ? "ON" : "OFF")} event=command_enqueued");
+                $"MANUAL_RELAY_LATENCY relay={relay} role={role} action={(turnOn ? "ON" : "OFF")} event=command_enqueued");
 
             if (_board.IsScanning)
                 await StopScanIntentionallyAsync("ManualRelay");
 
+            bool jigOn = ManualJigRelayOn;
+            bool markingOn = ManualMarkingRelayOn;
+            if (relay == JbzBoardTransportAdapter.JigOutputChannel)
+                jigOn = turnOn;
+            else
+                markingOn = turnOn;
+
             try
             {
-                // Mỗi lần BẬT luôn gửi OFF trước để relay đang giữ phải nhả
-                // hoàn toàn, sau đó mới chọn đúng một relay vật lý cần bật.
-                await _board.AllRelaysOffAsync();
-                if (turnOn)
-                    await _board.SetRelayAsync(relay);
+                await _board.ApplyRelayOutputsAsync(jigOn, markingOn);
+                SetManualRelayState(jigOn, markingOn, relay);
+                activeRelay = Volatile.Read(ref _manualActiveRelay);
+                exitManualAfterCommand = !jigOn && !markingOn;
 
-                Volatile.Write(ref _manualActiveRelay, turnOn ? relay : -1);
                 double elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
                 AsyncFileLogService.Current.Performance(
-                    $"MANUAL_RELAY_LATENCY relay={relay} action={(turnOn ? "ON" : "OFF")} event=ui_update elapsed_ms={elapsedMs:0.###}");
-                AddLog(turnOn
-                    ? $"MANUAL {(relay == 0 ? "RELAY 1 / OUT0" : "RELAY 5 / OUT4")} ON - relay còn lại đã OFF."
-                    : $"MANUAL {(relay == 0 ? "RELAY 1 / OUT0" : "RELAY 5 / OUT4")} OFF - cả hai relay OFF.");
-                activeRelay = Volatile.Read(ref _manualActiveRelay);
+                    $"MANUAL_RELAY_LATENCY relay={relay} role={role} action={(turnOn ? "ON" : "OFF")} " +
+                    $"event=ui_update elapsed_ms={elapsedMs:0.###} jig={(jigOn ? 1 : 0)} mark={(markingOn ? 1 : 0)} power={(jigOn || markingOn ? 1 : 0)}");
+                AddLog(
+                    $"MANUAL OUTPUT: OUT1/JIG={(jigOn ? "ON" : "OFF")}, " +
+                    $"OUT2/MARK={(markingOn ? "ON" : "OFF")}, " +
+                    $"OUT5/POWER={(jigOn || markingOn ? "ON" : "OFF")}.");
             }
             catch (Exception ex)
             {
                 try { await _board.AllRelaysOffAsync(); }
                 catch (Exception offEx) { AddLog($"MANUAL safe OFF sau lỗi relay thất bại: {offEx.Message}"); }
-                Volatile.Write(ref _manualActiveRelay, -1);
+                ClearManualRelayState();
                 EnterDeviceFault(ex, "ManualRelay");
                 throw;
             }
@@ -1477,19 +1526,27 @@ public sealed class TestViewModel : ObservableObject
             _manualRelayGate.Release();
         }
 
-        // Giữ Manual khi relay ON. Chỉ khi bấm TẮT mới thoát Manual và
-        // khôi phục scan Production.
-        if (!turnOn)
+        Raise(nameof(ManualJigRelayOn));
+        Raise(nameof(ManualMarkingRelayOn));
+        Raise(nameof(ManualRelayPowerOn));
+
+        // Chỉ thoát Manual khi cả hai relay chức năng đều OFF. Nếu tắt một relay
+        // nhưng relay còn lại đang ON thì OUT5 POWER phải tiếp tục ON.
+        if (exitManualAfterCommand)
             await ExitManualModeAsync(outputsAlreadyOff: true);
 
         return activeRelay;
     }
 
+    /// <summary>
+    /// Nút TẮT TẤT CẢ trong ProductionSettings chỉ đưa OUT1/OUT2/OUT5 về OFF.
+    /// Không RESET firmware vì thao tác relay không được phép làm gián đoạn board/model.
+    /// </summary>
     public async Task ResetManualOutputsAsync()
     {
         if (IsDeviceFault)
             throw new InvalidOperationException("DeviceFault đang khóa lệnh Manual. Hãy thoát và mở lại ứng dụng.");
-        if (!EnsureManualBoardReady("manual RESET"))
+        if (!EnsureManualBoardReady("manual ALL OFF"))
             return;
         if (!IsManualModeActive)
             await EnterManualModeAsync();
@@ -1500,20 +1557,18 @@ public sealed class TestViewModel : ObservableObject
             try
             {
                 if (_board.IsScanning)
-                    await StopScanIntentionallyAsync("ManualReset");
+                    await StopScanIntentionallyAsync("ManualAllOff");
                 await _board.AllRelaysOffAsync();
-                await _board.ResetClearAsync();
-                await _board.AllRelaysOffAsync();
-                Volatile.Write(ref _manualActiveRelay, -1);
+                ClearManualRelayState();
                 State = "MANUAL";
-                AddLog("MANUAL RESET - reset clear hoàn tất, Relay 1/OUT0 và Relay 5/OUT4 đều OFF.");
+                AddLog("MANUAL ALL OFF - OUT1/JIG=OFF, OUT2/MARK=OFF, OUT5/POWER=OFF; không RESET firmware.");
             }
             catch (Exception ex)
             {
                 try { await _board.AllRelaysOffAsync(); }
-                catch (Exception offEx) { AddLog($"MANUAL safe OFF sau lỗi reset thất bại: {offEx.Message}"); }
-                Volatile.Write(ref _manualActiveRelay, -1);
-                EnterDeviceFault(ex, "ManualReset");
+                catch (Exception offEx) { AddLog($"MANUAL safe OFF sau lỗi thất bại: {offEx.Message}"); }
+                ClearManualRelayState();
+                EnterDeviceFault(ex, "ManualAllOff");
                 throw;
             }
         }
@@ -1522,6 +1577,9 @@ public sealed class TestViewModel : ObservableObject
             _manualRelayGate.Release();
         }
 
+        Raise(nameof(ManualJigRelayOn));
+        Raise(nameof(ManualMarkingRelayOn));
+        Raise(nameof(ManualRelayPowerOn));
         await ExitManualModeAsync(outputsAlreadyOff: true);
     }
 
@@ -1603,7 +1661,7 @@ public sealed class TestViewModel : ObservableObject
                         await StopScanIntentionallyAsync("ManualLeak");
                     await _board.AllRelaysOffAsync();
                 }
-                Volatile.Write(ref _manualActiveRelay, -1);
+                ClearManualRelayState();
 
                 State = "CHẠY THỬ MÁY LEAK";
                 AddLog(
@@ -1656,16 +1714,16 @@ public sealed class TestViewModel : ObservableObject
         if (!jigEnabled && !markingEnabled)
             return "PASS không kích relay theo cấu hình";
         if (!jigEnabled)
-            return "RELAY 5 / OUT4 MARKING";
+            return "OUT2 / channel 1 MARKING (OUT5 POWER tự cấp)";
         if (!markingEnabled)
-            return "RELAY 1 / OUT0 mở JIG";
+            return "OUT1 / channel 0 mở JIG (OUT5 POWER tự cấp)";
 
-        return "RELAY 5 / OUT4 MARKING -> RELAY 1 / OUT0 mở JIG";
+        return "OUT2 / channel 1 MARKING -> OUT1 / channel 0 mở JIG (OUT5 POWER chung)";
     }
 
     private string FaultJigRelayText()
     {
-        return $"RELAY 1 / OUT0 mở JIG ({Math.Clamp(_productionSettings.Relay1JigPulseMs, 50, 5_000)} ms)";
+        return $"OUT1 / channel 0 mở JIG ({Math.Clamp(_productionSettings.Relay1JigPulseMs, 50, 5_000)} ms, OUT5 POWER tự cấp)";
     }
 
     private void ReportDeviceFaultForTest(Exception exception, int desiredRowsCount = -1) =>
@@ -1724,7 +1782,7 @@ public sealed class TestViewModel : ObservableObject
         Interlocked.Exchange(ref _masterEjectStarted, 0);
         Interlocked.Exchange(ref _resultRecordedThisCycle, 0);
         Interlocked.Exchange(ref _manualModeActive, 0);
-        Volatile.Write(ref _manualActiveRelay, -1);
+        ClearManualRelayState();
         SwitchRuntimeMode(RuntimeMode.Background);
         CancelCycleOperations();
         _sound.SetWiringFaultAlarm(false);
