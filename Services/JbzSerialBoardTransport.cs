@@ -329,18 +329,24 @@ public sealed class JbzSerialBoardTransport : IAsyncDisposable
             if (!IsConnected)
                 throw new IOException("JBZ board COM is not connected.");
 
-            // UniversalTester Rev 1.42: START is a state transition, not a
-            // fire-and-forget write. The original waits for :START,ON and then
-            // immediately sends :MAXEXT before normal MEASURE/CLEAR/OPEN events.
+            // Verified JBZ_Windows trace ordering:
+            //   TX :START -> RX :START,ON -> TX :MAXEXT,n
+            // :MEASURE is an asynchronous firmware notification and MUST NOT gate
+            // MAXEXT. Waiting for :MEASURE here can leave the firmware scan loop in
+            // a half-started state on some cycles, where only the initial OPEN sweep
+            // is emitted and later wiring changes are never reported.
             Drain(JbzEventFamily.Start);
             Drain(JbzEventFamily.Measure);
             Log?.Invoke(this, "SCAN_START_BEGIN");
             await SendCoreAsync(":START", ct);
             await WaitAsync(JbzEventFamily.Start, TimeSpan.FromSeconds(2), ct);
             Log?.Invoke(this, "SCAN_START_ACK");
-            await WaitAsync(JbzEventFamily.Measure, TimeSpan.FromSeconds(2), ct);
+
             await SendCoreAsync($":MAXEXT,{maxExt}", ct);
             Log?.Invoke(this, $"MAXEXT_SENT value={maxExt}");
+
+            // Do not wait for MEASURE. ReaderLoop continues to parse/log it when it
+            // arrives before or after MAXEXT, exactly like the original software.
         }
         finally { _transaction.Release(); }
     }

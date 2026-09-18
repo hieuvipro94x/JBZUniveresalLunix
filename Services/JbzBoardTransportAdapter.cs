@@ -34,6 +34,15 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
     private int _maxIo;
     private TaskCompletionSource<bool>? _passPenAck;
 
+    // Firmware normally terminates a topology update with :CIRCUIT,n. In field
+    // traces some firmware cycles emit OPEN/SHORT/OTHER but omit CIRCUIT. Without
+    // a complete frame TestEngine remains lastFrameValid=false forever, so no
+    // product detection and no NG/PASS are possible. A short quiet-window fallback
+    // converts the accumulated UART topology into one authoritative complete frame.
+    private readonly object _topologySync = new();
+    private CancellationTokenSource? _topologyFlushCts;
+    private const int TopologyQuietFlushMs = 55;
+
     public JbzBoardTransportAdapter(string preferredPort, ProductionSettings settings)
     {
         _preferredPort = preferredPort;
@@ -738,23 +747,29 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
             // allowing an in-progress UART scan to decide PASS/FAIL/removal.
             case JbzEventFamily.Clear:
                 ClearLiveProbe();
+                CancelTopologyQuietFlush();
                 ResetLiveCycleBaseline();
                 PublishAllOpenPreviews();
+                // CLEAR starts a firmware sweep. Do not publish a complete frame yet;
+                // OPEN/SHORT/OTHER events that follow will arm the quiet-window end.
                 break;
             case JbzEventFamily.Open:
                 UpdateOpen(value.Numbers ?? []);
                 if (value.Numbers is { Count: > 0 })
                     PublishContinuityPreview(value.Numbers[0]);
+                ScheduleTopologyQuietFlush("OPEN");
                 break;
             case JbzEventFamily.Short:
                 UpdateUnexpected(value.Numbers ?? [], ProductFaultType.ShortCircuit);
                 if (value.Numbers is { Count: > 0 })
                     PublishContinuityPreview(value.Numbers[0]);
+                ScheduleTopologyQuietFlush("SHORT");
                 break;
             case JbzEventFamily.Other:
                 UpdateUnexpected(value.Numbers ?? [], ProductFaultType.WrongWiring);
                 if (value.Numbers is { Count: > 0 })
                     PublishContinuityPreview(value.Numbers[0]);
+                ScheduleTopologyQuietFlush("OTHER");
                 break;
             case JbzEventFamily.TestPin:
                 if (IsConnected && !IsScanning) break;
@@ -771,6 +786,7 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
                 Log?.Invoke(this, "REMOVAL_HANDSHAKE_RX event=REMOVAL waiting_for=UNCONNECT");
                 break;
             case JbzEventFamily.Unconnect:
+                CancelTopologyQuietFlush();
                 // Verified trace boundary.  The firmware has completed its own
                 // removal state machine; only now is it safe to discard every
                 // OPEN/OTHER snapshot from the previous unit.  The next product
@@ -782,6 +798,7 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
                 Publish(new HashSet<int>(), new Dictionary<int, IReadOnlySet<int>>(), BoardScanMode.Production);
                 break;
             case JbzEventFamily.Circuit:
+                CancelTopologyQuietFlush();
                 PublishCircuit(value.Numbers?.FirstOrDefault() ?? -1);
                 break;
         }
@@ -798,10 +815,13 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
         //   :OPEN,1,1,31,32
         // and when the net is complete it emits only :OPEN,1.
         int[] missing = numbers.Skip(1).Where(io => io != source).Distinct().ToArray();
-        if (missing.Length == 0)
-            _open.Remove(source);
-        else
-            _open[source] = missing;
+        lock (_topologySync)
+        {
+            if (missing.Length == 0)
+                _open.Remove(source);
+            else
+                _open[source] = missing;
+        }
     }
 
     private void UpdateUnexpected(
@@ -812,23 +832,24 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
             return;
 
         int source = numbers[0];
-        foreach (int target in numbers.Skip(1).Distinct())
+        lock (_topologySync)
         {
-            if (source <= 0 || target <= 0 || source == target)
-                continue;
-
-            var key = (Math.Min(source, target), Math.Max(source, target));
-
-            // SHORT is stronger/more specific than OTHER for the same pair.
-            // Never downgrade an already reported SHORT to WRONG_WIRING when
-            // firmware later emits the reciprocal OTHER line.
-            if (_unexpected.TryGetValue(key, out var previous) &&
-                previous.Type == ProductFaultType.ShortCircuit)
+            foreach (int target in numbers.Skip(1).Distinct())
             {
-                continue;
-            }
+                if (source <= 0 || target <= 0 || source == target)
+                    continue;
 
-            _unexpected[key] = (source, target, reportedType);
+                var key = (Math.Min(source, target), Math.Max(source, target));
+
+                // SHORT is stronger/more-specific than OTHER for the same pair.
+                if (_unexpected.TryGetValue(key, out var previous) &&
+                    previous.Type == ProductFaultType.ShortCircuit)
+                {
+                    continue;
+                }
+
+                _unexpected[key] = (source, target, reportedType);
+            }
         }
     }
 
@@ -858,10 +879,19 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
             .SelectMany(net => net.ExpectedActiveIo)
             .ToHashSet();
 
-        if (_open.TryGetValue(source, out int[]? missing))
-            actual.ExceptWith(missing);
+        int[]? missingSnapshot = null;
+        (int Source, int Target, ProductFaultType Type)[] unexpectedSnapshot;
+        lock (_topologySync)
+        {
+            if (_open.TryGetValue(source, out int[]? missing))
+                missingSnapshot = missing.ToArray();
+            unexpectedSnapshot = _unexpected.Values.ToArray();
+        }
 
-        foreach ((_, (int unexpectedSource, int unexpectedTarget, ProductFaultType _)) in _unexpected)
+        if (missingSnapshot is not null)
+            actual.ExceptWith(missingSnapshot);
+
+        foreach ((int unexpectedSource, int unexpectedTarget, ProductFaultType _) in unexpectedSnapshot)
         {
             if (unexpectedSource == source)
                 actual.Add(unexpectedTarget);
@@ -908,8 +938,11 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
         if (result == 0)
         {
             // CIRCUIT,0 is the firmware's authoritative clean topology result.
-            _open.Clear();
-            _unexpected.Clear();
+            lock (_topologySync)
+            {
+                _open.Clear();
+                _unexpected.Clear();
+            }
         }
         PublishTopologySnapshot(result);
     }
@@ -927,14 +960,23 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
                 group => group.Key,
                 group => (IReadOnlySet<int>)group.SelectMany(net => net.ExpectedActiveIo).ToHashSet());
 
-        foreach ((int source, int[] missing) in _open)
+        KeyValuePair<int, int[]>[] openSnapshot;
+        (int Source, int Target, ProductFaultType Type)[] unexpectedSnapshot;
+        lock (_topologySync)
+        {
+            openSnapshot = _open.Select(pair =>
+                new KeyValuePair<int, int[]>(pair.Key, pair.Value.ToArray())).ToArray();
+            unexpectedSnapshot = _unexpected.Values.ToArray();
+        }
+
+        foreach ((int source, int[] missing) in openSnapshot)
         {
             if (!connections.TryGetValue(source, out IReadOnlySet<int>? expected))
                 continue;
             connections[source] = expected.Except(missing).ToHashSet();
         }
 
-        foreach ((_, (int source, int target, ProductFaultType _)) in _unexpected)
+        foreach ((int source, int target, ProductFaultType _) in unexpectedSnapshot)
         {
             var actual = connections.TryGetValue(source, out IReadOnlySet<int>? current)
                 ? current.ToHashSet()
@@ -949,17 +991,64 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
 
     private void ResetLiveCycleBaseline()
     {
-        _open.Clear();
-        _unexpected.Clear();
-        if (_model is null)
+        lock (_topologySync)
+        {
+            _open.Clear();
+            _unexpected.Clear();
+            if (_model is null)
+                return;
+
+            foreach (WireNet net in _model.Nets)
+            {
+                if (net.SourceIo <= 0 || net.ExpectedActiveIo.Count == 0)
+                    continue;
+                _open[net.SourceIo] = net.ExpectedActiveIo.Distinct().ToArray();
+            }
+        }
+    }
+
+
+    private void ScheduleTopologyQuietFlush(string source)
+    {
+        if (_mode != BoardScanMode.Production || !IsScanning || _model is null)
             return;
 
-        foreach (WireNet net in _model.Nets)
+        CancellationTokenSource next = new();
+        CancellationTokenSource? previous = Interlocked.Exchange(ref _topologyFlushCts, next);
+        previous?.Cancel();
+        previous?.Dispose();
+
+        _ = Task.Run(async () =>
         {
-            if (net.SourceIo <= 0 || net.ExpectedActiveIo.Count == 0)
-                continue;
-            _open[net.SourceIo] = net.ExpectedActiveIo.Distinct().ToArray();
-        }
+            try
+            {
+                await Task.Delay(TopologyQuietFlushMs, next.Token);
+                if (next.IsCancellationRequested || _mode != BoardScanMode.Production || !IsScanning)
+                    return;
+
+                Log?.Invoke(this,
+                    $"TOPOLOGY_QUIET_FRAME reason={source} quiet_ms={TopologyQuietFlushMs} circuit_missing=true");
+                PublishTopologySnapshot();
+            }
+            catch (OperationCanceledException)
+            {
+                // A newer UART topology event or CIRCUIT completed this sweep.
+            }
+            finally
+            {
+                if (ReferenceEquals(Interlocked.CompareExchange(ref _topologyFlushCts, null, next), next))
+                    next.Dispose();
+            }
+        });
+    }
+
+    private void CancelTopologyQuietFlush()
+    {
+        CancellationTokenSource? pending = Interlocked.Exchange(ref _topologyFlushCts, null);
+        if (pending is null)
+            return;
+        pending.Cancel();
+        pending.Dispose();
     }
 
     private void PublishProbe(JbzBoardEvent value)
@@ -1005,25 +1094,47 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
 
     private IReadOnlyDictionary<(int SourceIo, int TargetIo), ProductFaultType> BuildAllFaultHints()
     {
-        if (_unexpected.Count == 0)
-            return new Dictionary<(int SourceIo, int TargetIo), ProductFaultType>();
+        lock (_topologySync)
+        {
+            if (_unexpected.Count == 0)
+                return new Dictionary<(int SourceIo, int TargetIo), ProductFaultType>();
 
-        return _unexpected.ToDictionary(
-            pair => (pair.Key.Low, pair.Key.High),
-            pair => pair.Value.Type);
+            return _unexpected.ToDictionary(
+                pair => (pair.Key.Low, pair.Key.High),
+                pair => pair.Value.Type);
+        }
     }
 
     private IReadOnlyDictionary<(int SourceIo, int TargetIo), ProductFaultType> BuildFaultHintsForSource(int source)
     {
-        if (_unexpected.Count == 0)
-            return new Dictionary<(int SourceIo, int TargetIo), ProductFaultType>();
+        lock (_topologySync)
+        {
+            if (_unexpected.Count == 0)
+                return new Dictionary<(int SourceIo, int TargetIo), ProductFaultType>();
 
-        return _unexpected
-            .Where(pair => pair.Value.Source == source || pair.Value.Target == source)
-            .ToDictionary(
-                pair => (pair.Key.Low, pair.Key.High),
-                pair => pair.Value.Type);
+            return _unexpected
+                .Where(pair => pair.Value.Source == source || pair.Value.Target == source)
+                .ToDictionary(
+                    pair => (pair.Key.Low, pair.Key.High),
+                    pair => pair.Value.Type);
+        }
     }
-    private void ClearCycle() { _open.Clear(); _unexpected.Clear(); }
-    public async ValueTask DisposeAsync() { _serial.EventReceived -= OnEvent; await _serial.DisposeAsync(); _state = BoardConnectionState.Disconnected; }
+
+    private void ClearCycle()
+    {
+        CancelTopologyQuietFlush();
+        lock (_topologySync)
+        {
+            _open.Clear();
+            _unexpected.Clear();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        CancelTopologyQuietFlush();
+        _serial.EventReceived -= OnEvent;
+        await _serial.DisposeAsync();
+        _state = BoardConnectionState.Disconnected;
+    }
 }
