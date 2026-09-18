@@ -238,29 +238,31 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
                         $"BOARD_CONNECT_RECOVERY_AUTO_STOP_WARN port={port} reason={ex.Message}");
                 }
 
-                await Task.Delay(jbzSignature ? 120 : 220, ct);
+                await Task.Delay(jbzSignature ? 120 : 80, ct);
 
-                // STOP can make a scanning board responsive even when an explicit
-                // STOP ACK was missed, so always retry IDN before moving on.
-                try
+                // If STOP produced a JBZ signature, first try one quick IDN.
+                // Do not spend ~6 seconds retrying IDN on a remembered board that
+                // is clearly stuck; recover it with the original RESET handshake.
+                if (jbzSignature)
                 {
-                    string idn = await _serial.QueryIdentityAsync(
-                        ct,
-                        attempts: jbzSignature || rememberedPort ? 3 : 1,
-                        retryDelay: TimeSpan.FromMilliseconds(180));
-                    Log?.Invoke(this,
-                        $"BOARD_CONNECT_RECOVERY_AUTO_IDN_OK port={port} phase=after-stop raw={idn.Trim()}");
-                    return (port, idn.Trim(), null);
-                }
-                catch (Exception ex) when (ex is IOException or TimeoutException or InvalidDataException)
-                {
-                    Log?.Invoke(this,
-                        $"BOARD_CONNECT_RECOVERY_AUTO_IDN_FAIL port={port} phase=after-stop reason={ex.Message}");
+                    try
+                    {
+                        string idn = await _serial.QueryIdentityAsync(
+                            ct, attempts: 1, retryDelay: TimeSpan.Zero);
+                        Log?.Invoke(this,
+                            $"BOARD_CONNECT_RECOVERY_AUTO_IDN_OK port={port} phase=after-stop raw={idn.Trim()}");
+                        return (port, idn.Trim(), null);
+                    }
+                    catch (Exception ex) when (ex is IOException or TimeoutException or InvalidDataException)
+                    {
+                        Log?.Invoke(this,
+                            $"BOARD_CONNECT_RECOVERY_AUTO_IDN_FAIL port={port} phase=after-stop reason={ex.Message}");
+                    }
                 }
 
-                // Never send RESET to an arbitrary COM. We only reset after a
-                // JBZ-specific STOP/BOOT signature, or on a previously verified
-                // board port remembered from an earlier successful connection.
+                // Never RESET an arbitrary COM. A reset is allowed only after a
+                // JBZ STOP/BOOT signature or on the last successfully verified
+                // board port. This is what makes automatic discovery safe.
                 if (!jbzSignature && !rememberedPort)
                 {
                     Log?.Invoke(this,
@@ -272,11 +274,8 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
                 try
                 {
                     Log?.Invoke(this,
-                        $"BOARD_CONNECT_RECOVERY_AUTO_RESET_BEGIN port={port}");
-                    await _serial.SendAsync(":RESET", ct);
-                    await Task.Delay(700, ct);
-                    string idn = await _serial.QueryIdentityAsync(
-                        ct, attempts: 5, retryDelay: TimeSpan.FromMilliseconds(250));
+                        $"BOARD_CONNECT_RECOVERY_AUTO_RESET_BEGIN port={port} protocol=RESET_BOOTLOADER_STOP_BOOT_IDN");
+                    string idn = await _serial.RecoverKnownBoardApplicationAsync(ct);
                     Log?.Invoke(this,
                         $"BOARD_CONNECT_RECOVERY_AUTO_IDN_OK port={port} phase=after-reset raw={idn.Trim()}");
                     return (port, idn.Trim(), null);
@@ -319,6 +318,24 @@ public sealed class JbzBoardTransportAdapter : IBoardTransport
         // still logged MODEL_UPLOAD skip reason=already-synchronized.
         _uploadedModel = string.Empty;
         ClearLiveProbe();
+
+        // Do not leave the MCU in START/MEASURE when Windows closes the COM.
+        // The original UniversalTester sends :STOP before releasing the UART.
+        // Best-effort only: shutdown must still finish if the board is already hung.
+        if (_serial.IsConnected)
+        {
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1200));
+            try
+            {
+                bool stopped = await _serial.TryStopForFirmwareRecoveryAsync(stopCts.Token);
+                Log?.Invoke(this, $"BOARD_DISCONNECT_STOP result={(stopped ? "ack" : "no-ack")}");
+            }
+            catch (Exception ex) when (ex is IOException or TimeoutException or InvalidOperationException or OperationCanceledException)
+            {
+                Log?.Invoke(this, $"BOARD_DISCONNECT_STOP_WARN reason={ex.Message}");
+            }
+        }
+
         await _serial.DisconnectAsync();
         _state = BoardConnectionState.Disconnected;
     }
