@@ -3044,8 +3044,19 @@ public sealed class TestViewModel : ObservableObject
                 bool rearmAfterRemoval =
                     Interlocked.Exchange(ref _rearmAfterProductRemoval, 1) != 0;
                 bool wasWaterProofEquipmentRecovery = _waterProofEquipmentErrorAwaitingRemoval;
+                bool jbzCleanPassBoundary =
+                    _board is JbzBoardTransportAdapter &&
+                    CurrentProductionPhase == ProductionPhase.WaitingProductRemoval &&
+                    !wasWaterProofEquipmentRecovery;
                 _waterProofEquipmentErrorAwaitingRemoval = false;
-                ResetFullCycleAfterProductRemoved();
+
+                // Firmware :UNCONNECT is the authoritative clean boundary.  At
+                // this point the old product must disappear from the table and,
+                // when AutoRestartAfterPass is enabled, the original JBZ flow
+                // immediately starts a fresh scan for the next product.
+                ResetFullCycleAfterProductRemoved(
+                    clearWireTableBeforeNextCycle: jbzCleanPassBoundary);
+
                 if (returnedToMain || !rearmAfterRemoval)
                 {
                     _cycleActive = false;
@@ -3054,10 +3065,21 @@ public sealed class TestViewModel : ObservableObject
                     if (returnedToMain)
                         SwitchRuntimeMode(RuntimeMode.Background);
                 }
+                else if (jbzCleanPassBoundary)
+                {
+                    // :UNCONNECT leaves firmware idle.  The trace from the
+                    // original software starts :START again immediately after
+                    // the clean boundary.  Without this call the UI says
+                    // "CHỜ LẮP SẢN PHẨM" while the board is not scanning, so
+                    // the next harness cannot be detected and NG/PASS never
+                    // updates until another unrelated action restarts scanning.
+                    _ = ResumeJbzProductionAfterRemovalAsync("PASS_UNCONNECT");
+                }
+
                 State = "CHỜ LẮP SẢN PHẨM";
                 AddLog(wasWaterProofEquipmentRecovery
                     ? "Đã tháo sản phẩm sau lỗi thiết bị leak - ARM lại chu kỳ, leak COM sẽ reconnect ở lần chạy kế tiếp."
-                    : "PASS đã tháo hoàn toàn: toàn bộ continuity sản phẩm đã mất -> ARM lượt test mới.");
+                    : "PASS đã tháo hoàn toàn: firmware :UNCONNECT đã xác nhận ranh giới sạch -> ARM và START lượt test mới.");
             }
             else
             {
@@ -8941,7 +8963,7 @@ public sealed class TestViewModel : ObservableObject
             {
                 await StartProductRemovalMonitorAsync(ct, "PASS_RELAY_SEQUENCE");
                 State = "THÁO SẢN PHẨM";
-                AddLog("Đã bật scan giám sát tháo sản phẩm sau PASS.");
+                AddLog("Firmware đang xử lý MARKING/JIG và giám sát tháo bằng PASSPEN -> PEN -> UNCONNECT.");
             }
             catch (Exception ex)
             {
